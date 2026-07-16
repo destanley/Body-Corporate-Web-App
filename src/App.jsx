@@ -28,6 +28,34 @@ const FONT_IMPORT = (
       }
       .no-print { display: none !important; }
     }
+
+    /* ---------- Responsive: resident-facing pages ---------- */
+    /* Wide statement tables scroll inside their box instead of pushing the
+       whole page sideways. */
+    .scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+    @media (max-width: 640px) {
+      .resident-scope .resident-main { padding: 16px 12px 40px !important; }
+      .resident-scope .statement-paper { padding: 18px 14px !important; }
+
+      /* Header and input rows stack rather than overflow. */
+      .resident-scope .wrap-sm { flex-wrap: wrap; }
+
+      /* 16px inputs stop iOS Safari from auto-zooming on focus. */
+      .resident-scope input,
+      .resident-scope select,
+      .resident-scope textarea { font-size: 16px !important; }
+
+      /* Period / unit selector spans the row. */
+      .resident-scope .resident-main select { width: 100%; }
+
+      /* Banking details collapse to a single column. */
+      .resident-scope .bank-grid { grid-template-columns: 1fr !important; }
+
+      /* Primary actions go full-width and meet the 44px touch target. */
+      .resident-scope .resident-actions { flex-wrap: wrap; }
+      .resident-scope .resident-actions button { flex: 1 1 100% !important; min-height: 44px; }
+    }
   `}</style>
 );
 
@@ -4397,7 +4425,7 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
         <div style={{ fontWeight: 700, fontSize: 12.5, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.4, color: "#64748B" }}>
           El Corazon Banking Details
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 4, fontSize: 12.5 }}>
+        <div className="bank-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", rowGap: 4, fontSize: 12.5 }}>
           <BankRow label="Bank" value={BANK_DETAILS.bank} />
           <BankRow label="Account name" value={BANK_DETAILS.accountName} />
           <BankRow label="Account number" value={BANK_DETAILS.accountNumber} mono />
@@ -4476,7 +4504,7 @@ function ResidentTokenApp({ unit, remittanceDeductions, setRemittanceDeductions,
   );
 
   return (
-    <div className="f-body" style={{ minHeight: "100vh", background: "#EFEAE0", color: "#1B2A38" }}>
+    <div className="f-body resident-scope" style={{ minHeight: "100vh", background: "#EFEAE0", color: "#1B2A38" }}>
       {FONT_IMPORT}
       <ResidentTopBar unit={unit} period={period} />
       {stmt === undefined ? (
@@ -4616,7 +4644,7 @@ function ResidentPortal({
       </div>
 
       <StatementPaper r={r} period={period} />
-      <div className="no-print" style={{ marginTop: 12, display: "flex", justifyContent: "flex-end" }}>
+      <div className="no-print resident-actions" style={{ marginTop: 12, display: "flex", justifyContent: "flex-end" }}>
         <button style={secondaryBtn} onClick={printStatement}>Download PDF</button>
       </div>
 
@@ -4783,7 +4811,7 @@ function ResidentPortal({
             ))}
           </div>
         )}
-        <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 12 }}>
+        <div className="resident-actions" style={{ marginTop: 14, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 12 }}>
           {notifyStatus === "sending" && <span style={{ fontSize: 12, color: "#94A0AC" }}>Submitting…</span>}
           {notifyStatus === "sent" && <span style={{ fontSize: 12, color: "#2F5D50", fontWeight: 600 }}>✓ Submitted & trustee notified by email</span>}
           {notifyStatus === "failed" && <span style={{ fontSize: 12, color: "#B5651D", fontWeight: 600 }}>Submitted — email notification couldn't be sent</span>}
