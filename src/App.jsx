@@ -2543,9 +2543,15 @@ function Dashboard({ alloc, setTab, setSelectedUnit, bankTxns, period = CURRENT_
     });
   };
   const ci = alloc.councilInvoice;
+  // The full council bill as printed: every ex-VAT line item on the invoice
+  // (bulk water/elec + sewerage + water demand levy + elec service & network
+  // fees), grossed up by VAT. `sewerage` is already the complex-wide total
+  // (sewerChargePerUnit x 7), so it is NOT added again. Demand levy is stored
+  // per-unit, so x UNITS.length. Matches the R amount shown on the CoJ invoice.
   const totalInvoice =
-    ci.bulkWaterRand + ci.bulkElecRand + ci.sewerage +
-    ci.refuse + ci.fixedBasic;
+    (ci.bulkWaterRand + ci.bulkElecRand + ci.sewerage + ci.refuse + ci.fixedBasic +
+      ci.waterDemandLevyPerUnit * UNITS.length + ci.elecServiceFee + ci.elecNetworkFee) *
+    (1 + alloc.vatRate);
   const totalDue = alloc.rows.reduce((s, r) => s + r.total, 0);
   // Same reconciliation source of truth as the Bank reconciliation page, so the
   // two stay in sync — expected nets out approved deductions, settled lines
@@ -2563,7 +2569,7 @@ function Dashboard({ alloc, setTab, setSelectedUnit, bankTxns, period = CURRENT_
       </p>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 22 }}>
-        <Stat label="Council invoice" value={rand(totalInvoice)} />
+        <Stat label="Council invoice (incl VAT)" value={rand(totalInvoice)} />
         <Stat label="Total levies raised" value={rand(totalDue)} accent="#2F5D50" />
         <Stat label="Reconciled" value={`${reconciledCount} / 7 units`} accent={reconciledCount === 7 ? "#2F5D50" : "#B5651D"} />
         <Stat label="Outstanding" value={rand(outstanding)} accent={outstanding < RECON_TOLERANCE ? "#2F5D50" : "#B5651D"} />
