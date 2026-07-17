@@ -34,6 +34,14 @@ const FONT_IMPORT = (
        whole page sideways. */
     .scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
+    /* Reconciled "PAID" stamp — the ::before draws the inner hairline for a
+       classic double-ruled rubber-stamp border. */
+    .paid-stamp .stamp-box { position: relative; }
+    .paid-stamp .stamp-box::before {
+      content: ""; position: absolute; inset: 3px;
+      border: 1.5px solid #2F5D50; border-radius: 6px;
+    }
+
     @media (max-width: 640px) {
       .resident-scope .resident-main { padding: 16px 12px 40px !important; }
       .resident-scope .statement-paper { padding: 18px 14px !important; }
@@ -498,6 +506,22 @@ function computeStatementRow(data) {
     };
   }
 
+  // Reconciled = the trustee's Bank Reconciliation treats this unit + period as
+  // settled: a matched resident payment within tolerance of the expected amount
+  // (statement total minus any APPROVED deduction), or one the trustee reviewed.
+  // Mirrors reconcileUnits() exactly so the resident's PAID stamp and the
+  // trustee page never disagree. `data.payment` is the matched bank line for the
+  // payment period (statement month + 1), supplied by the get_unit_statement RPC.
+  const pay = data.payment && data.payment.amount != null
+    ? { amount: Number(data.payment.amount), reviewed: !!data.payment.reviewed }
+    : null;
+  let reconciled = false;
+  if (pay) {
+    const expected = deduction && deduction.approved ? round2(total - deduction.amount) : total;
+    const diff = round2(pay.amount - expected);
+    reconciled = Math.abs(diff) < RECON_TOLERANCE || pay.reviewed;
+  }
+
   const u = data.unit || {};
   return {
     id: "U" + u.unitNumber, owner: u.owner, pq: Number(u.pq),
@@ -506,7 +530,7 @@ function computeStatementRow(data) {
     waterOverridden: ov.waterDue != null, elecOverridden: ov.electricityDue != null,
     subTotal, vat, utilitiesDue,
     levy, levyItems, extras, additionalTotal, total,
-    deduction,
+    deduction, reconciled,
   };
 }
 
@@ -4307,8 +4331,21 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
   return (
     <div className="print-area statement-paper" style={{
       background: "#F6F1E7", border: "1px solid #D8D0BE", borderRadius: 4, padding: 32,
-      boxShadow: "0 1px 0 #fff inset", maxWidth: 680, width: "100%",
+      boxShadow: "0 1px 0 #fff inset", maxWidth: 680, width: "100%", position: "relative",
     }}>
+      {r.reconciled && (
+        <div className="paid-stamp" aria-hidden="true" style={{
+          position: "absolute", top: 132, left: "50%",
+          transform: "translateX(-50%) rotate(-13deg)",
+          mixBlendMode: "multiply", pointerEvents: "none", textAlign: "center", zIndex: 2,
+        }}>
+          <div className="stamp-box" style={{ border: "3px solid #2F5D50", borderRadius: 9, padding: "7px 20px 6px", opacity: 0.9 }}>
+            <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 7, letterSpacing: 2, color: "#2F5D50", fontWeight: 600, marginBottom: 2 }}>EL CORAZON BODY CORP</div>
+            <div className="f-display" style={{ fontWeight: 700, fontSize: 36, lineHeight: 1, letterSpacing: 3, color: "#2F5D50" }}>PAID</div>
+            <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 8, letterSpacing: 1, color: "#2F5D50", fontWeight: 600, marginTop: 3 }}>{periodLabel(period).toUpperCase()} · RECONCILED</div>
+          </div>
+        </div>
+      )}
       <div className="wrap-sm" style={{ display: "flex", justifyContent: "space-between", gap: 12, borderBottom: "2px solid #1B2A38", paddingBottom: 12, marginBottom: 18 }}>
         <div>
           <div className="f-display" style={{ fontSize: 19, fontWeight: 700 }}>El Corazon Body Corporate</div>
