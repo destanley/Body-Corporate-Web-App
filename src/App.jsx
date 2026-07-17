@@ -594,9 +594,10 @@ async function fetchAvailablePeriods() {
 async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPeriod(period)) {
   const client = await ensureSupabaseClient();
   const unitByDbId = Object.fromEntries(units.map((u) => [u.dbId, u.id]));
-  // Statement inputs (readings, levy, charges, council, remittances) are for the
-  // statement `period`; the bank statement + transactions are for the following
-  // month (`paymentPeriod`), because that's when this period's levies are paid.
+  // Statement inputs (readings, levy, charges, remittances) are for the statement
+  // `period`. The bank statement + transactions AND the council invoice are for the
+  // following month (`paymentPeriod`): that's when this period's levies are paid and
+  // when the council bill covering this period's consumption is issued/received.
   const [bands, elec, vat, levy, manual, usage, charges, expenses, invoice, btxns, bdocs, remits, overrides] = await Promise.all([
     client.from("water_tariff_bands").select("*"),
     client.from("electricity_rates").select("*").eq("financial_year", FY_ACTIVE).limit(1),
@@ -606,7 +607,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     client.from("monthly_usage").select("*").eq("period", period),
     client.from("additional_charges").select("*").eq("period", period),
     client.from("ops_expenses").select("*").order("expense_date", { ascending: false }),
-    client.from("council_invoices").select("*").eq("period", period).limit(1),
+    client.from("council_invoices").select("*").eq("period", paymentPeriod).limit(1),
     client.from("bank_transactions").select("*").eq("period", paymentPeriod).order("txn_date"),
     client.from("bank_statement_documents").select("*").eq("period", paymentPeriod).order("uploaded_at", { ascending: false }).limit(1),
     client.from("remittance_advices").select("*").eq("period", period),
@@ -852,7 +853,7 @@ async function saveCouncilInvoiceToDb(ci) {
   const { error } = await client
     .from("council_invoices")
     .upsert({
-      period: ACTIVE_PERIOD,
+      period: nextPeriod(ACTIVE_PERIOD),
       bulk_water_kl: ci.bulkWaterKl, bulk_water_rand: ci.bulkWaterRand,
       bulk_elec_kwh: ci.bulkElecKwh, bulk_elec_rand: ci.bulkElecRand,
       sewerage: ci.sewerage, refuse: ci.refuse, fixed_basic: ci.fixedBasic,
