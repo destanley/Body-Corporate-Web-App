@@ -531,7 +531,7 @@ async function fetchAvailablePeriods() {
   const client = await ensureSupabaseClient();
   const { data, error } = await client.from("monthly_usage").select("period");
   if (error) throw error;
-  const uniq = Array.from(new Set((data || []).map((r) => r.period)));
+  const uniq = Array.from(new Set([CURRENT_PERIOD, ...(data || []).map((r) => r.period)]));
   uniq.sort((a, b) => (a < b ? 1 : -1)); // newest first
   return uniq;
 }
