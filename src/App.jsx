@@ -491,8 +491,22 @@ const CURRENT_PERIOD = "2026-07-01";
 // don't each need it threaded through — App keeps it in sync with the selected
 // month and re-runs loadAppData whenever it changes.
 let ACTIVE_PERIOD = CURRENT_PERIOD;
-const FY_ACTIVE = "2025/2026";   // maps to the app's rate2025 fields
-const FY_PREVIOUS = "2024/2025"; // maps to the app's rate2024 fields
+// South African body corp financial year runs August to July:
+//   Aug 2025 – Jul 2026 = "2025/2026"
+//   Aug 2026 – Jul 2027 = "2026/2027"
+// Used ONLY for levy tables (levy_rates, levy_manual_entries) which are
+// set annually at the AGM. Rate tables (water, electricity) now use
+// effective_from dates instead — see loadAppData.
+function periodToFY(period) {
+  const [y, m] = String(period).split("-").map(Number);
+  return m >= 8 ? `${y}/${y + 1}` : `${y - 1}/${y}`;
+}
+function previousFY(fy) {
+  const [start] = fy.split("/").map(Number);
+  return `${start - 1}/${start}`;
+}
+let FY_ACTIVE = periodToFY(CURRENT_PERIOD);     // body corp FY for levy tables
+let FY_PREVIOUS = previousFY(FY_ACTIVE);
 
 // A month's levies are billed for period M but only paid the following month,
 // so they land on period M+1's bank statement. Reconciliation therefore matches
@@ -547,8 +561,10 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   // month (`paymentPeriod`), because that's when this period's levies are paid.
   const [bands, elec, vat, levy, manual, usage, charges, expenses, invoice, btxns, bdocs, remits, overrides] = await Promise.all([
     client.from("water_tariff_bands").select("*"),
-    client.from("electricity_rates").select("*").eq("financial_year", FY_ACTIVE).limit(1),
+    // Electricity: most recent effective_from ≤ this period (top 2 for YoY comparison)
+    client.from("electricity_rates").select("*").lte("effective_from", period).order("effective_from", { ascending: false }).limit(2),
     client.from("vat_rates").select("*").order("effective_from", { ascending: false }).limit(1),
+    // Levy tables stay keyed to the body corp FY (Aug–Jul)
     client.from("levy_rates").select("*").eq("financial_year", FY_ACTIVE).limit(1),
     client.from("levy_manual_entries").select("*").eq("financial_year", FY_ACTIVE),
     client.from("monthly_usage").select("*").eq("period", period),
@@ -563,19 +579,24 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   const failed = [bands, elec, vat, levy, manual, usage, charges, expenses, invoice, btxns, bdocs, remits, overrides].find((r) => r.error);
   if (failed) throw failed.error;
 
-  // Water bands: the DB stores one row per band per financial year; the app
-  // wants one object per band with both years' rates side by side.
+  // Water bands: the DB stores one row per band per effective date; the app
+  // wants one object per band with current + previous rates side by side.
+  // Find the two most recent effective dates that are ≤ the viewing period.
+  const allEffDates = [...new Set((bands.data || []).map((b) => b.effective_from))].sort().reverse();
+  const waterActiveEffDate = allEffDates.find((d) => d <= period) || allEffDates[0] || null;
+  const waterPrevEffDate = waterActiveEffDate ? (allEffDates.find((d) => d < waterActiveEffDate) || null) : null;
+
   const byLabel = {};
   bands.data.forEach((b) => {
     if (!byLabel[b.band_label]) {
       byLabel[b.band_label] = {
         id: b.band_label, label: b.band_label,
         from: Number(b.from_kl), to: b.to_kl == null ? null : Number(b.to_kl),
-        rate2024: 0, rate2025: 0,
+        rate2024: 0, rate2025: 0, // rate2025 = active set, rate2024 = previous set
       };
     }
-    if (b.financial_year === FY_ACTIVE) byLabel[b.band_label].rate2025 = Number(b.rate_per_kl);
-    if (b.financial_year === FY_PREVIOUS) byLabel[b.band_label].rate2024 = Number(b.rate_per_kl);
+    if (b.effective_from === waterActiveEffDate) byLabel[b.band_label].rate2025 = Number(b.rate_per_kl);
+    if (b.effective_from === waterPrevEffDate) byLabel[b.band_label].rate2024 = Number(b.rate_per_kl);
   });
   const waterBands = Object.values(byLabel).sort((a, b) => a.from - b.from);
 
@@ -684,7 +705,10 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     remittanceAdvices,
     statementOverrides,
     waterBands: waterBands.length ? waterBands : WATER_BANDS_DEFAULT,
+    waterEffectiveFrom: waterActiveEffDate,
+    waterPrevEffectiveFrom: waterPrevEffDate,
     electricityRate: elec.data[0] ? Number(elec.data[0].rate_per_kwh) : ELECTRICITY_RATE_DEFAULT,
+    electricityEffectiveFrom: elec.data[0]?.effective_from || null,
     vatRate: vat.data[0] ? Number(vat.data[0].rate) : VAT_RATE_DEFAULT,
     levyRates: levy.data[0]
       ? { commonPropertyElectricityKwh: Number(levy.data[0].common_property_electricity_kwh) }
@@ -729,21 +753,42 @@ async function saveReadingsToDb(readings) {
   if (error) throw error;
 }
 
-async function saveTariffsToDb({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh }) {
+async function saveTariffsToDb({ waterBands, waterEffectiveFrom, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh }) {
   const client = await ensureSupabaseClient();
   const updates = [];
+  // Water bands: upsert by (effective_from, band_label).
+  // If the effective date is new, this creates a fresh rate set.
   waterBands.forEach((b) => {
-    updates.push(client.from("water_tariff_bands").update({ rate_per_kl: b.rate2025 }).eq("financial_year", FY_ACTIVE).eq("band_label", b.label));
-    updates.push(client.from("water_tariff_bands").update({ rate_per_kl: b.rate2024 }).eq("financial_year", FY_PREVIOUS).eq("band_label", b.label));
+    updates.push(client.from("water_tariff_bands").upsert({
+      effective_from: waterEffectiveFrom, band_label: b.label,
+      from_kl: b.from, to_kl: b.to, rate_per_kl: b.rate2025,
+      financial_year: null, // no longer the key — kept for reference
+    }, { onConflict: "effective_from,band_label" }));
   });
-  updates.push(client.from("electricity_rates").update({ rate_per_kwh: electricityRate }).eq("financial_year", FY_ACTIVE));
+  // Electricity rate: upsert by effective_from. Since there's no unique
+  // constraint on effective_from alone, we do update-then-insert.
+  const elecResult = await client.from("electricity_rates")
+    .update({ rate_per_kwh: electricityRate })
+    .eq("effective_from", electricityEffectiveFrom);
+  if (!elecResult.error && (elecResult.count === 0 || elecResult.data?.length === 0)) {
+    updates.push(client.from("electricity_rates").insert({
+      financial_year: null, rate_per_kwh: electricityRate,
+      effective_from: electricityEffectiveFrom,
+    }));
+  }
+  // VAT is not date-scoped per rate set — single global rate.
   updates.push(client.from("vat_rates").update({ rate: vatRate }).gte("effective_from", "1900-01-01"));
-  // The bill-driven figures (water demand levy, sewer, service/network fees)
-  // now live on council_invoices, captured from the uploaded utility bills —
-  // levy_rates only carries the common-property electricity standard.
-  updates.push(client.from("levy_rates").update({
+  // Levy rates: update the configurable field; insert a new row if this FY doesn't exist yet.
+  const levyResult = await client.from("levy_rates").update({
     common_property_electricity_kwh: commonPropertyElectricityKwh,
-  }).eq("financial_year", FY_ACTIVE));
+  }).eq("financial_year", FY_ACTIVE);
+  if (!levyResult.error && (levyResult.count === 0 || levyResult.data?.length === 0)) {
+    updates.push(client.from("levy_rates").insert({
+      financial_year: FY_ACTIVE,
+      common_property_electricity_kwh: commonPropertyElectricityKwh,
+      water_demand_levy: 0, electricity_service_fee: 0, electricity_network_fee: 0,
+    }));
+  }
   const results = await Promise.all(updates);
   const bad = results.find((x) => x.error);
   if (bad) throw bad.error;
@@ -1224,7 +1269,10 @@ export default function App() {
   const [selectedPeriod, setSelectedPeriod] = useState(CURRENT_PERIOD);
   const [periods, setPeriods] = useState([CURRENT_PERIOD]);
   const [waterBands, setWaterBands] = useState(WATER_BANDS_DEFAULT);
+  const [waterEffectiveFrom, setWaterEffectiveFrom] = useState("2025-07-01");
+  const [waterPrevEffectiveFrom, setWaterPrevEffectiveFrom] = useState(null);
   const [electricityRate, setElectricityRate] = useState(ELECTRICITY_RATE_DEFAULT);
+  const [electricityEffectiveFrom, setElectricityEffectiveFrom] = useState("2025-07-01");
   const [levyBreakdown, setLevyBreakdown] = useState(LEVY_BREAKDOWN_DEFAULT);
   const [vatRate, setVatRate] = useState(VAT_RATE_DEFAULT);
   const [commonPropertyElectricityKwh, setCommonPropertyElectricityKwh] = useState(COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT);
@@ -1305,6 +1353,8 @@ export default function App() {
     // its levies are paid (the following month).
     ACTIVE_PERIOD = selectedPeriod;
     ACTIVE_PAYMENT_PERIOD = nextPeriod(selectedPeriod);
+    FY_ACTIVE = periodToFY(selectedPeriod);
+    FY_PREVIOUS = previousFY(FY_ACTIVE);
     // Refresh the list of months that have data (cheap; also picks up a newly
     // uploaded statement for a month that had none before).
     fetchAvailablePeriods()
@@ -1317,7 +1367,10 @@ export default function App() {
         const data = await loadAppData(units, selectedPeriod, nextPeriod(selectedPeriod));
         if (cancelled) return;
         setWaterBands(data.waterBands);
+        if (data.waterEffectiveFrom) setWaterEffectiveFrom(data.waterEffectiveFrom);
+        if (data.waterPrevEffectiveFrom !== undefined) setWaterPrevEffectiveFrom(data.waterPrevEffectiveFrom);
         setElectricityRate(data.electricityRate);
+        if (data.electricityEffectiveFrom) setElectricityEffectiveFrom(data.electricityEffectiveFrom);
         setVatRate(data.vatRate);
         if (data.levyRates) {
           setCommonPropertyElectricityKwh(data.levyRates.commonPropertyElectricityKwh);
@@ -1514,7 +1567,10 @@ export default function App() {
             {tab === "tariffs" && (
               <RateSettings
                 waterBands={waterBands} setWaterBands={setWaterBands}
+                waterEffectiveFrom={waterEffectiveFrom} setWaterEffectiveFrom={setWaterEffectiveFrom}
+                waterPrevEffectiveFrom={waterPrevEffectiveFrom}
                 electricityRate={electricityRate} setElectricityRate={setElectricityRate}
+                electricityEffectiveFrom={electricityEffectiveFrom} setElectricityEffectiveFrom={setElectricityEffectiveFrom}
                 vatRate={vatRate} setVatRate={setVatRate}
                 commonPropertyElectricityKwh={commonPropertyElectricityKwh}
                 setCommonPropertyElectricityKwh={setCommonPropertyElectricityKwh}
@@ -2487,7 +2543,11 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
 
 // ---------- Rate settings (trustee-editable tariffs) ----------
 function RateSettings({
-  waterBands, setWaterBands, electricityRate, setElectricityRate, vatRate, setVatRate,
+  waterBands, setWaterBands,
+  waterEffectiveFrom, setWaterEffectiveFrom, waterPrevEffectiveFrom,
+  electricityRate, setElectricityRate,
+  electricityEffectiveFrom, setElectricityEffectiveFrom,
+  vatRate, setVatRate,
   commonPropertyElectricityKwh, setCommonPropertyElectricityKwh,
 }) {
   const updateBand = (id, field, value) => {
@@ -2498,7 +2558,7 @@ function RateSettings({
   const save = async () => {
     setSaveStatus("saving");
     try {
-      await saveTariffsToDb({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh });
+      await saveTariffsToDb({ waterBands, waterEffectiveFrom, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh });
       setSaveStatus("saved");
       setTimeout(() => setSaveStatus("idle"), 2500);
     } catch (err) {
@@ -2507,24 +2567,42 @@ function RateSettings({
     }
   };
 
+  // Format a date string for display (e.g. "2025-07-01" → "1 Jul 2025")
+  const fmtDate = (d) => {
+    if (!d) return "—";
+    const dt = new Date(d + "T00:00:00");
+    return dt.toLocaleDateString("en-ZA", { day: "numeric", month: "short", year: "numeric" });
+  };
+
   return (
     <>
       <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Tariffs & rates</h1>
       <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
-        These figures drive every water and electricity calculation across the app. Editing a rate here updates readings, allocation, statements, and reconciliation immediately.
+        Rates are tied to their effective date — changing rates here only affects periods on or after that date. Older statements keep the rates they were issued with.
       </p>
 
       <Card>
         <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Water — increasing block tariff (R / kL)</div>
         <p style={{ fontSize: 12, color: "#94A0AC", marginBottom: 12 }}>
-          Each unit is charged band-by-band on its own consumption. The active rate used in calculations is 2025/2026.
+          Each unit is charged band-by-band on its own consumption. To enter new municipal rates, set a new effective date and update the figures.
         </p>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: "#64748B" }}>Effective from</span>
+          <input
+            type="date" value={waterEffectiveFrom || ""}
+            onChange={(e) => setWaterEffectiveFrom(e.target.value)}
+            style={{ ...inputStyle, width: 160, textAlign: "left", borderColor: "#2F5D50", fontWeight: 700 }}
+          />
+          {waterPrevEffectiveFrom && (
+            <span style={{ fontSize: 11.5, color: "#94A0AC" }}>Previous set: {fmtDate(waterPrevEffectiveFrom)}</span>
+          )}
+        </div>
         <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse" }}>
           <thead>
             <tr style={{ color: "#64748B", textAlign: "right", fontSize: 10.5, textTransform: "uppercase" }}>
               <th style={{ padding: "6px 6px", textAlign: "left" }}>Band</th>
-              <th style={{ padding: "6px 6px" }}>2024/2025</th>
-              <th style={{ padding: "6px 6px", color: "#1B2A38" }}>2025/2026 (active)</th>
+              <th style={{ padding: "6px 6px" }}>Previous{waterPrevEffectiveFrom ? ` (${fmtDate(waterPrevEffectiveFrom)})` : ""}</th>
+              <th style={{ padding: "6px 6px", color: "#1B2A38" }}>Active ({fmtDate(waterEffectiveFrom)})</th>
               <th style={{ padding: "6px 6px" }}>Increase %</th>
             </tr>
           </thead>
@@ -2563,6 +2641,14 @@ function RateSettings({
         <p style={{ fontSize: 12, color: "#94A0AC", marginBottom: 12 }}>
           Single rate applied to every kWh of metered and common-area electricity usage.
         </p>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: "#64748B" }}>Effective from</span>
+          <input
+            type="date" value={electricityEffectiveFrom || ""}
+            onChange={(e) => setElectricityEffectiveFrom(e.target.value)}
+            style={{ ...inputStyle, width: 160, textAlign: "left", borderColor: "#2F5D50", fontWeight: 700 }}
+          />
+        </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <span style={{ fontSize: 13.5 }} className="f-mono">R</span>
           <input
