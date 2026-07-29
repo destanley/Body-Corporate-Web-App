@@ -1576,6 +1576,7 @@ export default function App() {
                 setCommonPropertyElectricityKwh={setCommonPropertyElectricityKwh}
               />
             )}
+            {tab === "rate-history" && <RateHistory />}
             {tab === "levy-setup" && (
               <LevySetup
                 levyBreakdown={levyBreakdown} setLevyBreakdown={setLevyBreakdown}
@@ -1709,6 +1710,7 @@ function SideNav({ tab, setTab }) {
     ["reconciliation", "Bank reconciliation"],
     ["statement-preview", "Statement preview"],
     ["tariffs", "Tariffs & rates"],
+    ["rate-history", "Rate history"],
   ];
   return (
     <nav style={{ width: 210, borderRight: "1px solid #D8D0BE", padding: "24px 12px", minHeight: "calc(100vh - 65px)" }}>
@@ -2710,6 +2712,174 @@ function RateSettings({
           {saveStatus === "saving" ? "Saving…" : "Save tariffs & rates"}
         </button>
       </div>
+    </>
+  );
+}
+
+// ---------- Rate History ----------
+// Read-only page that loads ALL rate sets from the DB and displays them
+// grouped by effective date — a full audit trail independent of the
+// viewing period.
+function RateHistory() {
+  const [waterSets, setWaterSets] = useState(null); // null = loading
+  const [elecRows, setElecRows] = useState(null);
+  const [vatRows, setVatRows] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const client = await ensureSupabaseClient();
+        const [w, e, v] = await Promise.all([
+          client.from("water_tariff_bands").select("*").order("effective_from", { ascending: false }),
+          client.from("electricity_rates").select("*").order("effective_from", { ascending: false }),
+          client.from("vat_rates").select("*").order("effective_from", { ascending: false }),
+        ]);
+        if (cancelled) return;
+        if (w.error) throw w.error;
+        if (e.error) throw e.error;
+        if (v.error) throw v.error;
+
+        // Group water bands by effective_from
+        const grouped = {};
+        (w.data || []).forEach((b) => {
+          const key = b.effective_from;
+          if (!grouped[key]) grouped[key] = [];
+          grouped[key].push(b);
+        });
+        // Sort bands within each group by from_kl
+        Object.values(grouped).forEach((arr) => arr.sort((a, b) => Number(a.from_kl) - Number(b.from_kl)));
+        // Sort groups newest first
+        const sorted = Object.entries(grouped).sort((a, b) => (a[0] < b[0] ? 1 : -1));
+        setWaterSets(sorted);
+        setElecRows(e.data || []);
+        setVatRows(v.data || []);
+      } catch (err) {
+        console.error("Loading rate history failed:", err);
+        if (!cancelled) setError(err.message || "Failed to load rate history");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const fmtDate = (d) => {
+    if (!d) return "—";
+    const dt = new Date(d + "T00:00:00");
+    return dt.toLocaleDateString("en-ZA", { day: "numeric", month: "long", year: "numeric" });
+  };
+
+  if (error) return <Card><p style={{ color: "#B5651D" }}>{error}</p></Card>;
+
+  return (
+    <>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Rate history</h1>
+      <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
+        Complete audit trail of every rate set on file. Each block shows the rates that applied from its effective date until the next set took over.
+      </p>
+
+      {/* Water tariff history */}
+      <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 10, marginTop: 8 }}>Water — increasing block tariff</h2>
+      {waterSets === null ? (
+        <Card><p style={{ color: "#94A0AC", fontSize: 13 }}>Loading…</p></Card>
+      ) : waterSets.length === 0 ? (
+        <Card><p style={{ color: "#94A0AC", fontSize: 13 }}>No water rate history on file.</p></Card>
+      ) : waterSets.map(([effDate, bands], idx) => (
+        <Card key={effDate} style={{ marginBottom: 14, opacity: idx === 0 ? 1 : 0.85 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+            <span style={{ fontWeight: 700, fontSize: 13.5 }}>Effective from {fmtDate(effDate)}</span>
+            {idx === 0 && <span style={{ fontSize: 11, fontWeight: 700, color: "#2F5D50", background: "#E8F0ED", padding: "2px 8px", borderRadius: 4 }}>CURRENT</span>}
+          </div>
+          <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ color: "#64748B", textAlign: "right", fontSize: 10.5, textTransform: "uppercase" }}>
+                <th style={{ padding: "6px 8px", textAlign: "left" }}>Band</th>
+                <th style={{ padding: "6px 8px", textAlign: "left" }}>Range (kL)</th>
+                <th style={{ padding: "6px 8px" }}>Rate (R / kL)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bands.map((b) => (
+                <tr key={b.band_label} style={{ borderTop: "1px solid #EEE7D6" }}>
+                  <td style={{ padding: "8px", fontWeight: 600 }} className="f-mono">{b.band_label}</td>
+                  <td style={{ padding: "8px", color: "#64748B" }} className="f-mono">
+                    {Number(b.from_kl)} – {b.to_kl == null ? "∞" : Number(b.to_kl)}
+                  </td>
+                  <td style={{ padding: "8px", textAlign: "right", fontWeight: 700 }} className="f-mono">
+                    {rand(Number(b.rate_per_kl))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      ))}
+
+      {/* Electricity rate history */}
+      <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 10, marginTop: 24 }}>Electricity — flat rate</h2>
+      {elecRows === null ? (
+        <Card><p style={{ color: "#94A0AC", fontSize: 13 }}>Loading…</p></Card>
+      ) : elecRows.length === 0 ? (
+        <Card><p style={{ color: "#94A0AC", fontSize: 13 }}>No electricity rate history on file.</p></Card>
+      ) : (
+        <Card>
+          <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ color: "#64748B", textAlign: "right", fontSize: 10.5, textTransform: "uppercase" }}>
+                <th style={{ padding: "6px 8px", textAlign: "left" }}>Effective from</th>
+                <th style={{ padding: "6px 8px" }}>Rate (R / kWh)</th>
+                <th style={{ padding: "6px 8px", textAlign: "left" }}>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {elecRows.map((r, idx) => (
+                <tr key={r.id} style={{ borderTop: idx ? "1px solid #EEE7D6" : "none" }}>
+                  <td style={{ padding: "8px", fontWeight: 600 }}>{fmtDate(r.effective_from)}</td>
+                  <td style={{ padding: "8px", textAlign: "right", fontWeight: 700 }} className="f-mono">{rand(Number(r.rate_per_kwh))}</td>
+                  <td style={{ padding: "8px" }}>
+                    {idx === 0
+                      ? <span style={{ fontSize: 11, fontWeight: 700, color: "#2F5D50", background: "#E8F0ED", padding: "2px 8px", borderRadius: 4 }}>CURRENT</span>
+                      : <span style={{ fontSize: 11, color: "#94A0AC" }}>Superseded</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {/* VAT rate history */}
+      <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 10, marginTop: 24 }}>VAT on water & electricity</h2>
+      {vatRows === null ? (
+        <Card><p style={{ color: "#94A0AC", fontSize: 13 }}>Loading…</p></Card>
+      ) : vatRows.length === 0 ? (
+        <Card><p style={{ color: "#94A0AC", fontSize: 13 }}>No VAT rate history on file.</p></Card>
+      ) : (
+        <Card>
+          <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ color: "#64748B", textAlign: "right", fontSize: 10.5, textTransform: "uppercase" }}>
+                <th style={{ padding: "6px 8px", textAlign: "left" }}>Effective from</th>
+                <th style={{ padding: "6px 8px" }}>Rate</th>
+                <th style={{ padding: "6px 8px", textAlign: "left" }}>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {vatRows.map((r, idx) => (
+                <tr key={r.id} style={{ borderTop: idx ? "1px solid #EEE7D6" : "none" }}>
+                  <td style={{ padding: "8px", fontWeight: 600 }}>{fmtDate(r.effective_from)}</td>
+                  <td style={{ padding: "8px", textAlign: "right", fontWeight: 700 }} className="f-mono">{(Number(r.rate) * 100).toFixed(2)}%</td>
+                  <td style={{ padding: "8px" }}>
+                    {idx === 0
+                      ? <span style={{ fontSize: 11, fontWeight: 700, color: "#2F5D50", background: "#E8F0ED", padding: "2px 8px", borderRadius: 4 }}>CURRENT</span>
+                      : <span style={{ fontSize: 11, color: "#94A0AC" }}>Superseded</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
     </>
   );
 }
