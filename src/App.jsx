@@ -3343,28 +3343,20 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
       background: "#F6F1E7", border: "1px solid #D8D0BE", borderRadius: 4,
       padding: "24px 16px", boxShadow: "0 1px 0 #fff inset", maxWidth: 680,
     }}>
-      {/* Responsive styles */}
       <style>{`
         .stmt-paper { font-size: 13px; }
         .stmt-header { display: flex; justify-content: space-between; border-bottom: 2px solid #1B2A38; padding-bottom: 12px; margin-bottom: 18px; gap: 12px; }
         .stmt-header-right { text-align: right; font-size: 11.5px; }
-        .stmt-util-table th, .stmt-util-table td { padding: 7px 4px; }
-        .stmt-util-full { display: table-row; }
-        .stmt-util-mobile { display: none; }
+        .stmt-scroll-wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+        .stmt-util-table { min-width: 520px; }
         .stmt-bank-grid { display: grid; grid-template-columns: 1fr 1fr; row-gap: 4px; font-size: 12.5px; }
         .stmt-grand { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-        .stmt-grand-label { font-size: 15px; }
-        .stmt-grand-value { font-size: 15px; white-space: nowrap; }
         @media (max-width: 540px) {
           .stmt-paper { padding: 16px 12px !important; }
           .stmt-header { flex-direction: column; gap: 8px; }
           .stmt-header-right { text-align: left; }
-          .stmt-util-full { display: none !important; }
-          .stmt-util-mobile { display: table-row !important; }
-          .stmt-util-table { font-size: 12px; }
           .stmt-bank-grid { grid-template-columns: 1fr !important; }
-          .stmt-grand-label { font-size: 13px; }
-          .stmt-grand-value { font-size: 14px; }
+          .stmt-grand { flex-wrap: wrap; }
         }
       `}</style>
 
@@ -3389,68 +3381,44 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
       <div style={{ fontWeight: 700, fontSize: 12.5, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.4, color: "#64748B" }}>
         Utility Charges
       </div>
-      <table className="stmt-util-table" style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-        <thead>
-          {/* Desktop header — all 6 columns */}
-          <tr className="stmt-util-full" style={{ textAlign: "right", color: "#64748B", fontSize: 10, textTransform: "uppercase" }}>
-            <th style={{ padding: "0 4px 8px 0", textAlign: "left" }}>Description</th>
-            <th style={{ padding: "0 4px 8px" }}>Current</th>
-            <th style={{ padding: "0 4px 8px" }}>Previous</th>
-            <th style={{ padding: "0 4px 8px" }}>Consumption</th>
-            <th style={{ padding: "0 4px 8px" }}>Rate</th>
-            <th style={{ padding: "0 0 8px 4px" }}>Due</th>
-          </tr>
-          {/* Mobile header — description + due only */}
-          <tr className="stmt-util-mobile" style={{ textAlign: "right", color: "#64748B", fontSize: 10, textTransform: "uppercase" }}>
-            <th style={{ padding: "0 4px 8px 0", textAlign: "left" }}>Description</th>
-            <th style={{ padding: "0 0 8px 4px" }}>Due</th>
-          </tr>
-        </thead>
-        <tbody>
-          {utilityRows.map((row, i) => (
-            <React.Fragment key={i}>
-              {/* Desktop row */}
-              <tr className="stmt-util-full" style={{ borderTop: "1px solid #E4DCC8" }}>
-                <td style={{ padding: "7px 4px 7px 0", textAlign: "left" }}>{row.desc}</td>
-                <td className="f-mono" style={{ padding: "7px 4px", textAlign: "right", color: "#64748B" }}>{row.curr}</td>
-                <td className="f-mono" style={{ padding: "7px 4px", textAlign: "right", color: "#64748B" }}>{row.prev}</td>
-                <td className="f-mono" style={{ padding: "7px 4px", textAlign: "right" }}>{row.cons}</td>
-                <td className="f-mono" style={{ padding: "7px 4px", textAlign: "right", color: "#64748B" }}>{row.rate}</td>
-                <td className="f-mono" style={{ padding: "7px 0 7px 4px", textAlign: "right", fontWeight: 600 }}>{rand(row.due)}</td>
+      <div className="stmt-scroll-wrapper">
+        <table className="stmt-util-table" style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+          <thead>
+            <tr style={{ textAlign: "right", color: "#64748B", fontSize: 10, textTransform: "uppercase" }}>
+              <th style={{ padding: "0 6px 8px 0", textAlign: "left", whiteSpace: "nowrap" }}>Description</th>
+              <th style={{ padding: "0 6px 8px", whiteSpace: "nowrap" }}>Current</th>
+              <th style={{ padding: "0 6px 8px", whiteSpace: "nowrap" }}>Previous</th>
+              <th style={{ padding: "0 6px 8px", whiteSpace: "nowrap" }}>Consumption</th>
+              <th style={{ padding: "0 6px 8px", whiteSpace: "nowrap" }}>Rate</th>
+              <th style={{ padding: "0 0 8px 6px", whiteSpace: "nowrap" }}>Due</th>
+            </tr>
+          </thead>
+          <tbody>
+            {utilityRows.map((row, i) => (
+              <tr key={i} style={{ borderTop: "1px solid #E4DCC8" }}>
+                <td style={{ padding: "7px 6px 7px 0", textAlign: "left", whiteSpace: "nowrap" }}>{row.desc}</td>
+                <td className="f-mono" style={{ padding: "7px 6px", textAlign: "right", color: "#64748B", whiteSpace: "nowrap" }}>{row.curr}</td>
+                <td className="f-mono" style={{ padding: "7px 6px", textAlign: "right", color: "#64748B", whiteSpace: "nowrap" }}>{row.prev}</td>
+                <td className="f-mono" style={{ padding: "7px 6px", textAlign: "right", whiteSpace: "nowrap" }}>{row.cons}</td>
+                <td className="f-mono" style={{ padding: "7px 6px", textAlign: "right", color: "#64748B", whiteSpace: "nowrap" }}>{row.rate}</td>
+                <td className="f-mono" style={{ padding: "7px 0 7px 6px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{rand(row.due)}</td>
               </tr>
-              {/* Mobile rows — stacked layout */}
-              <tr className="stmt-util-mobile" style={{ borderTop: "1px solid #E4DCC8" }}>
-                <td style={{ padding: "8px 4px 2px 0", textAlign: "left", fontWeight: 600 }}>{row.desc}</td>
-                <td className="f-mono" style={{ padding: "8px 0 2px 4px", textAlign: "right", fontWeight: 600 }}>{rand(row.due)}</td>
-              </tr>
-              <tr className="stmt-util-mobile">
-                <td colSpan={2} style={{ padding: "0 0 8px 0", fontSize: 11, color: "#94A0AC" }}>
-                  Prev {row.prev} → Curr {row.curr} · {row.cons} · {row.rate}
-                </td>
-              </tr>
-            </React.Fragment>
-          ))}
-          <tr style={{ borderTop: "1px solid #1B2A38" }}>
-            <td colSpan={5} className="stmt-util-full" style={{ padding: "7px 4px 7px 0", textAlign: "left", fontWeight: 600 }}>Sub-Total</td>
-            <td className="stmt-util-full f-mono" style={{ padding: "7px 0 7px 4px", textAlign: "right", fontWeight: 600 }}>{rand(r.subTotal)}</td>
-            {/* Mobile sub-total */}
-            <td className="stmt-util-mobile" style={{ padding: "7px 4px 7px 0", textAlign: "left", fontWeight: 600 }}>Sub-Total</td>
-            <td className="stmt-util-mobile f-mono" style={{ padding: "7px 0 7px 4px", textAlign: "right", fontWeight: 600 }}>{rand(r.subTotal)}</td>
-          </tr>
-          <tr>
-            <td colSpan={5} className="stmt-util-full" style={{ padding: "5px 4px 5px 0", textAlign: "left" }}>VAT ({vatPct}%)</td>
-            <td className="stmt-util-full f-mono" style={{ padding: "5px 0 5px 4px", textAlign: "right" }}>{rand(r.vat)}</td>
-            <td className="stmt-util-mobile" style={{ padding: "5px 4px 5px 0", textAlign: "left" }}>VAT ({vatPct}%)</td>
-            <td className="stmt-util-mobile f-mono" style={{ padding: "5px 0 5px 4px", textAlign: "right" }}>{rand(r.vat)}</td>
-          </tr>
-          <tr style={{ borderTop: "1px solid #1B2A38" }}>
-            <td colSpan={5} className="stmt-util-full" style={{ padding: "7px 4px 7px 0", textAlign: "left", fontWeight: 700 }}>Total Due</td>
-            <td className="stmt-util-full f-mono" style={{ padding: "7px 0 7px 4px", textAlign: "right", fontWeight: 700 }}>{rand(r.utilitiesDue)}</td>
-            <td className="stmt-util-mobile" style={{ padding: "7px 4px 7px 0", textAlign: "left", fontWeight: 700 }}>Total Due</td>
-            <td className="stmt-util-mobile f-mono" style={{ padding: "7px 0 7px 4px", textAlign: "right", fontWeight: 700 }}>{rand(r.utilitiesDue)}</td>
-          </tr>
-        </tbody>
-      </table>
+            ))}
+            <tr style={{ borderTop: "1px solid #1B2A38" }}>
+              <td colSpan={5} style={{ padding: "7px 6px 7px 0", textAlign: "left", fontWeight: 600 }}>Sub-Total</td>
+              <td className="f-mono" style={{ padding: "7px 0 7px 6px", textAlign: "right", fontWeight: 600, whiteSpace: "nowrap" }}>{rand(r.subTotal)}</td>
+            </tr>
+            <tr>
+              <td colSpan={5} style={{ padding: "5px 6px 5px 0", textAlign: "left" }}>VAT ({vatPct}%)</td>
+              <td className="f-mono" style={{ padding: "5px 0 5px 6px", textAlign: "right", whiteSpace: "nowrap" }}>{rand(r.vat)}</td>
+            </tr>
+            <tr style={{ borderTop: "1px solid #1B2A38" }}>
+              <td colSpan={5} style={{ padding: "7px 6px 7px 0", textAlign: "left", fontWeight: 700 }}>Total Due</td>
+              <td className="f-mono" style={{ padding: "7px 0 7px 6px", textAlign: "right", fontWeight: 700, whiteSpace: "nowrap" }}>{rand(r.utilitiesDue)}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
 
       {/* Section 2 — levy breakdown */}
       <div style={{ marginTop: 22, borderTop: "1px dashed #D8D0BE", paddingTop: 14 }}>
