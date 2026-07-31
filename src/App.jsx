@@ -808,11 +808,22 @@ async function saveTariffsToDb({ waterBands, waterEffectiveFrom, electricityRate
   }, { onConflict: "effective_from" }));
   // VAT is not date-scoped per rate set — single global rate.
   updates.push(client.from("vat_rates").update({ rate: vatRate }).gte("effective_from", "1900-01-01"));
-  // Levy rates: upsert by financial_year (unique constraint).
-  updates.push(client.from("levy_rates").upsert({
-    financial_year: FY_ACTIVE,
-    common_property_electricity_kwh: commonPropertyElectricityKwh,
-  }, { onConflict: "financial_year" }));
+  // Levy rates: check if a row exists for this FY, then update or insert.
+  // Can't use upsert because PostgreSQL enforces NOT NULL on INSERT values
+  // before checking ON CONFLICT, and we don't want to overwrite the other
+  // columns (water_demand_levy etc.) with zeros when the row already exists.
+  const existingLevy = await client.from("levy_rates").select("financial_year").eq("financial_year", FY_ACTIVE).limit(1);
+  if (existingLevy.data?.length > 0) {
+    updates.push(client.from("levy_rates").update({
+      common_property_electricity_kwh: commonPropertyElectricityKwh,
+    }).eq("financial_year", FY_ACTIVE));
+  } else {
+    updates.push(client.from("levy_rates").insert({
+      financial_year: FY_ACTIVE,
+      common_property_electricity_kwh: commonPropertyElectricityKwh,
+      water_demand_levy: 0, electricity_service_fee: 0, electricity_network_fee: 0,
+    }));
+  }
   const results = await Promise.all(updates);
   const bad = results.find((x) => x.error);
   if (bad) throw bad.error;
