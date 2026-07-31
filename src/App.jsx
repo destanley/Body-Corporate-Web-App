@@ -518,6 +518,12 @@ function nextPeriod(period) {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   return `${d.getFullYear()}-${mm}-01`;
 }
+function prevPeriod(period) {
+  const [y, m] = String(period).split("-").map(Number);
+  const d = new Date(y, m - 2, 1); // m-1 is current (0-based), m-2 is previous
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${d.getFullYear()}-${mm}-01`;
+}
 // The bank-statement month the current statement period reconciles against.
 let ACTIVE_PAYMENT_PERIOD = nextPeriod(CURRENT_PERIOD);
 
@@ -559,7 +565,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   // Statement inputs (readings, levy, charges, council, remittances) are for the
   // statement `period`; the bank statement + transactions are for the following
   // month (`paymentPeriod`), because that's when this period's levies are paid.
-  const [bands, elec, vat, levy, manual, usage, charges, expenses, invoice, btxns, bdocs, remits, overrides] = await Promise.all([
+  const [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides] = await Promise.all([
     client.from("water_tariff_bands").select("*"),
     // Electricity: most recent effective_from ≤ this period (top 2 for YoY comparison)
     client.from("electricity_rates").select("*").lte("effective_from", period).order("effective_from", { ascending: false }).limit(2),
@@ -568,6 +574,8 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     client.from("levy_rates").select("*").eq("financial_year", FY_ACTIVE).limit(1),
     client.from("levy_manual_entries").select("*").eq("financial_year", FY_ACTIVE),
     client.from("monthly_usage").select("*").eq("period", period),
+    // Previous period's readings — their "current" becomes this period's "previous"
+    client.from("monthly_usage").select("*").eq("period", prevPeriod(period)),
     client.from("additional_charges").select("*").eq("period", period),
     client.from("ops_expenses").select("*").order("expense_date", { ascending: false }),
     client.from("council_invoices").select("*").eq("period", period).limit(1),
@@ -576,7 +584,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     client.from("remittance_advices").select("*").eq("period", period),
     client.from("statement_overrides").select("*").eq("period", period),
   ]);
-  const failed = [bands, elec, vat, levy, manual, usage, charges, expenses, invoice, btxns, bdocs, remits, overrides].find((r) => r.error);
+  const failed = [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides].find((r) => r.error);
   if (failed) throw failed.error;
 
   // Water bands: the DB stores one row per band per effective date; the app
@@ -611,15 +619,42 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     levyBreakdown[uid][m.item_label] = Number(m.amount);
   });
 
+  // Build a lookup of the previous period's current readings — these become
+  // this period's "previous" readings so the carry-forward is always correct.
+  const prevReadings = {};
+  (prevUsage.data || []).forEach((m) => {
+    const uid = unitByDbId[m.unit_id];
+    if (uid) prevReadings[uid] = { wCurr: Number(m.water_current), eCurr: Number(m.electricity_current) };
+  });
+
   const readings = {};
   usage.data.forEach((m) => {
     const uid = unitByDbId[m.unit_id];
     if (!uid) return;
+    const prev = prevReadings[uid];
     readings[uid] = {
-      wPrev: Number(m.water_previous), wCurr: Number(m.water_current),
-      ePrev: Number(m.electricity_previous), eCurr: Number(m.electricity_current),
+      // Always derive previous from the prior month's current — this ensures
+      // corrections to last month automatically flow through.
+      wPrev: prev ? prev.wCurr : Number(m.water_previous),
+      wCurr: Number(m.water_current),
+      ePrev: prev ? prev.eCurr : Number(m.electricity_previous),
+      eCurr: Number(m.electricity_current),
       dbId: m.id,
     };
+  });
+  // If this period has no rows yet (first time viewing), seed entries with
+  // the previous period's current readings as the starting point.
+  units.forEach((u) => {
+    if (!readings[u.id]) {
+      const prev = prevReadings[u.id];
+      readings[u.id] = {
+        wPrev: prev ? prev.wCurr : 0,
+        wCurr: prev ? prev.wCurr : 0, // default current = previous (zero usage until entered)
+        ePrev: prev ? prev.eCurr : 0,
+        eCurr: prev ? prev.eCurr : 0,
+        dbId: null,
+      };
+    }
   });
 
   const additionalCharges = Object.fromEntries(units.map((u) => [u.id, []]));
