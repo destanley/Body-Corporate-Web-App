@@ -800,30 +800,19 @@ async function saveTariffsToDb({ waterBands, waterEffectiveFrom, electricityRate
       financial_year: null, // no longer the key — kept for reference
     }, { onConflict: "effective_from,band_label" }));
   });
-  // Electricity rate: upsert by effective_from. Since there's no unique
-  // constraint on effective_from alone, we do update-then-insert.
-  const elecResult = await client.from("electricity_rates")
-    .update({ rate_per_kwh: electricityRate })
-    .eq("effective_from", electricityEffectiveFrom);
-  if (!elecResult.error && (elecResult.count === 0 || elecResult.data?.length === 0)) {
-    updates.push(client.from("electricity_rates").insert({
-      financial_year: null, rate_per_kwh: electricityRate,
-      effective_from: electricityEffectiveFrom,
-    }));
-  }
+  // Electricity rate: upsert by effective_from (unique constraint).
+  updates.push(client.from("electricity_rates").upsert({
+    rate_per_kwh: electricityRate,
+    effective_from: electricityEffectiveFrom,
+    financial_year: null,
+  }, { onConflict: "effective_from" }));
   // VAT is not date-scoped per rate set — single global rate.
   updates.push(client.from("vat_rates").update({ rate: vatRate }).gte("effective_from", "1900-01-01"));
-  // Levy rates: update the configurable field; insert a new row if this FY doesn't exist yet.
-  const levyResult = await client.from("levy_rates").update({
+  // Levy rates: upsert by financial_year (unique constraint).
+  updates.push(client.from("levy_rates").upsert({
+    financial_year: FY_ACTIVE,
     common_property_electricity_kwh: commonPropertyElectricityKwh,
-  }).eq("financial_year", FY_ACTIVE);
-  if (!levyResult.error && (levyResult.count === 0 || levyResult.data?.length === 0)) {
-    updates.push(client.from("levy_rates").insert({
-      financial_year: FY_ACTIVE,
-      common_property_electricity_kwh: commonPropertyElectricityKwh,
-      water_demand_levy: 0, electricity_service_fee: 0, electricity_network_fee: 0,
-    }));
-  }
+  }, { onConflict: "financial_year" }));
   const results = await Promise.all(updates);
   const bad = results.find((x) => x.error);
   if (bad) throw bad.error;
