@@ -3324,7 +3324,7 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
   const unitNumber = r.id.slice(1);
   const utilityRows = [
     { desc: `Electricity`, curr: r.eCurr, prev: r.ePrev, cons: `${r.eUse.toFixed(2)} kWh`, rate: r.elecOverridden ? "Adjusted" : `${num(r.electricityRate)} / kWh`, due: r.elecCost },
-    { desc: `Water`, curr: r.wCurr, prev: r.wPrev, cons: `${r.wUse.toFixed(2)} kL`, rate: r.waterOverridden ? "Adjusted" : (r.wUse ? `${num(r.waterCost / r.wUse)} / kL avg` : "Tiered"), due: r.waterCost },
+    { desc: `Water`, curr: r.wCurr, prev: r.wPrev, cons: `${r.wUse.toFixed(2)} kL`, rate: r.waterOverridden ? "Adjusted" : "Tiered", due: r.waterCost },
   ];
 
   return (
