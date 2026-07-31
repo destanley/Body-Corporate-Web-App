@@ -3344,15 +3344,21 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
       padding: "24px 16px", boxShadow: "0 1px 0 #fff inset", maxWidth: 680,
     }}>
       <style>{`
-        .stmt-paper { font-size: 13px; }
+        .stmt-paper { font-size: 13px; overflow: visible; }
         .stmt-header { display: flex; justify-content: space-between; border-bottom: 2px solid #1B2A38; padding-bottom: 12px; margin-bottom: 18px; gap: 12px; }
         .stmt-header-right { text-align: right; font-size: 11.5px; }
-        .stmt-scroll-wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-        .stmt-util-table { min-width: 520px; }
+        .stmt-scroll-wrapper {
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          margin: 0 -16px;
+          padding: 0 16px;
+        }
+        .stmt-util-table { min-width: 560px; width: 100%; }
         .stmt-bank-grid { display: grid; grid-template-columns: 1fr 1fr; row-gap: 4px; font-size: 12.5px; }
         .stmt-grand { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
         @media (max-width: 540px) {
           .stmt-paper { padding: 16px 12px !important; }
+          .stmt-scroll-wrapper { margin: 0 -12px; padding: 0 12px; }
           .stmt-header { flex-direction: column; gap: 8px; }
           .stmt-header-right { text-align: left; }
           .stmt-bank-grid { grid-template-columns: 1fr !important; }
