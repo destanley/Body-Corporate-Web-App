@@ -471,6 +471,7 @@ function computeStatementRow(data) {
   }
 
   const u = data.unit || {};
+  const payment = data.payment || null; // { amount, reviewed } from bank_transactions
   return {
     id: "U" + u.unitNumber, owner: u.owner, pq: Number(u.pq),
     wPrev, wCurr, ePrev, eCurr, wUse, eUse, electricityRate, vatRate,
@@ -478,7 +479,7 @@ function computeStatementRow(data) {
     waterOverridden: ov.waterDue != null, elecOverridden: ov.electricityDue != null,
     subTotal, vat, utilitiesDue,
     levy, levyItems, extras, additionalTotal, total,
-    deduction,
+    deduction, payment,
   };
 }
 
@@ -3342,7 +3343,20 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
     <div className="print-area stmt-paper" style={{
       background: "#F6F1E7", border: "1px solid #D8D0BE", borderRadius: 4,
       padding: "24px 16px", boxShadow: "0 1px 0 #fff inset", maxWidth: 680,
+      position: "relative", overflow: "hidden",
     }}>
+      {/* PAID stamp — shown when a bank payment has been matched to this unit/period */}
+      {r.payment && (
+        <div style={{
+          position: "absolute", top: 40, right: -20,
+          transform: "rotate(25deg)",
+          border: "4px solid #2F5D50", borderRadius: 8,
+          padding: "6px 28px", fontSize: 28, fontWeight: 900,
+          color: "#2F5D50", opacity: 0.18, letterSpacing: 4,
+          pointerEvents: "none", fontFamily: "monospace",
+          textTransform: "uppercase",
+        }}>PAID</div>
+      )}
       <style>{`
         .stmt-paper { font-size: 13px; overflow: visible; }
         .stmt-header { display: flex; justify-content: space-between; border-bottom: 2px solid #1B2A38; padding-bottom: 12px; margin-bottom: 18px; gap: 12px; }
