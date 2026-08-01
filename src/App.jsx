@@ -3343,20 +3343,7 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
     <div className="print-area stmt-paper" style={{
       background: "#F6F1E7", border: "1px solid #D8D0BE", borderRadius: 4,
       padding: "24px 16px", boxShadow: "0 1px 0 #fff inset", maxWidth: 680,
-      position: "relative", overflow: "hidden",
     }}>
-      {/* PAID stamp — shown when a bank payment has been matched to this unit/period */}
-      {r.payment && (
-        <div style={{
-          position: "absolute", top: 40, right: -20,
-          transform: "rotate(25deg)",
-          border: "4px solid #2F5D50", borderRadius: 8,
-          padding: "6px 28px", fontSize: 28, fontWeight: 900,
-          color: "#2F5D50", opacity: 0.18, letterSpacing: 4,
-          pointerEvents: "none", fontFamily: "monospace",
-          textTransform: "uppercase",
-        }}>PAID</div>
-      )}
       <style>{`
         .stmt-paper { font-size: 13px; overflow: visible; }
         .stmt-header { display: flex; justify-content: space-between; border-bottom: 2px solid #1B2A38; padding-bottom: 12px; margin-bottom: 18px; gap: 12px; }
@@ -3384,6 +3371,18 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
         <div>
           <div className="f-display" style={{ fontSize: 19, fontWeight: 700 }}>El Corazon Body Corporate</div>
           <div style={{ fontSize: 11.5, color: "#64748B" }}>Levy & utility statement — {periodLabel(period)}</div>
+          {/* PAID stamp — shown when a bank payment has been matched to this unit/period */}
+          {r.payment && (
+            <div style={{ marginTop: 12 }}>
+              <div style={{
+                display: "inline-block", transform: "rotate(-8deg)",
+                border: "4px solid #2F5D50", borderRadius: 8,
+                padding: "4px 22px", fontSize: 26, fontWeight: 900,
+                color: "#2F5D50", opacity: 0.18, letterSpacing: 4,
+                fontFamily: "monospace", textTransform: "uppercase",
+              }}>PAID</div>
+            </div>
+          )}
         </div>
         <div className="stmt-header-right">
           <div className="f-mono">Ref: Cor {unitNumber}</div>
