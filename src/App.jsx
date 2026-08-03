@@ -566,7 +566,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   // Statement inputs (readings, levy, charges, council, remittances) are for the
   // statement `period`; the bank statement + transactions are for the following
   // month (`paymentPeriod`), because that's when this period's levies are paid.
-  const [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides] = await Promise.all([
+  const [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays] = await Promise.all([
     client.from("water_tariff_bands").select("*"),
     // Electricity: most recent effective_from ≤ this period (top 2 for YoY comparison)
     client.from("electricity_rates").select("*").lte("effective_from", period).order("effective_from", { ascending: false }).limit(2),
@@ -580,12 +580,18 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     client.from("additional_charges").select("*").eq("period", period),
     client.from("ops_expenses").select("*").order("expense_date", { ascending: false }),
     client.from("council_invoices").select("*").eq("period", period).limit(1),
-    client.from("bank_transactions").select("*").eq("period", paymentPeriod).order("txn_date"),
+    // Two sets, unioned: everything on THIS bank statement (for the transaction
+    // listing and needs-review work), plus any payment applied to this statement
+    // month from another bank month — a resident paying early or late.
+    client.from("bank_transactions").select("*")
+      .or(`period.eq.${paymentPeriod},applied_period.eq.${period}`)
+      .order("txn_date"),
     client.from("bank_statement_documents").select("*").eq("period", paymentPeriod).order("uploaded_at", { ascending: false }).limit(1),
     client.from("remittance_advices").select("*").eq("period", period),
     client.from("statement_overrides").select("*").eq("period", period),
+    client.from("manual_payments").select("*").eq("applied_period", period),
   ]);
-  const failed = [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides].find((r) => r.error);
+  const failed = [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays].find((r) => r.error);
   if (failed) throw failed.error;
 
   // Water bands: the DB stores one row per band per effective date; the app
@@ -678,8 +684,25 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
         matchedUnit: t.matched_unit_id ? unitByDbId[t.matched_unit_id] || null : null,
         confidence: t.match_confidence, note: t.match_note,
         reviewed: !!t.reviewed, reviewNote: t.review_note || "",
+        // Which bank month the line is ON, vs which statement month it SETTLES.
+        // These differ when a resident pays early, late, or twice in a month.
+        period: t.period,
+        appliedPeriod: t.applied_period || null,
       }))
     : null;
+
+  // Provisional payments the trustee recorded before the bank statement landed.
+  // Deduplication is derived, not stored: reconcileUnits ignores any manual
+  // entry once a real bank line exists for the same unit and statement month.
+  const manualPayments = (manualPays.data || []).map((m) => ({
+    dbId: m.id,
+    unit: unitByDbId[m.unit_id] || null,
+    appliedPeriod: m.applied_period,
+    amount: Number(m.amount),
+    datePaid: m.date_paid || null,
+    note: m.note || "",
+  })).filter((m) => m.unit);
+
   const bdoc = bdocs.data[0];
   const bankStatementMeta = bdoc
     ? { fileName: bdoc.file_name, parsedAt: new Date(bdoc.uploaded_at).toLocaleString("en-ZA"), count: bdoc.transaction_count }
@@ -737,6 +760,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   return {
     bankTxns,
     bankStatementMeta,
+    manualPayments,
     remittanceDeductions,
     remittanceAdvices,
     statementOverrides,
@@ -935,6 +959,20 @@ function statementDateToIso(raw) {
 async function saveBankStatementToDb(fileName, txns) {
   const client = await ensureSupabaseClient();
   const unitDbIdByAppId = Object.fromEntries(UNITS.filter((u) => u.dbId).map((u) => [u.id, u.dbId]));
+
+  // Any trustee retargeting lives on rows the delete below is about to remove.
+  // Capture it first and re-apply after the re-insert, or re-importing a
+  // statement silently reverts the fix and the month quietly goes unpaid again.
+  const defaultApplied = prevPeriod(ACTIVE_PAYMENT_PERIOD);
+  const { data: priorTxns } = await client
+    .from("bank_transactions")
+    .select("txn_date, amount, description_raw, applied_period")
+    .eq("period", ACTIVE_PAYMENT_PERIOD)
+    .eq("category", "resident_payment");
+  const retargeted = (priorTxns || []).filter(
+    (p) => p.applied_period && p.applied_period !== defaultApplied
+  );
+
   let { error } = await client.from("bank_transactions").delete().eq("period", ACTIVE_PAYMENT_PERIOD);
   if (error) throw error;
   ({ error } = await client.from("bank_statement_documents").delete().eq("period", ACTIVE_PAYMENT_PERIOD));
@@ -960,6 +998,63 @@ async function saveBankStatementToDb(fileName, txns) {
   }));
   ({ error } = await client.from("bank_transactions").insert(rows));
   if (error) throw error;
+
+  // Re-apply retargeting, matched on the natural key. A deliberate compromise:
+  // if the bank ever restates a line's date, amount or description the override
+  // won't reattach and the line reverts to the default — which shows up as an
+  // unpaid month on the Reconciliation page rather than a silently wrong figure.
+  for (const o of retargeted) {
+    const { error: upErr } = await client
+      .from("bank_transactions")
+      .update({ applied_period: o.applied_period })
+      .eq("period", ACTIVE_PAYMENT_PERIOD)
+      .eq("txn_date", o.txn_date)
+      .eq("amount", o.amount)
+      .eq("description_raw", o.description_raw);
+    if (upErr) console.warn("Could not restore applied_period override:", upErr.message);
+  }
+  if (retargeted.length) {
+    console.info(`Restored ${retargeted.length} applied-period override(s) after re-import.`);
+  }
+}
+
+// Point a bank line at a different statement month — for a resident who paid
+// early, late, or twice in one bank month.
+async function setAppliedPeriodInDb(txnDbId, appliedPeriod) {
+  const client = await ensureSupabaseClient();
+  // .select() is required: without it Supabase returns count: null, so a failed
+  // update is indistinguishable from a successful no-op.
+  const { data, error } = await client
+    .from("bank_transactions")
+    .update({ applied_period: appliedPeriod })
+    .eq("id", txnDbId)
+    .select();
+  if (error) throw new Error(`Could not change applied period: ${error.message}`);
+  return data;
+}
+
+// Provisional payment, recorded before the bank statement exists. One per unit
+// per statement month — re-recording overwrites rather than duplicating.
+async function saveManualPaymentToDb({ unitId, appliedPeriod, amount, datePaid, note }) {
+  const client = await ensureSupabaseClient();
+  const unitDbId = (UNITS.find((u) => u.id === unitId) || {}).dbId;
+  if (!unitDbId) throw new Error(`Unknown unit ${unitId}`);
+  const { data, error } = await client
+    .from("manual_payments")
+    .upsert(
+      { unit_id: unitDbId, applied_period: appliedPeriod, amount, date_paid: datePaid || null, note: note || null },
+      { onConflict: "unit_id,applied_period" }
+    )
+    .select()
+    .single();
+  if (error) throw new Error(`Could not save manual payment: ${error.message}`);
+  return data;
+}
+
+async function deleteManualPaymentFromDb(id) {
+  const client = await ensureSupabaseClient();
+  const { error } = await client.from("manual_payments").delete().eq("id", id);
+  if (error) throw new Error(`Could not remove manual payment: ${error.message}`);
 }
 
 // Resident submissions go through the token RPC (anon); the trustee's
@@ -1329,6 +1424,9 @@ export default function App() {
       ...classifyBankTransaction(`${t.ref} ${t.desc}`),
     }))
   );
+  // Payments the trustee recorded before the bank statement arrived. Ignored
+  // automatically once a real bank line exists for the same unit and month.
+  const [manualPayments, setManualPayments] = useState([]);
   const [bankStatementMeta, setBankStatementMeta] = useState(null); // { fileName, parsedAt, count } | null
   const [bankStatementStatus, setBankStatementStatus] = useState("idle"); // idle | parsing | done | error
   const [bankStatementError, setBankStatementError] = useState(null);
@@ -1433,6 +1531,7 @@ export default function App() {
         }
         setRemittanceDeductions(data.remittanceDeductions);
         setRemittanceAdvices(data.remittanceAdvices);
+        setManualPayments(data.manualPayments || []);
         setUnitsSource("database");
       })
       .catch((err) => {
@@ -1495,6 +1594,29 @@ export default function App() {
     } catch (err) {
       console.error("Saving statement adjustment failed:", err);
     }
+  };
+
+  // Record (or overwrite) a provisional payment for a unit and statement month.
+  const addManualPayment = async ({ unitId, amount, datePaid, note }) => {
+    const saved = await saveManualPaymentToDb({
+      unitId, appliedPeriod: selectedPeriod, amount, datePaid, note,
+    });
+    setManualPayments((prev) => [
+      ...prev.filter((m) => !(m.unit === unitId && m.appliedPeriod === selectedPeriod)),
+      { dbId: saved.id, unit: unitId, appliedPeriod: saved.applied_period, amount: Number(saved.amount), datePaid: saved.date_paid, note: saved.note || "" },
+    ]);
+  };
+
+  const removeManualPayment = async (id) => {
+    await deleteManualPaymentFromDb(id);
+    setManualPayments((prev) => prev.filter((m) => m.dbId !== id));
+  };
+
+  // Retarget a bank line to a different statement month, then refresh so
+  // reconciliation recomputes against the new applied period.
+  const changeAppliedPeriod = async (txn, appliedPeriod) => {
+    await setAppliedPeriodInDb(txn.dbId, appliedPeriod);
+    setBankTxns((prev) => prev.map((t) => (t === txn ? { ...t, appliedPeriod } : t)));
   };
 
   // Records the trustee's review of a bank line: a free-text note explaining a
@@ -1574,7 +1696,7 @@ export default function App() {
           <SideNav tab={tab} setTab={setTab} />
           <main style={{ flex: 1, padding: "28px 32px", maxWidth: 1100 }}>
             <PeriodBar periods={periods} selectedPeriod={selectedPeriod} setSelectedPeriod={setSelectedPeriod} />
-            {tab === "dashboard" && <Dashboard alloc={alloc} setTab={setTab} setSelectedUnit={setSelectedUnit} bankTxns={bankTxns} period={selectedPeriod} remittanceDeductions={remittanceDeductions} />}
+            {tab === "dashboard" && <Dashboard alloc={alloc} setTab={setTab} setSelectedUnit={setSelectedUnit} bankTxns={bankTxns} period={selectedPeriod} remittanceDeductions={remittanceDeductions} manualPayments={manualPayments} />}
             {tab === "readings" && <Readings readings={readings} setReadings={setReadings} period={selectedPeriod} />}
             {tab === "allocation" && (
               <>
@@ -1590,6 +1712,10 @@ export default function App() {
                 setRemittanceDeductions={setRemittanceDeductions}
                 remittanceAdvices={remittanceAdvices}
                 bankTxns={bankTxns}
+                manualPayments={manualPayments}
+                onAddManualPayment={addManualPayment}
+                onRemoveManualPayment={removeManualPayment}
+                onChangeAppliedPeriod={changeAppliedPeriod}
                 onReviewTxn={updateTxnReview}
                 onUploadStatement={handleBankStatementUpload}
                 statementMeta={bankStatementMeta}
@@ -1822,7 +1948,7 @@ function StatusChip({ status }) {
 }
 
 // ---------- Dashboard ----------
-function Dashboard({ alloc, setTab, setSelectedUnit, bankTxns, period = CURRENT_PERIOD, remittanceDeductions = {} }) {
+function Dashboard({ alloc, setTab, setSelectedUnit, bankTxns, period = CURRENT_PERIOD, remittanceDeductions = {}, manualPayments = [] }) {
   const [copiedId, setCopiedId] = useState(null);
   const copyResidentLink = (r) => {
     const link = `${window.location.origin}${window.location.pathname}?unit=${r.token}`;
@@ -1839,7 +1965,7 @@ function Dashboard({ alloc, setTab, setSelectedUnit, bankTxns, period = CURRENT_
   // Same reconciliation source of truth as the Bank reconciliation page, so the
   // two stay in sync — expected nets out approved deductions, settled lines
   // (paid within tolerance or a reviewed variance) count as reconciled.
-  const matches = reconcileUnits(alloc.rows, bankTxns, remittanceDeductions);
+  const matches = reconcileUnits(alloc.rows, bankTxns, remittanceDeductions, {}, period, manualPayments);
   const matchByUnit = Object.fromEntries(matches.map((m) => [m.unit.id, m]));
   const reconciledCount = matches.filter((m) => m.settled).length;
   const outstanding = matches.reduce((s, m) => s + (m.settled ? 0 : Math.max(m.expected - m.received, 0)), 0);
@@ -2932,18 +3058,43 @@ const RECON_TOLERANCE = 0.05;
 // deduction), the matched bank payment, the variance, and whether it's settled.
 //   settled = matched within tolerance, or a variance the trustee marked reviewed.
 //   status  = paid | resolved | review | outstanding.
-function reconcileUnits(rows, bankTxns, remittanceDeductions = {}, remittanceAdvices = {}) {
+function reconcileUnits(rows, bankTxns, remittanceDeductions = {}, remittanceAdvices = {}, period = CURRENT_PERIOD, manualPayments = []) {
   return rows.map((r) => {
     const ded = remittanceDeductions[r.id];
     const adv = remittanceAdvices[r.id];
     const expected = ded && ded.approved ? r.total - ded.amount : r.total;
-    const txn = bankTxns.find((t) => t.category === "resident_payment" && t.matchedUnit === r.id);
-    if (!txn) return { unit: r, txn: null, status: "outstanding", expected, received: 0, diff: undefined, settled: false, ded, adv };
-    const diff = Math.round((txn.amount - expected) * 100) / 100;
+
+    // Every bank line applied to THIS statement month — not just the first one
+    // (the old .find() silently discarded the rest), and not tied to whichever
+    // bank month it happened to land in.
+    const txns = bankTxns.filter(
+      (t) => t.category === "resident_payment" && t.matchedUnit === r.id && t.appliedPeriod === period
+    );
+
+    // Real bank data always wins. A manual entry is only used while no bank line
+    // exists for this unit and month, so importing the statement supersedes it
+    // automatically — nothing to flag, and re-importing stays correct.
+    const manual = manualPayments.filter((m) => m.unit === r.id && m.appliedPeriod === period);
+    const usingManual = txns.length === 0 && manual.length > 0;
+    const sources = txns.length ? txns : manual;
+
+    if (!sources.length) {
+      return { unit: r, txn: null, txns: [], manual: [], provisional: false, status: "outstanding", expected, received: 0, diff: undefined, settled: false, ded, adv };
+    }
+
+    const received = round2(sources.reduce((s, t) => s + t.amount, 0));
+    const diff = round2(received - expected);
     const withinTolerance = Math.abs(diff) < RECON_TOLERANCE;
-    const settled = withinTolerance || !!txn.reviewed;
-    const status = withinTolerance ? "paid" : (txn.reviewed ? "resolved" : "review");
-    return { unit: r, txn, status, diff, expected, received: txn.amount, settled, ded, adv };
+    const reviewed = txns.some((t) => t.reviewed);
+    const settled = withinTolerance || reviewed;
+    const status = withinTolerance ? "paid" : (reviewed ? "resolved" : "review");
+
+    // `txn` retained so the existing single-line ReviewControls keep working.
+    return {
+      unit: r, txn: txns[0] || null, txns, manual,
+      provisional: usingManual,
+      status, diff, expected, received, settled, ded, adv,
+    };
   });
 }
 
@@ -3013,9 +3164,140 @@ function ReviewControls({ txn, onReviewTxn, compact }) {
   );
 }
 
+// Points a bank line at a different statement month. A payment normally settles
+// the previous month's statement, but residents pay early, late, and sometimes
+// twice in one bank month — the July 2026 statement had two Cor 6 credits, one
+// for June and one for July.
+function AppliedPeriodSelect({ txn, onChange }) {
+  const [busy, setBusy] = useState(false);
+  const bankPeriod = txn.period;
+  if (!bankPeriod) return null;
+
+  const defaultApplied = prevPeriod(bankPeriod);
+  const options = [prevPeriod(defaultApplied), defaultApplied, bankPeriod];
+  const current = txn.appliedPeriod || defaultApplied;
+  const isOverride = current !== defaultApplied;
+
+  return (
+    <select
+      value={current}
+      disabled={busy}
+      title={isOverride ? "Retargeted by trustee" : "Statement month this payment settles"}
+      onChange={async (e) => {
+        setBusy(true);
+        try { await onChange(txn, e.target.value); }
+        catch (err) { window.alert(err.message); }
+        finally { setBusy(false); }
+      }}
+      style={{
+        marginLeft: 8, fontSize: 10.5, fontWeight: 700, padding: "1px 4px", borderRadius: 4,
+        border: "1px solid #C9C1B2",
+        background: isOverride ? "#F1EAD3" : "transparent",
+        color: isOverride ? "#8A6D1E" : "#64748B",
+      }}
+    >
+      {options.map((p) => <option key={p} value={p}>{periodLabel(p)}</option>)}
+    </select>
+  );
+}
+
+// Records a payment before the bank statement exists — needed when the AGM
+// falls before the statement showing those payments has been issued. The entry
+// is provisional: reconcileUnits drops it the moment a real bank line appears
+// for the same unit and month, so importing the statement can't double count.
+function ManualPaymentControls({ match, period, onAdd, onRemove }) {
+  const [open, setOpen] = useState(false);
+  const [amount, setAmount] = useState("");
+  const [datePaid, setDatePaid] = useState("");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const existing = match.manual && match.manual[0];
+  const supersededByBank = existing && match.txns.length > 0;
+
+  // A manual entry that the bank statement has since confirmed is dead weight —
+  // surface it so the trustee can clear it rather than leaving it to rot.
+  if (supersededByBank) {
+    return (
+      <div style={{ marginTop: 6, fontSize: 10.5, color: "#64748B" }}>
+        manual entry superseded by bank
+        {onRemove && (
+          <button
+            onClick={async () => { setBusy(true); try { await onRemove(existing.dbId); } finally { setBusy(false); } }}
+            disabled={busy}
+            style={{ background: "none", border: "none", padding: "0 0 0 6px", fontSize: 10.5, fontWeight: 700, color: "#2A3E7A", cursor: "pointer", textDecoration: "underline" }}
+          >clear</button>
+        )}
+      </div>
+    );
+  }
+
+  if (existing) {
+    return (
+      <div style={{ marginTop: 6, fontSize: 10.5 }}>
+        {onRemove && (
+          <button
+            onClick={async () => { setBusy(true); try { await onRemove(existing.dbId); } finally { setBusy(false); } }}
+            disabled={busy}
+            style={{ background: "none", border: "none", padding: 0, fontSize: 10.5, fontWeight: 700, color: "#B5651D", cursor: "pointer", textDecoration: "underline" }}
+          >remove manual payment</button>
+        )}
+      </div>
+    );
+  }
+
+  if (match.txns.length) return null; // already reconciled against the bank
+
+  if (!open) {
+    return (
+      <div style={{ marginTop: 6 }}>
+        <button
+          onClick={() => { setOpen(true); setAmount(String(match.expected.toFixed(2))); }}
+          style={{ background: "none", border: "none", padding: 0, fontSize: 10.5, fontWeight: 700, color: "#2A3E7A", cursor: "pointer", textDecoration: "underline" }}
+        >record payment manually</button>
+      </div>
+    );
+  }
+
+  const submit = async () => {
+    const amt = parseAmount(amount);
+    if (!(amt > 0)) { window.alert("Enter an amount greater than zero."); return; }
+    setBusy(true);
+    try {
+      await onAdd({ unitId: match.unit.id, amount: amt, datePaid: datePaid || null, note: note || null });
+      setOpen(false); setAmount(""); setDatePaid(""); setNote("");
+    } catch (err) {
+      window.alert(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inp = { fontSize: 11, padding: "3px 5px", border: "1px solid #C9C1B2", borderRadius: 4, width: "100%" };
+
+  return (
+    <div style={{ marginTop: 6, display: "grid", gap: 4, minWidth: 150 }}>
+      <input style={inp} value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Amount" inputMode="decimal" />
+      <input style={inp} value={datePaid} onChange={(e) => setDatePaid(e.target.value)} type="date" title="Date paid" />
+      <input style={inp} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (e.g. EFT proof)" />
+      <div style={{ display: "flex", gap: 6 }}>
+        <button onClick={submit} disabled={busy}
+          style={{ background: "#2F5D50", color: "#fff", border: 0, borderRadius: 4, padding: "3px 9px", fontSize: 10.5, fontWeight: 700, cursor: "pointer" }}>
+          {busy ? "Saving…" : "Save"}
+        </button>
+        <button onClick={() => setOpen(false)} disabled={busy}
+          style={{ background: "none", border: "none", fontSize: 10.5, fontWeight: 700, color: "#64748B", cursor: "pointer" }}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Reconciliation({
   alloc, period, remittanceDeductions, setRemittanceDeductions, remittanceAdvices,
-  bankTxns, onReviewTxn, onUploadStatement, statementMeta, statementStatus, statementError,
+  bankTxns, manualPayments = [], onAddManualPayment, onRemoveManualPayment, onChangeAppliedPeriod,
+  onReviewTxn, onUploadStatement, statementMeta, statementStatus, statementError,
 }) {
   const fileInputRef = useRef(null);
 
@@ -3036,9 +3318,15 @@ function Reconciliation({
     }
   };
 
-  const matches = reconcileUnits(alloc.rows, bankTxns, remittanceDeductions, remittanceAdvices || {});
+  const matches = reconcileUnits(alloc.rows, bankTxns, remittanceDeductions, remittanceAdvices || {}, period, manualPayments);
 
-  const otherTxns = bankTxns.filter((t) => !(t.category === "resident_payment" && t.matchedUnit));
+  // The transaction listing shows this bank statement only. Lines pulled in
+  // from another bank month (a payment applied here) are already represented
+  // in the per-unit rows above and would look like strays in the listing.
+  // (t.period is undefined for the in-memory demo statement — keep those.)
+  const otherTxns = bankTxns.filter(
+    (t) => !(t.category === "resident_payment" && t.matchedUnit) && (!t.period || t.period === nextPeriod(period))
+  );
   // Outstanding review work = unmatched "needs review" lines not yet handled,
   // plus per-unit variances not yet marked resolved.
   const needsReviewCount =
@@ -3119,17 +3407,58 @@ function Reconciliation({
                   )}
                 </td>
                 <td className="f-mono" style={{ padding: "9px 8px", fontWeight: 600 }}>{rand(m.expected)}</td>
-                <td className="f-mono" style={{ padding: "9px 8px", fontSize: 12 }}>{m.txn ? m.txn.ref : "—"}</td>
-                <td className="f-mono" style={{ padding: "9px 8px" }}>{m.txn ? rand(m.txn.amount) : "—"}</td>
+                <td style={{ padding: "9px 8px", fontSize: 12 }}>
+                  {m.provisional ? (
+                    m.manual.map((mp) => (
+                      <div key={mp.dbId} style={{ marginBottom: 3 }}>
+                        <span style={{ background: "#F1EAD3", color: "#8A6D1E", fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 20 }}>
+                          MANUAL
+                        </span>
+                        <span style={{ color: "#64748B", fontSize: 11, marginLeft: 6 }}>
+                          {mp.datePaid ? `paid ${mp.datePaid}` : "no date"}{mp.note ? ` · ${mp.note}` : ""}
+                        </span>
+                      </div>
+                    ))
+                  ) : m.txns.length ? (
+                    m.txns.map((t, i) => (
+                      <div key={t.dbId || i} className="f-mono" style={{ marginBottom: 3 }}>
+                        {t.ref}
+                        <span className="f-sans" style={{ color: "#64748B", fontSize: 11 }}> · {rand(t.amount)}</span>
+                        {t.dbId && onChangeAppliedPeriod && (
+                          <AppliedPeriodSelect txn={t} onChange={onChangeAppliedPeriod} />
+                        )}
+                      </div>
+                    ))
+                  ) : "—"}
+                </td>
+                <td className="f-mono" style={{ padding: "9px 8px" }}>
+                  {m.received ? rand(m.received) : "—"}
+                  {m.txns.length > 1 && (
+                    <div className="f-sans" style={{ color: "#64748B", fontSize: 10.5 }}>{m.txns.length} payments</div>
+                  )}
+                </td>
                 <td className="f-mono" style={{ padding: "9px 8px", color: m.diff ? "#B5651D" : "#2F5D50" }}>
                   {m.diff !== undefined ? rand(m.diff) : "—"}
                 </td>
                 <td style={{ padding: "9px 8px" }}>
                   <StatusChip status={m.status} />
+                  {m.provisional && (
+                    <div style={{ fontSize: 10, color: "#8A6D1E", fontWeight: 700, marginTop: 3 }}>
+                      awaiting bank confirmation
+                    </div>
+                  )}
                   {m.txn && (m.status === "review" || m.status === "resolved") && (
                     <div style={{ marginTop: 6 }}>
                       <ReviewControls txn={m.txn} onReviewTxn={onReviewTxn} />
                     </div>
+                  )}
+                  {onAddManualPayment && (
+                    <ManualPaymentControls
+                      match={m}
+                      period={period}
+                      onAdd={onAddManualPayment}
+                      onRemove={onRemoveManualPayment}
+                    />
                   )}
                 </td>
               </tr>
