@@ -576,6 +576,11 @@ async function fetchAvailablePeriods() {
   if (error) throw error;
   const uniq = Array.from(new Set([CURRENT_PERIOD, ...(data || []).map((r) => r.period)]));
   uniq.sort((a, b) => (a < b ? 1 : -1)); // newest first
+  // Always offer the month after the newest one that has data. Without this the
+  // selector can't reach a month until its readings are captured, which makes it
+  // impossible to set up a new financial year's levies and rates in advance —
+  // and the body corp FY turns over on 1 August, before any August readings exist.
+  if (uniq.length) uniq.unshift(nextPeriod(uniq[0]));
   return uniq;
 }
 
@@ -593,9 +598,11 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     // Electricity: most recent effective_from ≤ this period (top 2 for YoY comparison)
     client.from("electricity_rates").select("*").lte("effective_from", period).order("effective_from", { ascending: false }).limit(2),
     client.from("vat_rates").select("*").order("effective_from", { ascending: false }).limit(1),
-    // Levy tables stay keyed to the body corp FY (Aug–Jul)
-    client.from("levy_rates").select("*").eq("financial_year", FY_ACTIVE).limit(1),
-    client.from("levy_manual_entries").select("*").eq("financial_year", FY_ACTIVE),
+    // Levy tables stay keyed to the body corp FY (Aug–Jul). Both years are
+    // fetched in one round trip so a brand-new FY can carry last year's figures
+    // forward rather than falling back to the source-code defaults.
+    client.from("levy_rates").select("*").in("financial_year", [FY_ACTIVE, FY_PREVIOUS]),
+    client.from("levy_manual_entries").select("*").in("financial_year", [FY_ACTIVE, FY_PREVIOUS]),
     client.from("monthly_usage").select("*").eq("period", period),
     // Previous period's readings — their "current" becomes this period's "previous"
     client.from("monthly_usage").select("*").eq("period", prevPeriod(period)),
@@ -659,11 +666,20 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     };
   });
 
-  // Levy manual grid: start from the app defaults, overlay any saved rows.
+  // Levy manual grid: start from the app defaults, overlay the saved rows for
+  // this FY. A financial year that has never been set up has no rows at all —
+  // in that case fall back to last year's grid as an editable starting point,
+  // because the source-code defaults are years out of date. Nothing is written
+  // until the trustee saves, so the previous year's rows stay untouched.
+  const manualActive = (manual.data || []).filter((m) => m.financial_year === FY_ACTIVE);
+  const manualPrevious = (manual.data || []).filter((m) => m.financial_year === FY_PREVIOUS);
+  const levyCarriedForward = manualActive.length === 0 && manualPrevious.length > 0;
+  const manualRows = manualActive.length ? manualActive : manualPrevious;
+
   const levyBreakdown = Object.fromEntries(
     Object.entries(LEVY_BREAKDOWN_DEFAULT).map(([k, v]) => [k, { ...v }])
   );
-  manual.data.forEach((m) => {
+  manualRows.forEach((m) => {
     const uid = unitByDbId[m.unit_id];
     if (!uid) return;
     if (!levyBreakdown[uid]) levyBreakdown[uid] = {};
@@ -823,10 +839,15 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     electricityRate: elec.data[0] ? Number(elec.data[0].rate_per_kwh) : ELECTRICITY_RATE_DEFAULT,
     electricityEffectiveFrom: elec.data[0]?.effective_from || null,
     vatRate: vat.data[0] ? Number(vat.data[0].rate) : VAT_RATE_DEFAULT,
-    levyRates: levy.data[0]
-      ? { commonPropertyElectricityKwh: Number(levy.data[0].common_property_electricity_kwh) }
-      : null,
+    levyRates: (() => {
+      const row = (levy.data || []).find((r) => r.financial_year === FY_ACTIVE)
+        || (levy.data || []).find((r) => r.financial_year === FY_PREVIOUS);
+      return row ? { commonPropertyElectricityKwh: Number(row.common_property_electricity_kwh) } : null;
+    })(),
     levyBreakdown,
+    levyFinancialYear: FY_ACTIVE,
+    levyCarriedForward,
+    levyCarriedFromFY: levyCarriedForward ? FY_PREVIOUS : null,
     readings: Object.keys(readings).length ? readings : READINGS,
     additionalCharges,
     opsExpenses,
@@ -1474,6 +1495,9 @@ export default function App() {
   const [electricityRate, setElectricityRate] = useState(ELECTRICITY_RATE_DEFAULT);
   const [electricityEffectiveFrom, setElectricityEffectiveFrom] = useState("2025-07-01");
   const [levyBreakdown, setLevyBreakdown] = useState(LEVY_BREAKDOWN_DEFAULT);
+  // Which FY the grid above belongs to, and whether it's last year's figures
+  // shown as a starting point because this FY has never been set up.
+  const [levyMeta, setLevyMeta] = useState({ financialYear: FY_ACTIVE, carriedForward: false, carriedFromFY: null });
   const [vatRate, setVatRate] = useState(VAT_RATE_DEFAULT);
   const [commonPropertyElectricityKwh, setCommonPropertyElectricityKwh] = useState(COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT);
   const [additionalCharges, setAdditionalCharges] = useState(ADDITIONAL_CHARGES_DEFAULT);
@@ -1581,6 +1605,11 @@ export default function App() {
           setCommonPropertyElectricityKwh(data.levyRates.commonPropertyElectricityKwh);
         }
         setLevyBreakdown(data.levyBreakdown);
+        setLevyMeta({
+          financialYear: data.levyFinancialYear,
+          carriedForward: Boolean(data.levyCarriedForward),
+          carriedFromFY: data.levyCarriedFromFY || null,
+        });
         setReadings(data.readings);
         setAdditionalCharges(data.additionalCharges);
         setOpsExpenses(data.opsExpenses);
@@ -1837,6 +1866,7 @@ export default function App() {
             {tab === "levy-setup" && (
               <LevySetup
                 levyBreakdown={levyBreakdown} setLevyBreakdown={setLevyBreakdown}
+                levyMeta={levyMeta} onSaved={() => setDataVersion((v) => v + 1)}
                 waterBands={waterBands} electricityRate={electricityRate} vatRate={vatRate}
                 commonPropertyElectricityKwh={commonPropertyElectricityKwh}
                 councilInvoice={councilInvoice}
@@ -2551,7 +2581,7 @@ function Allocation({ alloc }) {
 }
 
 // ---------- Levy breakdown setup (set annually at the AGM) ----------
-function LevySetup({ levyBreakdown, setLevyBreakdown, waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, councilInvoice }) {
+function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, councilInvoice }) {
   // VAT-inclusive suggested values from the confirmed rules (bill figures +
   // rates). They pre-fill via the button below but every cell stays editable.
   const suggestions = computeSuggestedLevyItems({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, councilInvoice });
@@ -2585,6 +2615,9 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, waterBands, electricityRat
     try {
       await saveLevyBreakdownToDb(levyBreakdown);
       setSaveStatus("saved");
+      // Reload so the grid stops being flagged as carried-forward once the new
+      // financial year's rows actually exist.
+      if (onSaved) onSaved();
       setTimeout(() => setSaveStatus("idle"), 2500);
     } catch (err) {
       console.error("Saving levy breakdown failed:", err);
@@ -2594,10 +2627,22 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, waterBands, electricityRat
 
   return (
     <>
-      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Levy breakdown — set annually at the AGM</h1>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>
+        Levy breakdown — {levyMeta.financialYear ? `FY ${levyMeta.financialYear}` : "set annually at the AGM"}
+      </h1>
       <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 14 }}>
         Each unit's monthly levy is the sum of these line items. Every cell is editable and defaults to 0.00 — enter the figures agreed at the AGM once a year; they carry forward every month until changed again. Statements bill exactly what's in this grid.
       </p>
+
+      {levyMeta.carriedForward && (
+        <Card style={{ marginBottom: 16, background: "#FBF3E9", border: "1px solid #E3C9A8" }}>
+          <div style={{ fontSize: 12.5, color: "#8A5A1E", lineHeight: 1.7 }}>
+            <b>FY {levyMeta.financialYear} hasn't been set up yet.</b> This grid is showing FY {levyMeta.carriedFromFY}'s
+            figures as a starting point — nothing has been saved against FY {levyMeta.financialYear} yet, and FY {levyMeta.carriedFromFY}
+            {" "}stays untouched. Apply this year's increases, then save.
+          </div>
+        </Card>
+      )}
 
       <Card style={{ marginBottom: 16, background: "#F4F1E9" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
