@@ -867,17 +867,21 @@ async function saveReadingsToDb(readings) {
   if (error) throw error;
 }
 
-async function saveTariffsToDb({ waterBands, waterEffectiveFrom, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh }) {
+async function saveTariffsToDb({ waterSets, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh }) {
   const client = await ensureSupabaseClient();
   const updates = [];
-  // Water bands: upsert by (effective_from, band_label).
-  // If the effective date is new, this creates a fresh rate set.
-  waterBands.forEach((b) => {
-    updates.push(client.from("water_tariff_bands").upsert({
-      effective_from: waterEffectiveFrom, band_label: b.label,
-      from_kl: b.from, to_kl: b.to, rate_per_kl: b.rate2025,
-      financial_year: null, // no longer the key — kept for reference
-    }, { onConflict: "effective_from,band_label" }));
+  // Water: one or more rate sets, each keyed by its own effective date. Upsert
+  // by (effective_from, band_label), so a date with no set yet is created and
+  // an existing one is corrected in place. Only the sets the trustee actually
+  // touched are passed in — untouched history is never rewritten.
+  (waterSets || []).forEach((set) => {
+    set.bands.forEach((b) => {
+      updates.push(client.from("water_tariff_bands").upsert({
+        effective_from: set.effectiveFrom, band_label: b.label,
+        from_kl: b.from, to_kl: b.to, rate_per_kl: b.rate,
+        financial_year: null, // no longer the key — kept for reference
+      }, { onConflict: "effective_from,band_label" }));
+    });
   });
   // Electricity rate: upsert by effective_from (unique constraint).
   updates.push(client.from("electricity_rates").upsert({
@@ -1460,10 +1464,9 @@ export default function App() {
   const [selectedPeriod, setSelectedPeriod] = useState(CURRENT_PERIOD);
   const [periods, setPeriods] = useState([CURRENT_PERIOD]);
   const [waterBands, setWaterBands] = useState(WATER_BANDS_DEFAULT);
-  const [waterEffectiveFrom, setWaterEffectiveFrom] = useState("2025-07-01");
-  const [waterPrevEffectiveFrom, setWaterPrevEffectiveFrom] = useState(null);
-  // Every saved water rate set, keyed by effective date — feeds the Tariffs &
-  // rates editor so it can resolve Active/Previous against any date.
+  // Every saved water rate set, keyed by effective date. The Tariffs & rates
+  // page works entirely off this; `waterBands` above stays period-scoped and is
+  // what the selected month's statements are billed on.
   const [waterBandHistory, setWaterBandHistory] = useState({});
   // Bumped after a tariff save so the loader below re-runs and every screen
   // picks up the new rate set without a page refresh.
@@ -1570,8 +1573,6 @@ export default function App() {
         const data = await loadAppData(units, selectedPeriod, nextPeriod(selectedPeriod));
         if (cancelled) return;
         setWaterBands(data.waterBands);
-        if (data.waterEffectiveFrom) setWaterEffectiveFrom(data.waterEffectiveFrom);
-        if (data.waterPrevEffectiveFrom !== undefined) setWaterPrevEffectiveFrom(data.waterPrevEffectiveFrom);
         setWaterBandHistory(data.waterBandHistory || {});
         setElectricityRate(data.electricityRate);
         if (data.electricityEffectiveFrom) setElectricityEffectiveFrom(data.electricityEffectiveFrom);
@@ -1824,7 +1825,6 @@ export default function App() {
               <RateSettings
                 waterBands={waterBands}
                 waterBandHistory={waterBandHistory}
-                waterEffectiveFrom={waterEffectiveFrom}
                 onSaved={() => setDataVersion((v) => v + 1)}
                 electricityRate={electricityRate} setElectricityRate={setElectricityRate}
                 electricityEffectiveFrom={electricityEffectiveFrom} setElectricityEffectiveFrom={setElectricityEffectiveFrom}
@@ -2945,7 +2945,7 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
 
 // ---------- Rate settings (trustee-editable tariffs) ----------
 function RateSettings({
-  waterBands, waterBandHistory, waterEffectiveFrom, onSaved,
+  waterBands, waterBandHistory, onSaved,
   electricityRate, setElectricityRate,
   electricityEffectiveFrom, setElectricityEffectiveFrom,
   vatRate, setVatRate,
@@ -2953,79 +2953,101 @@ function RateSettings({
 }) {
   // The water card is a self-contained editor. It deliberately does NOT write
   // into the app-wide `waterBands` state, because that is what the month
-  // currently on screen bills on — typing a future effective date here must not
+  // currently on screen bills on — editing a future rate set here must not
   // silently re-price the statements behind it. Saving writes to the database
   // and then asks App to reload, which is what makes the change take effect.
+  //
+  // The three columns are anchored on TODAY, not on the statement month being
+  // viewed, so this page is a stable "where the rates stand now" view:
+  //   Previous = the set in force before the current one
+  //   Current  = the newest set with an effective date on or before today
+  //   Next     = the first set dated after today (blank until one is added)
+  // Anything beyond "Next" is shown too, labelled by its own date.
+  const TODAY_ISO = new Date().toISOString().slice(0, 10);
   const historyDates = useMemo(() => Object.keys(waterBandHistory || {}).sort(), [waterBandHistory]);
 
-  // Resolve both columns from an effective date:
-  //   Previous = the newest saved set strictly BEFORE that date
-  //   Active   = that date's saved set, or — for a date with no set yet — the
-  //              previous set carried forward as a starting point to edit.
-  const resolveForDate = (date) => {
-    const prevDate = historyDates.filter((d) => d < date).pop() || null;
-    const activeSet = (waterBandHistory || {})[date] || null;
-    const prevSet = prevDate ? waterBandHistory[prevDate] : null;
-    const template = activeSet || prevSet;
-    const labels = template ? Object.keys(template) : waterBands.map((b) => b.label);
-    const rows = labels.map((label) => {
-      const src = (activeSet && activeSet[label]) || (prevSet && prevSet[label]) || null;
-      const fallback = waterBands.find((b) => b.label === label);
-      return {
-        id: label,
-        label,
-        from: src ? src.from : fallback ? fallback.from : 0,
-        to: src ? src.to : fallback ? fallback.to : null,
-        rate2024: prevSet && prevSet[label] ? prevSet[label].rate : 0,
-        rate2025: activeSet && activeSet[label]
-          ? activeSet[label].rate
-          : prevSet && prevSet[label]
-          ? prevSet[label].rate
-          : 0,
-      };
-    });
-    return { rows: rows.sort((a, b) => a.from - b.from), prevDate };
+  // Rate sets created via "Add new rates" but not yet saved.
+  const [addedDates, setAddedDates] = useState([]);
+  // Pending, unsaved edits: { [effectiveFrom]: { [bandLabel]: rate } }
+  const [edits, setEdits] = useState({});
+  const [adding, setAdding] = useState(false);
+  const [newDate, setNewDate] = useState("");
+  const [addError, setAddError] = useState(null);
+
+  const allDates = useMemo(
+    () => [...new Set([...historyDates, ...addedDates])].sort(),
+    [historyDates, addedDates]
+  );
+
+  // Band geometry (labels and kL boundaries) comes from the newest saved set —
+  // the bands themselves haven't changed in years; only the rates move.
+  const bandDefs = useMemo(() => {
+    const newest = historyDates.length ? waterBandHistory[historyDates[historyDates.length - 1]] : null;
+    const defs = newest
+      ? Object.entries(newest).map(([label, b]) => ({ label, from: b.from, to: b.to }))
+      : waterBands.map((b) => ({ label: b.label, from: b.from, to: b.to }));
+    return defs.sort((a, b) => a.from - b.from);
+  }, [historyDates, waterBandHistory, waterBands]);
+
+  const savedRate = (date, label) => {
+    const set = (waterBandHistory || {})[date];
+    return set && set[label] ? set[label].rate : null;
+  };
+  // A pending edit wins; then the saved figure; then — for a set that has just
+  // been added and never saved — the rates carried forward from the set before it.
+  const rateFor = (date, label) => {
+    if (edits[date] && edits[date][label] !== undefined) return edits[date][label];
+    const saved = savedRate(date, label);
+    if (saved !== null) return saved;
+    const base = [...allDates].filter((d) => d < date).reverse().find((d) => savedRate(d, label) !== null);
+    return base ? savedRate(base, label) : 0;
+  };
+  const setRate = (date, label, value) => {
+    setEdits((prev) => ({ ...prev, [date]: { ...prev[date], [label]: parseFloat(value) || 0 } }));
   };
 
-  const [editDate, setEditDate] = useState(waterEffectiveFrom || "");
-  const [editBands, setEditBands] = useState(waterBands);
-  const [prevDate, setPrevDate] = useState(null);
-  // Once the trustee has picked a date here, stay on it. Otherwise the reload
-  // that follows a save would snap the card back to the viewed month's rate set
-  // and make a successful save look like it hadn't stuck.
-  const [dateTouched, setDateTouched] = useState(false);
+  const currentDate = [...allDates].filter((d) => d <= TODAY_ISO).pop() || null;
+  const previousDate = currentDate ? [...allDates].filter((d) => d < currentDate).pop() || null : null;
+  const futureDates = allDates.filter((d) => d > TODAY_ISO);
+  const columns = [
+    previousDate && { date: previousDate, heading: "Previous", editable: false },
+    currentDate && { date: currentDate, heading: "Current", editable: true },
+    ...futureDates.map((d, i) => ({ date: d, heading: i === 0 ? "Next" : "Later", editable: true })),
+  ].filter(Boolean);
+  const hasNext = futureDates.length > 0;
+  const isUnsaved = (d) => addedDates.includes(d) || Boolean(edits[d]);
+  const dirty = allDates.some(isUnsaved);
 
-  // Re-resolve whenever the history lands from the database, or the app's
-  // effective date changes (period switch, or a save round-trip).
-  useEffect(() => {
-    const d = dateTouched ? editDate : waterEffectiveFrom || "";
-    if (!d) return;
-    setEditDate(d);
-    const { rows, prevDate: pd } = resolveForDate(d);
-    if (rows.length) setEditBands(rows);
-    setPrevDate(pd);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [waterEffectiveFrom, waterBandHistory]);
-
-  const changeDate = (d) => {
-    setEditDate(d);
-    setDateTouched(true);
-    if (!d) return;
-    const { rows, prevDate: pd } = resolveForDate(d);
-    if (rows.length) setEditBands(rows);
-    setPrevDate(pd);
+  const addRateSet = () => {
+    setAddError(null);
+    if (!newDate) return setAddError("Pick an effective date");
+    if (allDates.includes(newDate)) return setAddError("A rate set already starts on that date");
+    if (newDate <= TODAY_ISO) return setAddError("New rates must start on a future date");
+    setAddedDates((prev) => [...prev, newDate]);
+    setAdding(false);
+    setNewDate("");
   };
 
-  const updateBand = (id, field, value) => {
-    setEditBands((prev) => prev.map((b) => (b.id === id ? { ...b, [field]: parseFloat(value) || 0 } : b)));
-  };
-  const increasePct = (b) => (b.rate2024 > 0 ? ((b.rate2025 - b.rate2024) / b.rate2024) * 100 : null);
-  const isNewSet = Boolean(editDate) && !historyDates.includes(editDate);
+  // The common-property preview below prices 20kL on the set in force today,
+  // in the shape calcWaterCost expects.
+  const currentBandsForCalc = bandDefs.map((b) => ({
+    ...b, rate2025: currentDate ? rateFor(currentDate, b.label) : 0,
+  }));
+
   const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | saved | error
   const save = async () => {
     setSaveStatus("saving");
     try {
-      await saveTariffsToDb({ waterBands: editBands, waterEffectiveFrom: editDate, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh });
+      // Only push sets that were actually touched — never rewrite history.
+      const waterSets = columns
+        .filter((c) => c.editable && isUnsaved(c.date))
+        .map((c) => ({
+          effectiveFrom: c.date,
+          bands: bandDefs.map((b) => ({ label: b.label, from: b.from, to: b.to, rate: rateFor(c.date, b.label) })),
+        }));
+      await saveTariffsToDb({ waterSets, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh });
+      setEdits({});
+      setAddedDates([]);
       setSaveStatus("saved");
       if (onSaved) onSaved(); // reload so every screen sees the new set
       setTimeout(() => setSaveStatus("idle"), 2500);
@@ -3052,60 +3074,103 @@ function RateSettings({
       <Card>
         <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Water — increasing block tariff (R / kL)</div>
         <p style={{ fontSize: 12, color: "#94A0AC", marginBottom: 12 }}>
-          Each unit is charged band-by-band on its own consumption. To enter new municipal rates, set a new effective date and update the figures.
+          Each unit is charged band-by-band on its own consumption. The previous and current sets are shown for comparison; when the municipality publishes an increase, use <b>Add new rates</b> and give it the date it takes effect.
         </p>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
-          <span style={{ fontSize: 12, fontWeight: 600, color: "#64748B" }}>Effective from</span>
-          <input
-            type="date" value={editDate || ""}
-            onChange={(e) => changeDate(e.target.value)}
-            style={{ ...inputStyle, width: 160, textAlign: "left", borderColor: "#2F5D50", fontWeight: 700 }}
-          />
-          {prevDate && (
-            <span style={{ fontSize: 11.5, color: "#94A0AC" }}>Previous set: {fmtDate(prevDate)}</span>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+          {!adding && (
+            <button
+              onClick={() => { setAdding(true); setAddError(null); }}
+              style={{ background: "#2F5D50", color: "#F6F1E7", border: "none", borderRadius: 6, padding: "7px 14px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}
+            >
+              + Add new rates
+            </button>
           )}
-          {isNewSet && (
-            <span style={{ fontSize: 11.5, color: "#B5651D", fontWeight: 600 }}>
-              New rate set — figures carried forward from {fmtDate(prevDate)}; edit and save
-            </span>
+          {adding && (
+            <>
+              <span style={{ fontSize: 12, fontWeight: 600, color: "#64748B" }}>New rates effective from</span>
+              <input
+                type="date" value={newDate}
+                onChange={(e) => { setNewDate(e.target.value); setAddError(null); }}
+                style={{ ...inputStyle, width: 160, textAlign: "left", borderColor: "#2F5D50", fontWeight: 700 }}
+              />
+              <button
+                onClick={addRateSet}
+                style={{ background: "#2F5D50", color: "#F6F1E7", border: "none", borderRadius: 6, padding: "7px 14px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}
+              >
+                Add
+              </button>
+              <button
+                onClick={() => { setAdding(false); setNewDate(""); setAddError(null); }}
+                style={{ background: "none", border: "none", color: "#64748B", fontSize: 12.5, cursor: "pointer", textDecoration: "underline" }}
+              >
+                Cancel
+              </button>
+              {addError && <span style={{ fontSize: 11.5, color: "#B5651D", fontWeight: 600 }}>{addError}</span>}
+            </>
+          )}
+          {!hasNext && !adding && (
+            <span style={{ fontSize: 11.5, color: "#94A0AC" }}>No future rate set scheduled.</span>
           )}
         </div>
-        <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse" }}>
-          <thead>
-            <tr style={{ color: "#64748B", textAlign: "right", fontSize: 10.5, textTransform: "uppercase" }}>
-              <th style={{ padding: "6px 6px", textAlign: "left" }}>Band</th>
-              <th style={{ padding: "6px 6px" }}>Previous{prevDate ? ` (${fmtDate(prevDate)})` : ""}</th>
-              <th style={{ padding: "6px 6px", color: "#1B2A38" }}>Active ({fmtDate(editDate)})</th>
-              <th style={{ padding: "6px 6px" }}>Increase %</th>
-            </tr>
-          </thead>
-          <tbody>
-            {editBands.map((b) => {
-              const pct = increasePct(b);
-              return (
-                <tr key={b.id} style={{ borderTop: "1px solid #EEE7D6" }}>
-                  <td style={{ padding: "8px 6px", fontWeight: 600 }} className="f-mono">{b.label}</td>
-                  {/* Read-only: the previous set is history. Saving only ever
-                      writes the Active column at the chosen effective date, so
-                      an editable field here would silently discard the edit. */}
-                  <td className="f-mono" style={{ padding: "8px 6px", textAlign: "right", color: "#64748B" }}>
-                    {b.rate2024 ? b.rate2024.toFixed(2) : "—"}
-                  </td>
-                  <td style={{ padding: "4px" }}>
-                    <input
-                      type="number" step="0.01" value={b.rate2025}
-                      onChange={(e) => updateBand(b.id, "rate2025", e.target.value)}
-                      style={{ ...inputStyle, borderColor: "#2F5D50", fontWeight: 700 }}
-                    />
-                  </td>
-                  <td className="f-mono" style={{ padding: "8px 6px", textAlign: "right", color: "#B5651D" }}>
-                    {pct === null ? "—" : `${pct.toFixed(2)}%`}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", minWidth: 520 }}>
+            <thead>
+              <tr style={{ color: "#64748B", textAlign: "right", fontSize: 10.5, textTransform: "uppercase" }}>
+                <th style={{ padding: "6px 6px", textAlign: "left" }}>Band</th>
+                {columns.map((c) => (
+                  <th key={c.date} style={{ padding: "6px 6px", color: c.heading === "Current" ? "#1B2A38" : "#64748B" }}>
+                    {c.heading}
+                    <div style={{ fontWeight: 400, textTransform: "none", fontSize: 10.5, color: "#94A0AC" }}>
+                      {fmtDate(c.date)}{isUnsaved(c.date) ? " · unsaved" : ""}
+                    </div>
+                  </th>
+                ))}
+                <th style={{ padding: "6px 6px" }}>Increase %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {bandDefs.map((b) => {
+                // Increase is measured across the two right-most columns —
+                // i.e. the newest change, which is the one being decided on.
+                const last = columns[columns.length - 1];
+                const beforeLast = columns[columns.length - 2];
+                const from = beforeLast ? rateFor(beforeLast.date, b.label) : 0;
+                const to = last ? rateFor(last.date, b.label) : 0;
+                const pct = from > 0 ? ((to - from) / from) * 100 : null;
+                return (
+                  <tr key={b.label} style={{ borderTop: "1px solid #EEE7D6" }}>
+                    <td style={{ padding: "8px 6px", fontWeight: 600 }} className="f-mono">{b.label}</td>
+                    {columns.map((c) =>
+                      c.editable ? (
+                        <td key={c.date} style={{ padding: "4px" }}>
+                          <input
+                            type="number" step="0.01" value={rateFor(c.date, b.label)}
+                            onChange={(e) => setRate(c.date, b.label, e.target.value)}
+                            style={{ ...inputStyle, borderColor: c.heading === "Current" ? "#D8D0BE" : "#2F5D50", fontWeight: c.heading === "Current" ? 500 : 700 }}
+                          />
+                        </td>
+                      ) : (
+                        // Read-only: superseded sets are history. Letting them be
+                        // edited here would silently re-price issued statements.
+                        <td key={c.date} className="f-mono" style={{ padding: "8px 6px", textAlign: "right", color: "#64748B" }}>
+                          {rateFor(c.date, b.label) ? rateFor(c.date, b.label).toFixed(2) : "—"}
+                        </td>
+                      )
+                    )}
+                    <td className="f-mono" style={{ padding: "8px 6px", textAlign: "right", color: "#B5651D" }}>
+                      {pct === null ? "—" : `${pct.toFixed(2)}%`}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 10 }}>
+          Increase % compares the two most recent sets. Superseded sets are read-only so statements already issued keep the rates they were billed on.
+        </p>
       </Card>
 
       <Card style={{ marginTop: 16 }}>
@@ -3168,7 +3233,7 @@ function RateSettings({
             <span style={{ fontSize: 11.5, color: "#94A0AC" }}>kWh / month, billed at the flat rate above, split 7 ways</span>
           </div>
           <div style={{ fontSize: 12, color: "#64748B" }} className="f-mono">
-            Common Property Water: {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, editBands))} total · {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, editBands) / UNITS.length)} per unit
+            Common Property Water: {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, currentBandsForCalc))} total · {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, currentBandsForCalc) / UNITS.length)} per unit
             <br />
             Common Property Electricity: {rand(commonPropertyElectricityKwh * electricityRate)} total · {rand((commonPropertyElectricityKwh * electricityRate) / UNITS.length)} per unit
           </div>
@@ -3176,6 +3241,7 @@ function RateSettings({
       </Card>
 
       <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10 }}>
+        {dirty && saveStatus === "idle" && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>Unsaved water rate changes</span>}
         {saveStatus === "saved" && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>✓ Saved to database</span>}
         {saveStatus === "error" && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>Couldn't save — see browser console</span>}
         <button style={primaryBtn} onClick={save} disabled={saveStatus === "saving"}>
