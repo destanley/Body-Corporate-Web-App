@@ -3003,7 +3003,25 @@ function RateSettings({
     return base ? savedRate(base, label) : 0;
   };
   const setRate = (date, label, value) => {
-    setEdits((prev) => ({ ...prev, [date]: { ...prev[date], [label]: parseFloat(value) || 0 } }));
+    setEdits((prev) => ({ ...prev, [date]: { ...prev[date], [label]: value } }));
+  };
+
+  // Rates are edited as text, not <input type="number">. The number input
+  // renders its value through the browser locale, which on en-ZA showed
+  // "33,57" next to the read-only column's "33.57" and dropped trailing zeros
+  // ("100,4"). Holding the in-progress keystrokes in `editing` lets the field
+  // show exactly what was typed while focused, and snap to the shared
+  // two-decimal, full-stop format the moment it loses focus.
+  const [editing, setEditing] = useState(null); // { date, label, text } | null
+  const fmtRate = (v) => (v === null || v === undefined || Number.isNaN(v) ? "—" : v.toFixed(2));
+  const rateInputValue = (date, label) =>
+    editing && editing.date === date && editing.label === label
+      ? editing.text
+      : fmtRate(rateFor(date, label));
+  const onRateChange = (date, label, text) => {
+    setEditing({ date, label, text });
+    const n = parseFloat(text.replace(",", "."));
+    if (!Number.isNaN(n)) setRate(date, label, n);
   };
 
   const currentDate = [...allDates].filter((d) => d <= TODAY_ISO).pop() || null;
@@ -3158,8 +3176,11 @@ function RateSettings({
                       c.editable ? (
                         <td key={c.date} style={rateCellStyle}>
                           <input
-                            type="number" step="0.01" value={rateFor(c.date, b.label)}
-                            onChange={(e) => setRate(c.date, b.label, e.target.value)}
+                            type="text" inputMode="decimal"
+                            value={rateInputValue(c.date, b.label)}
+                            onFocus={() => setEditing({ date: c.date, label: b.label, text: String(rateFor(c.date, b.label)) })}
+                            onChange={(e) => onRateChange(c.date, b.label, e.target.value)}
+                            onBlur={() => setEditing(null)}
                             style={{
                               ...inputStyle, textAlign: "center",
                               width: "100%", maxWidth: 110, boxSizing: "border-box", display: "block", margin: "0 auto",
@@ -3171,8 +3192,10 @@ function RateSettings({
                       ) : (
                         // Read-only: superseded sets are history. Letting them be
                         // edited here would silently re-price issued statements.
+                        // savedRate (not rateFor) so a genuine R0.00 band shows as
+                        // 0.00 and only a band absent from that set shows as "—".
                         <td key={c.date} className="f-mono" style={{ ...rateCellStyle, color: "#64748B" }}>
-                          {rateFor(c.date, b.label) ? rateFor(c.date, b.label).toFixed(2) : "—"}
+                          {fmtRate(savedRate(c.date, b.label))}
                         </td>
                       )
                     )}
