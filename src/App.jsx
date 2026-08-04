@@ -3064,6 +3064,10 @@ function RateSettings({
     return dt.toLocaleDateString("en-ZA", { day: "numeric", month: "short", year: "numeric" });
   };
 
+  // Every cell in the water table shares this, so the rows with inputs are
+  // exactly as tall as the read-only ones.
+  const rateCellStyle = { padding: "6px", height: 46, verticalAlign: "middle", textAlign: "center" };
+
   return (
     <>
       <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Tariffs & rates</h1>
@@ -3115,19 +3119,27 @@ function RateSettings({
         </div>
 
         <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", minWidth: 520 }}>
+          {/* Fixed layout + an explicit colgroup keeps every column exactly the
+              same width however many rate sets are on screen, and a fixed row
+              height keeps the read-only cells the same height as the input rows. */}
+          <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", tableLayout: "fixed", minWidth: 130 * (columns.length + 2) }}>
+            <colgroup>
+              {Array.from({ length: columns.length + 2 }).map((_, i) => (
+                <col key={i} style={{ width: `${100 / (columns.length + 2)}%` }} />
+              ))}
+            </colgroup>
             <thead>
               <tr style={{ color: "#64748B", textAlign: "center", fontSize: 10.5, textTransform: "uppercase" }}>
-                <th style={{ padding: "6px 6px" }}>Band</th>
+                <th style={{ padding: "6px", height: 44, verticalAlign: "middle" }}>Band</th>
                 {columns.map((c) => (
-                  <th key={c.date} style={{ padding: "6px 6px", color: c.heading === "Current" ? "#1B2A38" : "#64748B" }}>
+                  <th key={c.date} style={{ padding: "6px", height: 44, verticalAlign: "middle", color: c.heading === "Current" ? "#1B2A38" : "#64748B" }}>
                     {c.heading}
                     <div style={{ fontWeight: 400, textTransform: "none", fontSize: 10.5, color: "#94A0AC" }}>
                       {fmtDate(c.date)}{isUnsaved(c.date) ? " · unsaved" : ""}
                     </div>
                   </th>
                 ))}
-                <th style={{ padding: "6px 6px" }}>Increase %</th>
+                <th style={{ padding: "6px", height: 44, verticalAlign: "middle" }}>Increase %</th>
               </tr>
             </thead>
             <tbody>
@@ -3141,25 +3153,30 @@ function RateSettings({
                 const pct = from > 0 ? ((to - from) / from) * 100 : null;
                 return (
                   <tr key={b.label} style={{ borderTop: "1px solid #EEE7D6", textAlign: "center" }}>
-                    <td style={{ padding: "8px 6px", fontWeight: 600 }} className="f-mono">{b.label}</td>
+                    <td className="f-mono" style={{ ...rateCellStyle, fontWeight: 600 }}>{b.label}</td>
                     {columns.map((c) =>
                       c.editable ? (
-                        <td key={c.date} style={{ padding: "4px" }}>
+                        <td key={c.date} style={rateCellStyle}>
                           <input
                             type="number" step="0.01" value={rateFor(c.date, b.label)}
                             onChange={(e) => setRate(c.date, b.label, e.target.value)}
-                            style={{ ...inputStyle, textAlign: "center", borderColor: c.heading === "Current" ? "#D8D0BE" : "#2F5D50", fontWeight: c.heading === "Current" ? 500 : 700 }}
+                            style={{
+                              ...inputStyle, textAlign: "center",
+                              width: "100%", maxWidth: 110, boxSizing: "border-box", display: "block", margin: "0 auto",
+                              borderColor: c.heading === "Current" ? "#D8D0BE" : "#2F5D50",
+                              fontWeight: c.heading === "Current" ? 500 : 700,
+                            }}
                           />
                         </td>
                       ) : (
                         // Read-only: superseded sets are history. Letting them be
                         // edited here would silently re-price issued statements.
-                        <td key={c.date} className="f-mono" style={{ padding: "8px 6px", color: "#64748B" }}>
+                        <td key={c.date} className="f-mono" style={{ ...rateCellStyle, color: "#64748B" }}>
                           {rateFor(c.date, b.label) ? rateFor(c.date, b.label).toFixed(2) : "—"}
                         </td>
                       )
                     )}
-                    <td className="f-mono" style={{ padding: "8px 6px", color: "#B5651D" }}>
+                    <td className="f-mono" style={{ ...rateCellStyle, color: "#B5651D" }}>
                       {pct === null ? "—" : `${pct.toFixed(2)}%`}
                     </td>
                   </tr>
