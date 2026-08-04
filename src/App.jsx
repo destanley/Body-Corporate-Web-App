@@ -3117,8 +3117,8 @@ function RateSettings({
         <div style={{ overflowX: "auto" }}>
           <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", minWidth: 520 }}>
             <thead>
-              <tr style={{ color: "#64748B", textAlign: "right", fontSize: 10.5, textTransform: "uppercase" }}>
-                <th style={{ padding: "6px 6px", textAlign: "left" }}>Band</th>
+              <tr style={{ color: "#64748B", textAlign: "center", fontSize: 10.5, textTransform: "uppercase" }}>
+                <th style={{ padding: "6px 6px" }}>Band</th>
                 {columns.map((c) => (
                   <th key={c.date} style={{ padding: "6px 6px", color: c.heading === "Current" ? "#1B2A38" : "#64748B" }}>
                     {c.heading}
@@ -3140,7 +3140,7 @@ function RateSettings({
                 const to = last ? rateFor(last.date, b.label) : 0;
                 const pct = from > 0 ? ((to - from) / from) * 100 : null;
                 return (
-                  <tr key={b.label} style={{ borderTop: "1px solid #EEE7D6" }}>
+                  <tr key={b.label} style={{ borderTop: "1px solid #EEE7D6", textAlign: "center" }}>
                     <td style={{ padding: "8px 6px", fontWeight: 600 }} className="f-mono">{b.label}</td>
                     {columns.map((c) =>
                       c.editable ? (
@@ -3148,18 +3148,18 @@ function RateSettings({
                           <input
                             type="number" step="0.01" value={rateFor(c.date, b.label)}
                             onChange={(e) => setRate(c.date, b.label, e.target.value)}
-                            style={{ ...inputStyle, borderColor: c.heading === "Current" ? "#D8D0BE" : "#2F5D50", fontWeight: c.heading === "Current" ? 500 : 700 }}
+                            style={{ ...inputStyle, textAlign: "center", borderColor: c.heading === "Current" ? "#D8D0BE" : "#2F5D50", fontWeight: c.heading === "Current" ? 500 : 700 }}
                           />
                         </td>
                       ) : (
                         // Read-only: superseded sets are history. Letting them be
                         // edited here would silently re-price issued statements.
-                        <td key={c.date} className="f-mono" style={{ padding: "8px 6px", textAlign: "right", color: "#64748B" }}>
+                        <td key={c.date} className="f-mono" style={{ padding: "8px 6px", color: "#64748B" }}>
                           {rateFor(c.date, b.label) ? rateFor(c.date, b.label).toFixed(2) : "—"}
                         </td>
                       )
                     )}
-                    <td className="f-mono" style={{ padding: "8px 6px", textAlign: "right", color: "#B5651D" }}>
+                    <td className="f-mono" style={{ padding: "8px 6px", color: "#B5651D" }}>
                       {pct === null ? "—" : `${pct.toFixed(2)}%`}
                     </td>
                   </tr>
