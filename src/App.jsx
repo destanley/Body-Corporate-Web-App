@@ -2214,9 +2214,18 @@ function Readings({ readings, setReadings, period = CURRENT_PERIOD }) {
   // Current readings are edited as local draft strings so half-typed numbers
   // never ripple into the live billing calculations — figures commit to app
   // state AND the database together when saved.
+  // Every reading on this screen — typed or derived — is shown to two decimals
+  // with a full stop, so the input columns read the same as the carried-forward
+  // and usage columns beside them.
+  const fmtReading = (v) => {
+    const n = Number(v);
+    return Number.isNaN(n) ? "—" : n.toFixed(2);
+  };
+  const toNum = (v) => parseFloat(String(v).replace(",", ".")) || 0;
+
   const toDraft = (rs) => Object.fromEntries(UNITS.map((u) => {
     const r = rs[u.id] || { wCurr: 0, eCurr: 0 };
-    return [u.id, { wCurr: String(r.wCurr), eCurr: String(r.eCurr) }];
+    return [u.id, { wCurr: fmtReading(r.wCurr), eCurr: fmtReading(r.eCurr) }];
   }));
   const [draft, setDraft] = useState(() => toDraft(readings));
   const [status, setStatus] = useState("idle"); // idle | saving | saved | error
@@ -2224,7 +2233,16 @@ function Readings({ readings, setReadings, period = CURRENT_PERIOD }) {
 
   const updateDraft = (uid, field, value) =>
     setDraft((prev) => ({ ...prev, [uid]: { ...prev[uid], [field]: value } }));
-  const draftNum = (uid, field) => parseFloat(draft[uid]?.[field]) || 0;
+  const draftNum = (uid, field) => toNum(draft[uid]?.[field]);
+  // Snap what was typed to the shared format once the field loses focus, so a
+  // comma-decimal or a bare "1234" doesn't sit out of step with its neighbours.
+  const normalizeDraft = (uid, field) =>
+    setDraft((prev) => {
+      const raw = prev[uid]?.[field];
+      const n = parseFloat(String(raw).replace(",", "."));
+      if (Number.isNaN(n)) return prev;
+      return { ...prev, [uid]: { ...prev[uid], [field]: n.toFixed(2) } };
+    });
 
   const save = async () => {
     setStatus("saving");
@@ -2250,39 +2268,57 @@ function Readings({ readings, setReadings, period = CURRENT_PERIOD }) {
         Enter current readings; previous month carries forward automatically. Saving writes to the database and updates every dependent screen.
       </p>
       <Card>
-        <table style={{ width: "100%", fontSize: 13.5, borderCollapse: "collapse" }}>
-          <thead>
-            <tr style={{ color: "#64748B", textAlign: "right", fontSize: 11, textTransform: "uppercase" }}>
-              <th style={{ padding: "6px 8px", textAlign: "left" }}>Unit</th>
-              <th style={{ padding: "6px 8px" }}>Water prev (kL)</th>
-              <th style={{ padding: "6px 8px" }}>Water curr (kL)</th>
-              <th style={{ padding: "6px 8px", color: "#2F5D50" }}>Usage</th>
-              <th style={{ padding: "6px 8px" }}>Elec prev (kWh)</th>
-              <th style={{ padding: "6px 8px" }}>Elec curr (kWh)</th>
-              <th style={{ padding: "6px 8px", color: "#2F5D50" }}>Usage</th>
-            </tr>
-          </thead>
-          <tbody>
-            {UNITS.map((u) => {
-              const r = readings[u.id] || { wPrev: 0, wCurr: 0, ePrev: 0, eCurr: 0 };
-              return (
-                <tr key={u.id} style={{ borderTop: "1px solid #EEE7D6" }} className="f-mono">
-                  <td style={{ padding: "8px", textAlign: "left", fontWeight: 600 }}>{u.id}</td>
-                  <td style={{ padding: "8px", textAlign: "right", color: "#94A0AC" }}>{r.wPrev}</td>
-                  <td style={{ padding: "4px" }}>
-                    <input value={draft[u.id]?.wCurr ?? ""} onChange={(e) => updateDraft(u.id, "wCurr", e.target.value)} style={inputStyle} />
-                  </td>
-                  <td style={{ padding: "8px", textAlign: "right", color: "#2F5D50", fontWeight: 600 }}>{round2(draftNum(u.id, "wCurr") - r.wPrev).toFixed(2)}</td>
-                  <td style={{ padding: "8px", textAlign: "right", color: "#94A0AC" }}>{r.ePrev}</td>
-                  <td style={{ padding: "4px" }}>
-                    <input value={draft[u.id]?.eCurr ?? ""} onChange={(e) => updateDraft(u.id, "eCurr", e.target.value)} style={inputStyle} />
-                  </td>
-                  <td style={{ padding: "8px", textAlign: "right", color: "#2F5D50", fontWeight: 600 }}>{round2(draftNum(u.id, "eCurr") - r.ePrev).toFixed(2)}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        {/* Same treatment as the water tariff table: fixed layout + colgroup for
+            seven equal columns, one shared cell style for a uniform row height,
+            everything centred. */}
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", fontSize: 13.5, borderCollapse: "collapse", tableLayout: "fixed", minWidth: 7 * 110 }}>
+            <colgroup>
+              {Array.from({ length: 7 }).map((_, i) => <col key={i} style={{ width: `${100 / 7}%` }} />)}
+            </colgroup>
+            <thead>
+              <tr style={{ color: "#64748B", textAlign: "center", fontSize: 11, textTransform: "uppercase" }}>
+                <th style={readingHeadStyle}>Unit</th>
+                <th style={readingHeadStyle}>Water prev (kL)</th>
+                <th style={readingHeadStyle}>Water curr (kL)</th>
+                <th style={{ ...readingHeadStyle, color: "#2F5D50" }}>Usage</th>
+                <th style={readingHeadStyle}>Elec prev (kWh)</th>
+                <th style={readingHeadStyle}>Elec curr (kWh)</th>
+                <th style={{ ...readingHeadStyle, color: "#2F5D50" }}>Usage</th>
+              </tr>
+            </thead>
+            <tbody>
+              {UNITS.map((u) => {
+                const r = readings[u.id] || { wPrev: 0, wCurr: 0, ePrev: 0, eCurr: 0 };
+                return (
+                  <tr key={u.id} style={{ borderTop: "1px solid #EEE7D6" }} className="f-mono">
+                    <td style={{ ...readingCellStyle, fontWeight: 600 }}>{u.id}</td>
+                    <td style={{ ...readingCellStyle, color: "#94A0AC" }}>{fmtReading(r.wPrev)}</td>
+                    <td style={readingCellStyle}>
+                      <input
+                        value={draft[u.id]?.wCurr ?? ""}
+                        onChange={(e) => updateDraft(u.id, "wCurr", e.target.value)}
+                        onBlur={() => normalizeDraft(u.id, "wCurr")}
+                        inputMode="decimal" style={readingInputStyle}
+                      />
+                    </td>
+                    <td style={{ ...readingCellStyle, color: "#2F5D50", fontWeight: 600 }}>{round2(draftNum(u.id, "wCurr") - r.wPrev).toFixed(2)}</td>
+                    <td style={{ ...readingCellStyle, color: "#94A0AC" }}>{fmtReading(r.ePrev)}</td>
+                    <td style={readingCellStyle}>
+                      <input
+                        value={draft[u.id]?.eCurr ?? ""}
+                        onChange={(e) => updateDraft(u.id, "eCurr", e.target.value)}
+                        onBlur={() => normalizeDraft(u.id, "eCurr")}
+                        inputMode="decimal" style={readingInputStyle}
+                      />
+                    </td>
+                    <td style={{ ...readingCellStyle, color: "#2F5D50", fontWeight: 600 }}>{round2(draftNum(u.id, "eCurr") - r.ePrev).toFixed(2)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
         <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10 }}>
           {status === "saved" && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>✓ Saved to database</span>}
           {status === "error" && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>Couldn't save — see browser console</span>}
@@ -2306,6 +2342,14 @@ const primaryBtn = {
 const secondaryBtn = {
   background: "transparent", color: "#1B2A38", border: "1px solid #D8D0BE", padding: "9px 16px",
   borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: "pointer",
+};
+// Meter-readings table: uniform column width, row height and centring. Declared
+// after inputStyle because readingInputStyle spreads it at module-eval time.
+const readingHeadStyle = { padding: "6px 8px", height: 40, verticalAlign: "middle", textAlign: "center" };
+const readingCellStyle = { padding: "6px 8px", height: 46, verticalAlign: "middle", textAlign: "center" };
+const readingInputStyle = {
+  ...inputStyle, textAlign: "center",
+  width: "100%", maxWidth: 110, boxSizing: "border-box", display: "block", margin: "0 auto",
 };
 
 // ---------- Utility bills (feeds the levy suggestions & provision check) ----------
