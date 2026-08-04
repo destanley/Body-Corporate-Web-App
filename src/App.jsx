@@ -644,6 +644,21 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   });
   const waterBands = Object.values(byLabel).sort((a, b) => a.from - b.from);
 
+  // The complete rate-set history, keyed by effective date. The two collapsed
+  // sets above are period-scoped (they answer "what did this month bill on?"),
+  // which is right for billing but wrong for the Tariffs & rates editor — there
+  // the trustee picks an effective date, and the Previous column must resolve
+  // against that date, not against the month being viewed.
+  const waterBandHistory = {};
+  (bands.data || []).forEach((b) => {
+    if (!waterBandHistory[b.effective_from]) waterBandHistory[b.effective_from] = {};
+    waterBandHistory[b.effective_from][b.band_label] = {
+      from: Number(b.from_kl),
+      to: b.to_kl == null ? null : Number(b.to_kl),
+      rate: Number(b.rate_per_kl),
+    };
+  });
+
   // Levy manual grid: start from the app defaults, overlay any saved rows.
   const levyBreakdown = Object.fromEntries(
     Object.entries(LEVY_BREAKDOWN_DEFAULT).map(([k, v]) => [k, { ...v }])
@@ -804,6 +819,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     waterBands: waterBands.length ? waterBands : WATER_BANDS_DEFAULT,
     waterEffectiveFrom: waterActiveEffDate,
     waterPrevEffectiveFrom: waterPrevEffDate,
+    waterBandHistory,
     electricityRate: elec.data[0] ? Number(elec.data[0].rate_per_kwh) : ELECTRICITY_RATE_DEFAULT,
     electricityEffectiveFrom: elec.data[0]?.effective_from || null,
     vatRate: vat.data[0] ? Number(vat.data[0].rate) : VAT_RATE_DEFAULT,
@@ -1446,6 +1462,12 @@ export default function App() {
   const [waterBands, setWaterBands] = useState(WATER_BANDS_DEFAULT);
   const [waterEffectiveFrom, setWaterEffectiveFrom] = useState("2025-07-01");
   const [waterPrevEffectiveFrom, setWaterPrevEffectiveFrom] = useState(null);
+  // Every saved water rate set, keyed by effective date — feeds the Tariffs &
+  // rates editor so it can resolve Active/Previous against any date.
+  const [waterBandHistory, setWaterBandHistory] = useState({});
+  // Bumped after a tariff save so the loader below re-runs and every screen
+  // picks up the new rate set without a page refresh.
+  const [dataVersion, setDataVersion] = useState(0);
   const [electricityRate, setElectricityRate] = useState(ELECTRICITY_RATE_DEFAULT);
   const [electricityEffectiveFrom, setElectricityEffectiveFrom] = useState("2025-07-01");
   const [levyBreakdown, setLevyBreakdown] = useState(LEVY_BREAKDOWN_DEFAULT);
@@ -1550,6 +1572,7 @@ export default function App() {
         setWaterBands(data.waterBands);
         if (data.waterEffectiveFrom) setWaterEffectiveFrom(data.waterEffectiveFrom);
         if (data.waterPrevEffectiveFrom !== undefined) setWaterPrevEffectiveFrom(data.waterPrevEffectiveFrom);
+        setWaterBandHistory(data.waterBandHistory || {});
         setElectricityRate(data.electricityRate);
         if (data.electricityEffectiveFrom) setElectricityEffectiveFrom(data.electricityEffectiveFrom);
         setVatRate(data.vatRate);
@@ -1587,7 +1610,7 @@ export default function App() {
         if (!cancelled) setUnitsSource("error");
       });
     return () => { cancelled = true; };
-  }, [session, selectedPeriod]);
+  }, [session, selectedPeriod, dataVersion]);
 
   const handleBankStatementUpload = async (file) => {
     setBankStatementStatus("parsing");
@@ -1799,9 +1822,10 @@ export default function App() {
             )}
             {tab === "tariffs" && (
               <RateSettings
-                waterBands={waterBands} setWaterBands={setWaterBands}
-                waterEffectiveFrom={waterEffectiveFrom} setWaterEffectiveFrom={setWaterEffectiveFrom}
-                waterPrevEffectiveFrom={waterPrevEffectiveFrom}
+                waterBands={waterBands}
+                waterBandHistory={waterBandHistory}
+                waterEffectiveFrom={waterEffectiveFrom}
+                onSaved={() => setDataVersion((v) => v + 1)}
                 electricityRate={electricityRate} setElectricityRate={setElectricityRate}
                 electricityEffectiveFrom={electricityEffectiveFrom} setElectricityEffectiveFrom={setElectricityEffectiveFrom}
                 vatRate={vatRate} setVatRate={setVatRate}
@@ -2921,23 +2945,89 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
 
 // ---------- Rate settings (trustee-editable tariffs) ----------
 function RateSettings({
-  waterBands, setWaterBands,
-  waterEffectiveFrom, setWaterEffectiveFrom, waterPrevEffectiveFrom,
+  waterBands, waterBandHistory, waterEffectiveFrom, onSaved,
   electricityRate, setElectricityRate,
   electricityEffectiveFrom, setElectricityEffectiveFrom,
   vatRate, setVatRate,
   commonPropertyElectricityKwh, setCommonPropertyElectricityKwh,
 }) {
+  // The water card is a self-contained editor. It deliberately does NOT write
+  // into the app-wide `waterBands` state, because that is what the month
+  // currently on screen bills on — typing a future effective date here must not
+  // silently re-price the statements behind it. Saving writes to the database
+  // and then asks App to reload, which is what makes the change take effect.
+  const historyDates = useMemo(() => Object.keys(waterBandHistory || {}).sort(), [waterBandHistory]);
+
+  // Resolve both columns from an effective date:
+  //   Previous = the newest saved set strictly BEFORE that date
+  //   Active   = that date's saved set, or — for a date with no set yet — the
+  //              previous set carried forward as a starting point to edit.
+  const resolveForDate = (date) => {
+    const prevDate = historyDates.filter((d) => d < date).pop() || null;
+    const activeSet = (waterBandHistory || {})[date] || null;
+    const prevSet = prevDate ? waterBandHistory[prevDate] : null;
+    const template = activeSet || prevSet;
+    const labels = template ? Object.keys(template) : waterBands.map((b) => b.label);
+    const rows = labels.map((label) => {
+      const src = (activeSet && activeSet[label]) || (prevSet && prevSet[label]) || null;
+      const fallback = waterBands.find((b) => b.label === label);
+      return {
+        id: label,
+        label,
+        from: src ? src.from : fallback ? fallback.from : 0,
+        to: src ? src.to : fallback ? fallback.to : null,
+        rate2024: prevSet && prevSet[label] ? prevSet[label].rate : 0,
+        rate2025: activeSet && activeSet[label]
+          ? activeSet[label].rate
+          : prevSet && prevSet[label]
+          ? prevSet[label].rate
+          : 0,
+      };
+    });
+    return { rows: rows.sort((a, b) => a.from - b.from), prevDate };
+  };
+
+  const [editDate, setEditDate] = useState(waterEffectiveFrom || "");
+  const [editBands, setEditBands] = useState(waterBands);
+  const [prevDate, setPrevDate] = useState(null);
+  // Once the trustee has picked a date here, stay on it. Otherwise the reload
+  // that follows a save would snap the card back to the viewed month's rate set
+  // and make a successful save look like it hadn't stuck.
+  const [dateTouched, setDateTouched] = useState(false);
+
+  // Re-resolve whenever the history lands from the database, or the app's
+  // effective date changes (period switch, or a save round-trip).
+  useEffect(() => {
+    const d = dateTouched ? editDate : waterEffectiveFrom || "";
+    if (!d) return;
+    setEditDate(d);
+    const { rows, prevDate: pd } = resolveForDate(d);
+    if (rows.length) setEditBands(rows);
+    setPrevDate(pd);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [waterEffectiveFrom, waterBandHistory]);
+
+  const changeDate = (d) => {
+    setEditDate(d);
+    setDateTouched(true);
+    if (!d) return;
+    const { rows, prevDate: pd } = resolveForDate(d);
+    if (rows.length) setEditBands(rows);
+    setPrevDate(pd);
+  };
+
   const updateBand = (id, field, value) => {
-    setWaterBands((prev) => prev.map((b) => (b.id === id ? { ...b, [field]: parseFloat(value) || 0 } : b)));
+    setEditBands((prev) => prev.map((b) => (b.id === id ? { ...b, [field]: parseFloat(value) || 0 } : b)));
   };
   const increasePct = (b) => (b.rate2024 > 0 ? ((b.rate2025 - b.rate2024) / b.rate2024) * 100 : null);
+  const isNewSet = Boolean(editDate) && !historyDates.includes(editDate);
   const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | saved | error
   const save = async () => {
     setSaveStatus("saving");
     try {
-      await saveTariffsToDb({ waterBands, waterEffectiveFrom, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh });
+      await saveTariffsToDb({ waterBands: editBands, waterEffectiveFrom: editDate, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh });
       setSaveStatus("saved");
+      if (onSaved) onSaved(); // reload so every screen sees the new set
       setTimeout(() => setSaveStatus("idle"), 2500);
     } catch (err) {
       console.error("Saving tariffs failed:", err);
@@ -2967,35 +3057,39 @@ function RateSettings({
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
           <span style={{ fontSize: 12, fontWeight: 600, color: "#64748B" }}>Effective from</span>
           <input
-            type="date" value={waterEffectiveFrom || ""}
-            onChange={(e) => setWaterEffectiveFrom(e.target.value)}
+            type="date" value={editDate || ""}
+            onChange={(e) => changeDate(e.target.value)}
             style={{ ...inputStyle, width: 160, textAlign: "left", borderColor: "#2F5D50", fontWeight: 700 }}
           />
-          {waterPrevEffectiveFrom && (
-            <span style={{ fontSize: 11.5, color: "#94A0AC" }}>Previous set: {fmtDate(waterPrevEffectiveFrom)}</span>
+          {prevDate && (
+            <span style={{ fontSize: 11.5, color: "#94A0AC" }}>Previous set: {fmtDate(prevDate)}</span>
+          )}
+          {isNewSet && (
+            <span style={{ fontSize: 11.5, color: "#B5651D", fontWeight: 600 }}>
+              New rate set — figures carried forward from {fmtDate(prevDate)}; edit and save
+            </span>
           )}
         </div>
         <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse" }}>
           <thead>
             <tr style={{ color: "#64748B", textAlign: "right", fontSize: 10.5, textTransform: "uppercase" }}>
               <th style={{ padding: "6px 6px", textAlign: "left" }}>Band</th>
-              <th style={{ padding: "6px 6px" }}>Previous{waterPrevEffectiveFrom ? ` (${fmtDate(waterPrevEffectiveFrom)})` : ""}</th>
-              <th style={{ padding: "6px 6px", color: "#1B2A38" }}>Active ({fmtDate(waterEffectiveFrom)})</th>
+              <th style={{ padding: "6px 6px" }}>Previous{prevDate ? ` (${fmtDate(prevDate)})` : ""}</th>
+              <th style={{ padding: "6px 6px", color: "#1B2A38" }}>Active ({fmtDate(editDate)})</th>
               <th style={{ padding: "6px 6px" }}>Increase %</th>
             </tr>
           </thead>
           <tbody>
-            {waterBands.map((b) => {
+            {editBands.map((b) => {
               const pct = increasePct(b);
               return (
                 <tr key={b.id} style={{ borderTop: "1px solid #EEE7D6" }}>
                   <td style={{ padding: "8px 6px", fontWeight: 600 }} className="f-mono">{b.label}</td>
-                  <td style={{ padding: "4px" }}>
-                    <input
-                      type="number" step="0.01" value={b.rate2024}
-                      onChange={(e) => updateBand(b.id, "rate2024", e.target.value)}
-                      style={inputStyle}
-                    />
+                  {/* Read-only: the previous set is history. Saving only ever
+                      writes the Active column at the chosen effective date, so
+                      an editable field here would silently discard the edit. */}
+                  <td className="f-mono" style={{ padding: "8px 6px", textAlign: "right", color: "#64748B" }}>
+                    {b.rate2024 ? b.rate2024.toFixed(2) : "—"}
                   </td>
                   <td style={{ padding: "4px" }}>
                     <input
@@ -3074,7 +3168,7 @@ function RateSettings({
             <span style={{ fontSize: 11.5, color: "#94A0AC" }}>kWh / month, billed at the flat rate above, split 7 ways</span>
           </div>
           <div style={{ fontSize: 12, color: "#64748B" }} className="f-mono">
-            Common Property Water: {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, waterBands))} total · {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, waterBands) / UNITS.length)} per unit
+            Common Property Water: {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, editBands))} total · {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, editBands) / UNITS.length)} per unit
             <br />
             Common Property Electricity: {rand(commonPropertyElectricityKwh * electricityRate)} total · {rand((commonPropertyElectricityKwh * electricityRate) / UNITS.length)} per unit
           </div>
