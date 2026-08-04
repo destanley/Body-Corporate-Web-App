@@ -406,10 +406,14 @@ async function fetchUnitStatement(token, period) {
 // rows saved before itemised deductions existed.
 function normaliseDeductionItems(deductions, fallbackAmount, fallbackComment) {
   if (Array.isArray(deductions) && deductions.length > 0) {
-    return deductions.map((d) => ({ amount: Number(d.amount) || 0, comment: d.comment || "" }));
+    return deductions.map((d) => ({
+      amount: Number(d.amount) || 0,
+      comment: d.comment || "",
+      expenseCategory: d.expenseCategory || "",
+    }));
   }
   if (Number(fallbackAmount) > 0) {
-    return [{ amount: Number(fallbackAmount), comment: fallbackComment || "" }];
+    return [{ amount: Number(fallbackAmount), comment: fallbackComment || "", expenseCategory: "" }];
   }
   return [];
 }
@@ -509,6 +513,24 @@ function previousFY(fy) {
 let FY_ACTIVE = periodToFY(CURRENT_PERIOD);     // body corp FY for levy tables
 let FY_PREVIOUS = previousFY(FY_ACTIVE);
 
+// ---- Financial-year helpers (analytics) ----
+// The body corp FY runs 1 August – 31 July, so "2025/2026" covers
+// 2025-08-01 .. 2026-07-31. periodToFY above takes a first-of-month period;
+// these take any ISO date, because analytics buckets on transaction date.
+function fyOfDate(dateStr) {
+  const [y, m] = String(dateStr).split("-").map(Number);
+  if (!y || !m) return null;
+  return m >= 8 ? `${y}/${y + 1}` : `${y - 1}/${y}`;
+}
+function fyBounds(fy) {
+  const start = Number(String(fy).split("/")[0]);
+  return { from: `${start}-08-01`, to: `${start + 1}-07-31` };
+}
+function fyLabel(fy) {
+  const start = Number(String(fy).split("/")[0]);
+  return `Aug ${start} – Jul ${start + 1}`;
+}
+
 // A month's levies are billed for period M but only paid the following month,
 // so they land on period M+1's bank statement. Reconciliation therefore matches
 // period M's unit statements against the M+1 bank statement — the "payment
@@ -566,7 +588,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   // Statement inputs (readings, levy, charges, council, remittances) are for the
   // statement `period`; the bank statement + transactions are for the following
   // month (`paymentPeriod`), because that's when this period's levies are paid.
-  const [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays] = await Promise.all([
+  const [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats] = await Promise.all([
     client.from("water_tariff_bands").select("*"),
     // Electricity: most recent effective_from ≤ this period (top 2 for YoY comparison)
     client.from("electricity_rates").select("*").lte("effective_from", period).order("effective_from", { ascending: false }).limit(2),
@@ -590,9 +612,16 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     client.from("remittance_advices").select("*").eq("period", period),
     client.from("statement_overrides").select("*").eq("period", period),
     client.from("manual_payments").select("*").eq("applied_period", period),
+    // Trustee-managed expense category list (Config module) — the single
+    // vocabulary every tagging dropdown and the analytics dashboard use.
+    client.from("expense_categories").select("*").order("sort_order").order("name"),
   ]);
-  const failed = [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays].find((r) => r.error);
+  const failed = [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats].find((r) => r.error);
   if (failed) throw failed.error;
+
+  const expenseCategories = (expCats.data || []).map((c) => ({
+    id: c.id, name: c.name, sortOrder: Number(c.sort_order || 0), active: c.active !== false,
+  }));
 
   // Water bands: the DB stores one row per band per effective date; the app
   // wants one object per band with current + previous rates side by side.
@@ -667,11 +696,17 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   const additionalCharges = Object.fromEntries(units.map((u) => [u.id, []]));
   charges.data.forEach((c) => {
     const uid = unitByDbId[c.unit_id];
-    if (uid) additionalCharges[uid].push({ id: c.id, description: c.description, amount: Number(c.amount) });
+    if (uid) additionalCharges[uid].push({
+      id: c.id, description: c.description, amount: Number(c.amount),
+      expenseCategory: c.expense_category || "",
+    });
   });
 
+  // supersededReason is non-null when the row duplicates a bank line or an
+  // approved resident deduction — kept for audit, excluded from analytics.
   const opsExpenses = expenses.data.map((e) => ({
     id: e.id, date: e.expense_date, category: e.category, amount: Number(e.amount), notes: e.notes || "",
+    supersededReason: e.superseded_reason || null,
   }));
 
   // Persisted bank statement (null when none uploaded yet — demo data stays).
@@ -684,6 +719,8 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
         matchedUnit: t.matched_unit_id ? unitByDbId[t.matched_unit_id] || null : null,
         confidence: t.match_confidence, note: t.match_note,
         reviewed: !!t.reviewed, reviewNote: t.review_note || "",
+        // Trustee-assigned expense category — what drives the analytics dashboard.
+        expenseCategory: t.expense_category || "",
         // Which bank month the line is ON, vs which statement month it SETTLES.
         // These differ when a resident pays early, late, or twice in a month.
         period: t.period,
@@ -777,6 +814,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     readings: Object.keys(readings).length ? readings : READINGS,
     additionalCharges,
     opsExpenses,
+    expenseCategories,
     councilInvoice: inv
       ? {
           bulkWaterKl: Number(inv.bulk_water_kl), bulkWaterRand: Number(inv.bulk_water_rand),
@@ -1212,12 +1250,18 @@ ADDITIONAL_CHARGES_DEFAULT.U3 = [
 // Body Corp operating expenses — paid by the Body Corp itself, never billed to
 // units, but tracked for the analytics dashboard and annual report (e.g. CSOS,
 // Fire Extinguisher Servicing, and the actual Garden Service / Blockwatch cost).
-const OPS_EXPENSE_CATEGORIES = [
-  "CSOS Levy",
-  "Fire Extinguisher Servicing",
-  "Garden Service (actual cost)",
-  "Blockwatch (actual cost)",
-  "Other",
+// Expense categories are trustee-managed in the Config module and live in the
+// `expense_categories` table — this array is only the offline fallback used
+// before that table loads (or if the fetch fails). The live list always wins.
+const EXPENSE_CATEGORIES_FALLBACK = [
+  { id: "f1", name: "CoJ Water", sortOrder: 1, active: true },
+  { id: "f2", name: "CoJ Electricity", sortOrder: 2, active: true },
+  { id: "f3", name: "Insurance", sortOrder: 3, active: true },
+  { id: "f4", name: "Garden Service", sortOrder: 4, active: true },
+  { id: "f5", name: "BlockWatch", sortOrder: 5, active: true },
+  { id: "f6", name: "Bank Charges", sortOrder: 6, active: true },
+  { id: "f7", name: "Maintenance/Miscellaneous", sortOrder: 7, active: true },
+  { id: "f8", name: "Other", sortOrder: 8, active: true },
 ];
 const OPS_EXPENSES_DEFAULT = [
   { id: "ops1", date: "2026-06-05", category: "Garden Service (actual cost)", amount: 387.00, notes: "Paid by Unit 2, proof on file" },
@@ -1411,6 +1455,9 @@ export default function App() {
   const [remittanceDeductions, setRemittanceDeductions] = useState({});
   const [remittanceAdvices, setRemittanceAdvices] = useState({});
   const [opsExpenses, setOpsExpenses] = useState(OPS_EXPENSES_DEFAULT);
+  // Trustee-managed expense category list — Config edits it, every tagging
+  // dropdown and the analytics dashboard read from it.
+  const [expenseCategories, setExpenseCategories] = useState(EXPENSE_CATEGORIES_FALLBACK);
   const [readings, setReadings] = useState(READINGS);
   const [councilInvoice, setCouncilInvoice] = useState(COUNCIL_INVOICE);
   // Manual overrides of the computed utility due lines, per unit, for the
@@ -1513,6 +1560,7 @@ export default function App() {
         setReadings(data.readings);
         setAdditionalCharges(data.additionalCharges);
         setOpsExpenses(data.opsExpenses);
+        if (data.expenseCategories && data.expenseCategories.length) setExpenseCategories(data.expenseCategories);
         setCouncilInvoice(data.councilInvoice);
         setStatementOverrides(data.statementOverrides || {});
         // Reset the statement view for the selected month: show its data if
@@ -1638,6 +1686,28 @@ export default function App() {
     }
   };
 
+  // Tags a bank line with an expense category. This is the primary tagging
+  // point — bank transactions are the cash-basis source of truth for the
+  // analytics dashboard, so an untagged debit shows up there as unclassified
+  // rather than being silently dropped.
+  const updateTxnExpenseCategory = async (txn, expenseCategory) => {
+    const before = txn.expenseCategory || "";
+    setBankTxns((prev) => prev.map((t) => (t === txn ? { ...t, expenseCategory } : t)));
+    if (!txn.dbId) return; // demo/unsaved statement — local-only
+    try {
+      const client = await ensureSupabaseClient();
+      const { error } = await client
+        .from("bank_transactions")
+        .update({ expense_category: expenseCategory || null })
+        .eq("id", txn.dbId);
+      if (error) throw error;
+    } catch (err) {
+      console.error("Saving the expense category failed:", err);
+      setBankTxns((prev) => prev.map((t) => (t.dbId === txn.dbId ? { ...t, expenseCategory: before } : t)));
+      window.alert("Couldn't save the expense category — see browser console.");
+    }
+  };
+
   const alloc = useAllocation(
     waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges,
     commonPropertyElectricityKwh, unitsSource, readings, councilInvoice, statementOverrides
@@ -1717,6 +1787,7 @@ export default function App() {
                 onRemoveManualPayment={removeManualPayment}
                 onChangeAppliedPeriod={changeAppliedPeriod}
                 onReviewTxn={updateTxnReview}
+                onTagTxn={updateTxnExpenseCategory}
                 onUploadStatement={handleBankStatementUpload}
                 statementMeta={bankStatementMeta}
                 statementStatus={bankStatementStatus}
@@ -1752,6 +1823,10 @@ export default function App() {
             )}
             {tab === "ops-expenses" && (
               <OpsExpenses opsExpenses={opsExpenses} setOpsExpenses={setOpsExpenses} period={selectedPeriod} />
+            )}
+            {tab === "analytics" && <Analytics expenseCategories={expenseCategories} />}
+            {tab === "config" && (
+              <Config expenseCategories={expenseCategories} setExpenseCategories={setExpenseCategories} />
             )}
           </main>
         </div>
@@ -1871,8 +1946,10 @@ function SideNav({ tab, setTab }) {
     ["allocation", "Invoice allocation"],
     ["reconciliation", "Bank reconciliation"],
     ["statement-preview", "Statement preview"],
+    ["analytics", "Financial dashboard"],
     ["tariffs", "Tariffs & rates"],
     ["rate-history", "Rate history"],
+    ["config", "Config"],
   ];
   return (
     <nav style={{ width: 210, borderRight: "1px solid #D8D0BE", padding: "24px 12px", minHeight: "calc(100vh - 65px)" }}>
@@ -1899,6 +1976,66 @@ function SideNav({ tab, setTab }) {
         </button>
       ))}
     </nav>
+  );
+}
+
+// ---------- Expense categories (shared across every tagging point) ----------
+// Fetched once per page load and cached at module level, because four separate
+// screens need the same list. Both trustee and resident sessions go through the
+// SECURITY DEFINER RPC: expense_categories itself is trustee-only under RLS,
+// and the RPC returns active names only.
+let EXPENSE_CATEGORY_PROMISE = null;
+function loadExpenseCategoryNames() {
+  if (!EXPENSE_CATEGORY_PROMISE) {
+    EXPENSE_CATEGORY_PROMISE = (async () => {
+      const client = await ensureSupabaseClient();
+      const { data, error } = await client.rpc("get_expense_categories");
+      if (error) throw error;
+      return (data || []).map((c) => c.name);
+    })().catch((err) => {
+      console.error("Loading expense categories failed:", err);
+      EXPENSE_CATEGORY_PROMISE = null; // let a later mount retry
+      return EXPENSE_CATEGORIES_FALLBACK.filter((c) => c.active).map((c) => c.name);
+    });
+  }
+  return EXPENSE_CATEGORY_PROMISE;
+}
+// Call after any Config edit so open dropdowns pick the change up on next mount.
+function invalidateExpenseCategoryCache() { EXPENSE_CATEGORY_PROMISE = null; }
+
+function useExpenseCategoryNames() {
+  const [names, setNames] = useState([]);
+  useEffect(() => {
+    let alive = true;
+    loadExpenseCategoryNames().then((n) => { if (alive) setNames(n); });
+    return () => { alive = false; };
+  }, []);
+  return names;
+}
+
+// The one dropdown used everywhere an expense can be tagged. `value` may be a
+// category that has since been deactivated — it stays selectable so historic
+// records keep their tag rather than silently reverting to untagged.
+function ExpenseCategorySelect({ value, onChange, disabled, placeholder = "Untagged", style, names: namesProp }) {
+  const loaded = useExpenseCategoryNames();
+  const names = namesProp || loaded;
+  const options = value && !names.includes(value) ? [...names, value] : names;
+  return (
+    <select
+      value={value || ""}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value)}
+      style={{
+        padding: "6px 8px", borderRadius: 6, border: "1px solid #D8D0BE",
+        fontSize: 12, fontFamily: "'Inter', sans-serif",
+        background: value ? "#fff" : "#FBF6EC",
+        color: value ? "#1B2A38" : "#8A6D1E",
+        ...style,
+      }}
+    >
+      <option value="">{placeholder}</option>
+      {options.map((n) => <option key={n} value={n}>{n}</option>)}
+    </select>
   );
 }
 
@@ -2464,9 +2601,14 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, waterBands, electricityRat
 
 // ---------- Additional (ad-hoc) charges per statement ----------
 function AdditionalCharges({ additionalCharges, setAdditionalCharges }) {
+  const categoryNames = useExpenseCategoryNames();
   const [unit, setUnit] = useState("U1");
   const [desc, setDesc] = useState("");
   const [amount, setAmount] = useState("");
+  // Optional: a charge recovering a cost the Body Corp incurred (a locksmith
+  // call-out it paid for) can be tagged so the recovery shows against the same
+  // category as the spend on the analytics dashboard.
+  const [expenseCategory, setExpenseCategory] = useState("");
 
   const [dbError, setDbError] = useState(null);
 
@@ -2481,18 +2623,33 @@ function AdditionalCharges({ additionalCharges, setAdditionalCharges }) {
       const client = await ensureSupabaseClient();
       const { data, error } = await client
         .from("additional_charges")
-        .insert({ unit_id: unitRow.dbId, period: ACTIVE_PERIOD, description, amount: amt })
+        .insert({ unit_id: unitRow.dbId, period: ACTIVE_PERIOD, description, amount: amt, expense_category: expenseCategory || null })
         .select("id")
         .single();
       if (error) throw error;
       setAdditionalCharges((prev) => ({
         ...prev,
-        [unit]: [...(prev[unit] || []), { id: data.id, description, amount: amt }],
+        [unit]: [...(prev[unit] || []), { id: data.id, description, amount: amt, expenseCategory }],
       }));
-      setDesc(""); setAmount("");
+      setDesc(""); setAmount(""); setExpenseCategory("");
     } catch (err) {
       console.error("Saving additional charge failed:", err);
       setDbError("Couldn't save the charge — see browser console.");
+    }
+  };
+  const retagCharge = async (unitId, chargeId, next) => {
+    setDbError(null);
+    setAdditionalCharges((prev) => ({
+      ...prev,
+      [unitId]: (prev[unitId] || []).map((c) => (c.id === chargeId ? { ...c, expenseCategory: next } : c)),
+    }));
+    try {
+      const client = await ensureSupabaseClient();
+      const { error } = await client.from("additional_charges").update({ expense_category: next || null }).eq("id", chargeId);
+      if (error) throw error;
+    } catch (err) {
+      console.error("Retagging additional charge failed:", err);
+      setDbError("Couldn't change the category — see browser console.");
     }
   };
   const removeCharge = async (unitId, chargeId) => {
@@ -2534,6 +2691,11 @@ function AdditionalCharges({ additionalCharges, setAdditionalCharges }) {
             value={amount} onChange={(e) => setAmount(e.target.value)}
             style={{ ...inputStyle, width: 140, textAlign: "left" }}
           />
+          <ExpenseCategorySelect
+            value={expenseCategory} onChange={setExpenseCategory} names={categoryNames}
+            placeholder="Cost recovery for… (optional)"
+            style={{ padding: "8px 10px", fontSize: 13 }}
+          />
           <button style={primaryBtn} onClick={addCharge}>Add to statement</button>
         </div>
         {dbError && <div style={{ marginTop: 10, fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{dbError}</div>}
@@ -2554,6 +2716,12 @@ function AdditionalCharges({ additionalCharges, setAdditionalCharges }) {
                   <div key={c.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, padding: "6px 0", borderTop: "1px solid #EEE7D6" }}>
                     <span>{c.description}</span>
                     <span style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <ExpenseCategorySelect
+                        value={c.expenseCategory}
+                        onChange={(v) => retagCharge(u.id, c.id, v)}
+                        names={categoryNames}
+                        placeholder="No cost recovery"
+                      />
                       <span className="f-mono">{rand(c.amount)}</span>
                       <button
                         onClick={() => removeCharge(u.id, c.id)}
@@ -2582,8 +2750,9 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
   // Default the date picker to today (clamped to the selected month for convenience).
   const todayStr = new Date().toISOString().slice(0, 10);
   const defaultDate = todayStr.startsWith(periodYM) ? todayStr : `${periodYM}-01`;
+  const categoryNames = useExpenseCategoryNames();
   const [date, setDate] = useState(defaultDate);
-  const [category, setCategory] = useState(OPS_EXPENSE_CATEGORIES[0]);
+  const [category, setCategory] = useState("");
   const [amount, setAmount] = useState("");
   const [notes, setNotes] = useState("");
 
@@ -2597,6 +2766,7 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
 
   const addExpense = async () => {
     if (!date || !amount) return;
+    if (!category) { setDbError("Pick an expense category first."); return; }
     const amt = parseFloat(amount) || 0;
     setDbError(null);
     try {
@@ -2607,7 +2777,7 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
         .select("id")
         .single();
       if (error) throw error;
-      setOpsExpenses((prev) => [...prev, { id: data.id, date, category, amount: amt, notes }]);
+      setOpsExpenses((prev) => [...prev, { id: data.id, date, category, amount: amt, notes, supersededReason: null }]);
       setAmount(""); setNotes("");
     } catch (err) {
       console.error("Saving expense failed:", err);
@@ -2626,17 +2796,40 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
       setDbError("Couldn't remove the expense — see browser console.");
     }
   };
-  const total = monthExpenses.reduce((s, e) => s + e.amount, 0);
-  const allTimeTotal = opsExpenses.reduce((s, e) => s + e.amount, 0);
-  const byCategory = OPS_EXPENSE_CATEGORIES.map((cat) => ({
-    cat, total: monthExpenses.filter((e) => e.category === cat).reduce((s, e) => s + e.amount, 0),
-  })).filter((c) => c.total > 0);
+  // Retag an existing row — the trustee often only knows the right category
+  // after the fact, and the analytics dashboard reads straight off this field.
+  const retagExpense = async (id, nextCategory) => {
+    setDbError(null);
+    const prevRows = opsExpenses;
+    setOpsExpenses((prev) => prev.map((e) => (e.id === id ? { ...e, category: nextCategory } : e)));
+    try {
+      const client = await ensureSupabaseClient();
+      const { error } = await client.from("ops_expenses").update({ category: nextCategory }).eq("id", id);
+      if (error) throw error;
+    } catch (err) {
+      console.error("Retagging expense failed:", err);
+      setOpsExpenses(prevRows);
+      setDbError("Couldn't change the category — see browser console.");
+    }
+  };
+
+  // Superseded rows duplicate a bank line or an approved resident deduction.
+  // They're kept for audit but must never be added into a total.
+  const countedExpenses = monthExpenses.filter((e) => !e.supersededReason);
+  const total = countedExpenses.reduce((s, e) => s + e.amount, 0);
+  const allTimeTotal = opsExpenses.filter((e) => !e.supersededReason).reduce((s, e) => s + e.amount, 0);
+  const byCategory = Array.from(new Set(countedExpenses.map((e) => e.category))).map((cat) => ({
+    cat, total: countedExpenses.filter((e) => e.category === cat).reduce((s, e) => s + e.amount, 0),
+  })).filter((c) => c.total > 0).sort((a, b) => b.total - a.total);
+  const supersededCount = monthExpenses.length - countedExpenses.length;
 
   return (
     <>
       <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Body corp operating expenses</h1>
       <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
-        Costs the Body Corp pays directly — CSOS, fire extinguisher servicing, and the actual Garden Service / Blockwatch spend. Never billed to a unit; tracked here for the analytics dashboard and the September annual report.
+        Costs the Body Corp pays directly. Never billed to a unit; tracked here for the analytics dashboard and the September annual report.
+        <br />
+        <strong>Log only expenses that never went through the bank account</strong> — anything on a bank statement is captured (and tagged) on the Bank reconciliation page, and anything a resident paid personally is captured on their deduction claim. Rows that duplicate either are greyed out below and excluded from every total.
       </p>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 18 }}>
@@ -2655,9 +2848,11 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
         <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>Log an expense</div>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={{ ...inputStyle, width: 150, textAlign: "left" }} />
-          <select value={category} onChange={(e) => setCategory(e.target.value)} style={{ padding: "8px 10px", borderRadius: 6, border: "1px solid #D8D0BE" }}>
-            {OPS_EXPENSE_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
+          <ExpenseCategorySelect
+            value={category} onChange={setCategory} names={categoryNames}
+            placeholder="Choose a category…"
+            style={{ padding: "8px 10px", fontSize: 13 }}
+          />
           <input placeholder="Amount (R)" type="number" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} style={{ ...inputStyle, width: 130, textAlign: "left" }} />
           <input placeholder="Notes (e.g. who paid, proof on file)" value={notes} onChange={(e) => setNotes(e.target.value)} style={{ ...inputStyle, width: 260, textAlign: "left" }} />
           <button style={primaryBtn} onClick={addExpense}>Add expense</button>
@@ -2668,6 +2863,11 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
       <Card style={{ marginTop: 16 }}>
         <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>
           Expense log — {periodLabel(period)}
+          {supersededCount > 0 && (
+            <span style={{ fontWeight: 400, fontSize: 12, color: "#B5651D", marginLeft: 10 }}>
+              ({supersededCount} excluded as duplicates — already counted elsewhere)
+            </span>
+          )}
           {monthExpenses.length === 0 && opsExpenses.length > 0 && (
             <span style={{ fontWeight: 400, fontSize: 12, color: "#94A0AC", marginLeft: 10 }}>
               (no expenses logged this month — {opsExpenses.length} in other months)
@@ -2688,11 +2888,25 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
             {monthExpenses.length === 0 ? (
               <tr><td colSpan={5} style={{ padding: 16, textAlign: "center", color: "#94A0AC", fontSize: 13 }}>No expenses for {periodLabel(period)}</td></tr>
             ) : monthExpenses.map((e) => (
-              <tr key={e.id} style={{ borderTop: "1px solid #EEE7D6" }}>
+              <tr key={e.id} style={{ borderTop: "1px solid #EEE7D6", opacity: e.supersededReason ? 0.55 : 1 }}>
                 <td className="f-mono" style={{ padding: "8px" }}>{e.date}</td>
-                <td style={{ padding: "8px" }}>{e.category}</td>
-                <td style={{ padding: "8px", color: "#64748B" }}>{e.notes}</td>
-                <td className="f-mono" style={{ padding: "8px", textAlign: "right" }}>{rand(e.amount)}</td>
+                <td style={{ padding: "8px" }}>
+                  <ExpenseCategorySelect
+                    value={e.category}
+                    onChange={(v) => retagExpense(e.id, v)}
+                    names={categoryNames}
+                    disabled={!!e.supersededReason}
+                  />
+                </td>
+                <td style={{ padding: "8px", color: "#64748B" }}>
+                  {e.notes}
+                  {e.supersededReason && (
+                    <div style={{ color: "#B5651D", fontSize: 11, fontWeight: 600, marginTop: 2 }}>
+                      Excluded — {e.supersededReason.toLowerCase()}
+                    </div>
+                  )}
+                </td>
+                <td className="f-mono" style={{ padding: "8px", textAlign: "right", textDecoration: e.supersededReason ? "line-through" : "none" }}>{rand(e.amount)}</td>
                 <td style={{ padding: "8px", textAlign: "right" }}>
                   <button onClick={() => removeExpense(e.id)} style={{ background: "none", border: "none", color: "#B5651D", fontSize: 12, cursor: "pointer", textDecoration: "underline" }}>Remove</button>
                 </td>
@@ -3058,6 +3272,565 @@ const RECON_TOLERANCE = 0.05;
 // deduction), the matched bank payment, the variance, and whether it's settled.
 //   settled = matched within tolerance, or a variance the trustee marked reviewed.
 //   status  = paid | resolved | review | outstanding.
+// ---------- Analytics: financial dashboard ----------
+// Cash basis. Bank transactions are the source of truth for anything that moved
+// through the account; approved resident deductions cover Body Corp expenses a
+// resident paid personally; ops_expenses covers the rest (and excludes rows
+// flagged as duplicating either of the other two).
+//
+// Owner Contributions are grossed up by approved deductions on purpose. A
+// resident who owes R5 000 and pays R4 326 in cash after paying the gardener
+// R674 directly has still contributed R5 000 — booking only the R4 326 while
+// also booking the R674 as an expense would understate the surplus twice over.
+const UNCLASSIFIED = "Unclassified";
+
+function fyMonths(fy) {
+  const start = Number(String(fy).split("/")[0]);
+  const out = [];
+  for (let i = 0; i < 12; i++) {
+    const monthIndex = 7 + i;              // 7 = August (0-based)
+    const y = start + Math.floor(monthIndex / 12);
+    const m = (monthIndex % 12) + 1;
+    out.push(`${y}-${String(m).padStart(2, "0")}`);
+  }
+  return out;
+}
+const ymOf = (dateStr) => String(dateStr).slice(0, 7);
+
+function buildFinancialYearReport({ fy, txns, ops, remits, charges, categories }) {
+  const months = fyMonths(fy);
+  const blank = () => Object.fromEntries(months.map((m) => [m, 0]));
+  const add = (bucket, ym, amount) => {
+    if (bucket[ym] === undefined) return; // outside the FY window — ignore
+    bucket[ym] += amount;
+  };
+
+  const income = {
+    "Owner Contributions": blank(),
+    "Interest Earned": blank(),
+    "Other Credits": blank(),
+  };
+  const expenses = {};
+  const ensureExpense = (name) => {
+    if (!expenses[name]) expenses[name] = blank();
+    return expenses[name];
+  };
+  // Every active category gets a row even at zero, so the dashboard shape is
+  // stable month to month and a missing figure reads as "nothing spent" rather
+  // than "line forgotten".
+  categories.filter((c) => c.active).forEach((c) => ensureExpense(c.name));
+
+  // --- Bank lines ---
+  txns.forEach((t) => {
+    const ym = ymOf(t.txn_date);
+    const amount = Number(t.amount) || 0;
+    if (t.direction === "credit") {
+      if (t.category === "resident_payment") add(income["Owner Contributions"], ym, amount);
+      else if (t.category === "interest") add(income["Interest Earned"], ym, amount);
+      else add(income["Other Credits"], ym, amount);
+    } else {
+      add(ensureExpense(t.expense_category || UNCLASSIFIED), ym, amount);
+    }
+  });
+
+  // --- Approved resident deductions: expense incurred + contribution grossed up ---
+  let deductionTotal = 0;
+  remits.forEach((r) => {
+    if (!r.deduction_approved) return;
+    const ym = ymOf(r.period);
+    const items = Array.isArray(r.deductions) && r.deductions.length
+      ? r.deductions
+      : (Number(r.deduction_amount) > 0
+          ? [{ amount: r.deduction_amount, expenseCategory: null }]
+          : []);
+    items.forEach((it) => {
+      const amount = Number(it.amount) || 0;
+      if (!(amount > 0)) return;
+      deductionTotal += amount;
+      add(ensureExpense(it.expenseCategory || UNCLASSIFIED), ym, amount);
+      add(income["Owner Contributions"], ym, amount);
+    });
+  });
+
+  // --- Non-bank, non-deduction expenses ---
+  ops.forEach((e) => {
+    add(ensureExpense(e.category || UNCLASSIFIED), ymOf(e.expense_date), Number(e.amount) || 0);
+  });
+
+  // --- Memo only: costs recovered from units via additional charges. Already
+  //     inside Owner Contributions once paid, so never netted off expenses. ---
+  const recoveries = {};
+  charges.forEach((c) => {
+    if (!c.expense_category) return;
+    recoveries[c.expense_category] = (recoveries[c.expense_category] || 0) + (Number(c.amount) || 0);
+  });
+
+  const sumRow = (row) => months.reduce((s, m) => s + row[m], 0);
+  const orderOf = (name) => {
+    const hit = categories.find((c) => c.name === name);
+    if (hit) return hit.sortOrder;
+    return name === UNCLASSIFIED ? 9998 : 9999;
+  };
+
+  const incomeRows = Object.entries(income).map(([label, row]) => ({ label, row, total: sumRow(row) }));
+  const expenseRows = Object.entries(expenses)
+    .map(([label, row]) => ({ label, row, total: sumRow(row), recovered: recoveries[label] || 0 }))
+    .sort((a, b) => orderOf(a.label) - orderOf(b.label) || a.label.localeCompare(b.label));
+
+  const totalIncomeRow = blank();
+  const totalExpenseRow = blank();
+  months.forEach((m) => {
+    incomeRows.forEach((r) => { totalIncomeRow[m] += r.row[m]; });
+    expenseRows.forEach((r) => { totalExpenseRow[m] += r.row[m]; });
+  });
+  const surplusRow = Object.fromEntries(months.map((m) => [m, totalIncomeRow[m] - totalExpenseRow[m]]));
+
+  return {
+    months, incomeRows, expenseRows,
+    totalIncome: sumRow(totalIncomeRow), totalExpense: sumRow(totalExpenseRow),
+    totalIncomeRow, totalExpenseRow, surplusRow,
+    surplus: sumRow(totalIncomeRow) - sumRow(totalExpenseRow),
+    deductionTotal,
+    unclassified: expenseRows.find((r) => r.label === UNCLASSIFIED)?.total || 0,
+  };
+}
+
+function Analytics({ expenseCategories }) {
+  const [fy, setFy] = useState(null);
+  const [availableFys, setAvailableFys] = useState([]);
+  const [report, setReport] = useState(null);
+  const [status, setStatus] = useState("loading"); // loading | ready | error
+  const [error, setError] = useState(null);
+  const [showMonths, setShowMonths] = useState(false);
+
+  // Which financial years actually have bank data, newest first. Defaults to the
+  // most recent one with data rather than the calendar-current FY — on 4 August
+  // the new FY is four days old and would render an empty dashboard.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const client = await ensureSupabaseClient();
+        const [oldest, newest] = await Promise.all([
+          client.from("bank_transactions").select("txn_date").order("txn_date", { ascending: true }).limit(1),
+          client.from("bank_transactions").select("txn_date").order("txn_date", { ascending: false }).limit(1),
+        ]);
+        if (oldest.error) throw oldest.error;
+        if (newest.error) throw newest.error;
+        const first = oldest.data?.[0]?.txn_date;
+        const last = newest.data?.[0]?.txn_date;
+        const fallback = periodToFY(CURRENT_PERIOD);
+        if (!first || !last) {
+          if (alive) { setAvailableFys([fallback]); setFy(fallback); }
+          return;
+        }
+        const startYear = Number(fyOfDate(first).split("/")[0]);
+        const endYear = Number(fyOfDate(last).split("/")[0]);
+        const list = [];
+        for (let y = endYear; y >= startYear; y--) list.push(`${y}/${y + 1}`);
+        if (alive) { setAvailableFys(list); setFy(list[0]); }
+      } catch (err) {
+        console.error("Loading financial years failed:", err);
+        if (alive) { setStatus("error"); setError("Couldn't reach the database — see browser console."); }
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!fy) return;
+    let alive = true;
+    setStatus("loading");
+    (async () => {
+      try {
+        const { from, to } = fyBounds(fy);
+        const client = await ensureSupabaseClient();
+        const [txns, ops, remits, charges] = await Promise.all([
+          client.from("bank_transactions").select("txn_date, direction, amount, category, expense_category")
+            .gte("txn_date", from).lte("txn_date", to),
+          // Rows flagged as duplicating a bank line or a deduction are excluded.
+          client.from("ops_expenses").select("expense_date, category, amount")
+            .is("superseded_reason", null).gte("expense_date", from).lte("expense_date", to),
+          client.from("remittance_advices").select("period, deduction_approved, deduction_amount, deductions")
+            .gte("period", from).lte("period", to),
+          client.from("additional_charges").select("period, amount, expense_category")
+            .gte("period", from).lte("period", to),
+        ]);
+        const bad = [txns, ops, remits, charges].find((r) => r.error);
+        if (bad) throw bad.error;
+        if (!alive) return;
+        setReport(buildFinancialYearReport({
+          fy,
+          txns: txns.data || [], ops: ops.data || [],
+          remits: remits.data || [], charges: charges.data || [],
+          categories: expenseCategories,
+        }));
+        setStatus("ready");
+      } catch (err) {
+        console.error("Building the financial dashboard failed:", err);
+        if (alive) { setStatus("error"); setError("Couldn't build the dashboard — see browser console."); }
+      }
+    })();
+    return () => { alive = false; };
+  }, [fy, expenseCategories]);
+
+  const monthLabel = (ym) => {
+    const [y, m] = ym.split("-");
+    return `${MONTH_NAMES[Number(m) - 1].slice(0, 3)} ${y.slice(2)}`;
+  };
+  const th = { padding: "7px 8px", color: "#64748B", fontSize: 10.5, textTransform: "uppercase", textAlign: "right", whiteSpace: "nowrap" };
+  const td = { padding: "7px 8px", textAlign: "right", whiteSpace: "nowrap" };
+
+  return (
+    <>
+      <div className="no-print" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 16, flexWrap: "wrap", marginBottom: 4 }}>
+        <h1 className="f-display" style={{ fontSize: 24, margin: 0 }}>Financial dashboard</h1>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <label style={{ fontSize: 12, color: "#64748B", fontWeight: 600 }}>Financial year</label>
+          <select
+            value={fy || ""}
+            onChange={(e) => setFy(e.target.value)}
+            style={{ padding: "7px 10px", borderRadius: 6, border: "1px solid #D8D0BE", fontSize: 13, fontWeight: 600 }}
+          >
+            {availableFys.map((y) => <option key={y} value={y}>{y} ({fyLabel(y)})</option>)}
+          </select>
+          <button onClick={() => window.print()} style={{ ...primaryBtn, padding: "7px 14px" }}>Print / PDF</button>
+        </div>
+      </div>
+      <p className="no-print" style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
+        Year to date on a <strong>cash basis</strong> — money in and out of the bank account, plus Body Corp expenses residents paid personally and claimed as an approved deduction. The body corp financial year runs August to July.
+      </p>
+
+      {status === "error" && (
+        <Card><div style={{ color: "#B5651D", fontWeight: 600, fontSize: 13 }}>{error}</div></Card>
+      )}
+      {status === "loading" && (
+        <Card><div style={{ color: "#94A0AC", fontSize: 13 }}>Loading {fy || "financial year"}…</div></Card>
+      )}
+
+      {status === "ready" && report && (
+        <div className="print-area">
+          <div style={{ marginBottom: 14 }}>
+            <div className="f-display" style={{ fontSize: 20 }}>El Corazon Body Corporate — income &amp; expenditure</div>
+            <div style={{ fontSize: 12, color: "#64748B" }}>
+              Financial year {fy} ({fyLabel(fy)}) · cash basis · generated {new Date().toLocaleDateString("en-ZA")}
+            </div>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 18 }}>
+            <Stat label={`Total income — ${fy}`} value={rand(report.totalIncome)} accent="#2F5D50" />
+            <Stat label={`Total expenditure — ${fy}`} value={rand(report.totalExpense)} accent="#B5651D" />
+            <Stat
+              label={report.surplus >= 0 ? "Surplus" : "Deficit"}
+              value={rand(Math.abs(report.surplus))}
+              accent={report.surplus >= 0 ? "#2F5D50" : "#B5651D"}
+            />
+          </div>
+
+          {report.unclassified > 0 && (
+            <Card style={{ marginBottom: 16, borderColor: "#EAD9C4", background: "#FBF6EC" }}>
+              <div style={{ fontSize: 12.5, color: "#8A6D1E", fontWeight: 600 }}>
+                {rand(report.unclassified)} of expenditure is untagged.
+                <span style={{ fontWeight: 400 }}> Tag the relevant debits on the Bank reconciliation page (and any deduction claims below them) to move it onto the right line.</span>
+              </div>
+            </Card>
+          )}
+
+          <Card>
+            <div className="no-print" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div style={{ fontWeight: 700, fontSize: 13.5 }}>Income &amp; expenditure — {fy}</div>
+              <button
+                onClick={() => setShowMonths((v) => !v)}
+                style={{ background: "none", border: "none", padding: 0, fontSize: 11.5, fontWeight: 700, color: "#2A3E7A", cursor: "pointer", textDecoration: "underline" }}
+              >
+                {showMonths ? "Hide monthly breakdown" : "Show monthly breakdown"}
+              </button>
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", fontSize: 12.5, borderCollapse: "collapse", minWidth: showMonths ? 1150 : 420 }}>
+                <thead>
+                  <tr>
+                    <th style={{ ...th, textAlign: "left" }}>Line item</th>
+                    {showMonths && report.months.map((m) => <th key={m} style={th}>{monthLabel(m)}</th>)}
+                    <th style={{ ...th, color: "#1B2A38" }}>Year to date</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td colSpan={showMonths ? 14 : 2} style={{ padding: "10px 8px 4px", fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "#2F5D50" }}>Income</td></tr>
+                  {report.incomeRows.map((r) => (
+                    <tr key={r.label} style={{ borderTop: "1px solid #EEE7D6" }}>
+                      <td style={{ padding: "7px 8px" }}>
+                        {r.label}
+                        {r.label === "Owner Contributions" && report.deductionTotal > 0 && (
+                          <span style={{ color: "#94A0AC", fontSize: 11 }}> — incl. {rand(report.deductionTotal)} settled by approved deductions</span>
+                        )}
+                      </td>
+                      {showMonths && report.months.map((m) => (
+                        <td key={m} className="f-mono" style={{ ...td, color: r.row[m] ? "#1B2A38" : "#C7CDD4" }}>{r.row[m] ? rand(r.row[m]) : "—"}</td>
+                      ))}
+                      <td className="f-mono" style={{ ...td, fontWeight: 600 }}>{rand(r.total)}</td>
+                    </tr>
+                  ))}
+                  <tr style={{ borderTop: "1px solid #1B2A38", background: "#FAF7EF" }}>
+                    <td style={{ padding: "7px 8px", fontWeight: 700 }}>Total income</td>
+                    {showMonths && report.months.map((m) => (
+                      <td key={m} className="f-mono" style={{ ...td, fontWeight: 700 }}>{report.totalIncomeRow[m] ? rand(report.totalIncomeRow[m]) : "—"}</td>
+                    ))}
+                    <td className="f-mono" style={{ ...td, fontWeight: 700 }}>{rand(report.totalIncome)}</td>
+                  </tr>
+
+                  <tr><td colSpan={showMonths ? 14 : 2} style={{ padding: "16px 8px 4px", fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "#B5651D" }}>Expenditure</td></tr>
+                  {report.expenseRows.map((r) => (
+                    <tr key={r.label} style={{ borderTop: "1px solid #EEE7D6", opacity: r.total === 0 ? 0.5 : 1 }}>
+                      <td style={{ padding: "7px 8px" }}>
+                        {r.label === UNCLASSIFIED
+                          ? <span style={{ color: "#B5651D", fontWeight: 600 }}>{r.label}</span>
+                          : r.label}
+                        {r.recovered > 0 && (
+                          <span style={{ color: "#94A0AC", fontSize: 11 }}> — {rand(r.recovered)} recovered via additional charges</span>
+                        )}
+                      </td>
+                      {showMonths && report.months.map((m) => (
+                        <td key={m} className="f-mono" style={{ ...td, color: r.row[m] ? "#1B2A38" : "#C7CDD4" }}>{r.row[m] ? rand(r.row[m]) : "—"}</td>
+                      ))}
+                      <td className="f-mono" style={{ ...td, fontWeight: 600 }}>{rand(r.total)}</td>
+                    </tr>
+                  ))}
+                  <tr style={{ borderTop: "1px solid #1B2A38", background: "#FAF7EF" }}>
+                    <td style={{ padding: "7px 8px", fontWeight: 700 }}>Total expenditure</td>
+                    {showMonths && report.months.map((m) => (
+                      <td key={m} className="f-mono" style={{ ...td, fontWeight: 700 }}>{report.totalExpenseRow[m] ? rand(report.totalExpenseRow[m]) : "—"}</td>
+                    ))}
+                    <td className="f-mono" style={{ ...td, fontWeight: 700 }}>{rand(report.totalExpense)}</td>
+                  </tr>
+                </tbody>
+                <tfoot>
+                  <tr style={{ borderTop: "2px solid #1B2A38" }}>
+                    <td style={{ padding: "10px 8px", fontWeight: 700, fontSize: 13.5 }}>
+                      {report.surplus >= 0 ? "Surplus" : "Deficit"} — income less expenditure
+                    </td>
+                    {showMonths && report.months.map((m) => (
+                      <td key={m} className="f-mono" style={{ ...td, fontWeight: 700, color: report.surplusRow[m] >= 0 ? "#2F5D50" : "#B5651D" }}>
+                        {report.surplusRow[m] ? rand(report.surplusRow[m]) : "—"}
+                      </td>
+                    ))}
+                    <td className="f-mono" style={{ ...td, fontWeight: 700, fontSize: 14, color: report.surplus >= 0 ? "#2F5D50" : "#B5651D" }}>
+                      {rand(report.surplus)}
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+            <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 14, lineHeight: 1.6 }}>
+              Owner Contributions include levies settled by an approved deduction, so the matching expense below doesn't understate the surplus.
+              Additional charges billed to a unit arrive as part of Owner Contributions; where one recovers a specific cost it's shown against that line as a memo and is never netted off expenditure.
+              Body corp expenses flagged as duplicating a bank line or a deduction claim are excluded.
+            </p>
+          </Card>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ---------- Config: expense categories ----------
+// The single vocabulary behind every tagging dropdown and every line on the
+// analytics dashboard. Renaming goes through the rename_expense_category RPC so
+// the change cascades to bank transactions, ops expenses, additional charges and
+// resident deduction claims in one transaction — a plain UPDATE here would leave
+// historic records pointing at a name that no longer exists.
+function Config({ expenseCategories, setExpenseCategories }) {
+  const [usage, setUsage] = useState({});
+  const [newName, setNewName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  const refreshUsage = async () => {
+    try {
+      const client = await ensureSupabaseClient();
+      const { data, error: e } = await client.rpc("expense_category_usage");
+      if (e) throw e;
+      setUsage(Object.fromEntries((data || []).map((r) => [r.name, Number(r.usage_count)])));
+    } catch (err) {
+      console.error("Loading category usage failed:", err);
+    }
+  };
+  useEffect(() => { refreshUsage(); }, []);
+
+  const sorted = [...expenseCategories].sort(
+    (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name)
+  );
+
+  const run = async (fn, successMsg) => {
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      await fn();
+      if (successMsg) setNotice(successMsg);
+      invalidateExpenseCategoryCache();
+    } catch (err) {
+      console.error("Config change failed:", err);
+      setError(err.message || "Something went wrong — see browser console.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addCategory = () => run(async () => {
+    const name = newName.trim();
+    if (!name) throw new Error("Give the category a name.");
+    if (expenseCategories.some((c) => c.name.toLowerCase() === name.toLowerCase())) {
+      throw new Error(`"${name}" already exists.`);
+    }
+    const nextOrder = Math.max(0, ...expenseCategories.map((c) => c.sortOrder)) + 1;
+    const client = await ensureSupabaseClient();
+    const { data, error: e } = await client
+      .from("expense_categories")
+      .insert({ name, sort_order: nextOrder, active: true })
+      .select("id, name, sort_order, active")
+      .single();
+    if (e) throw e;
+    setExpenseCategories((prev) => [...prev, { id: data.id, name: data.name, sortOrder: Number(data.sort_order), active: data.active }]);
+    setNewName("");
+    refreshUsage();
+  }, "Category added.");
+
+  const renameCategory = (cat) => {
+    const next = window.prompt(`Rename "${cat.name}" to:`, cat.name);
+    if (next == null) return;
+    const name = next.trim();
+    if (!name || name === cat.name) return;
+    run(async () => {
+      if (expenseCategories.some((c) => c.id !== cat.id && c.name.toLowerCase() === name.toLowerCase())) {
+        throw new Error(`"${name}" already exists.`);
+      }
+      const client = await ensureSupabaseClient();
+      const { error: e } = await client.rpc("rename_expense_category", { old_name: cat.name, new_name: name });
+      if (e) throw e;
+      setExpenseCategories((prev) => prev.map((c) => (c.id === cat.id ? { ...c, name } : c)));
+      refreshUsage();
+    }, `Renamed to "${name}" — every record using the old name was updated too.`);
+  };
+
+  const toggleActive = (cat) => run(async () => {
+    const client = await ensureSupabaseClient();
+    const { error: e } = await client.from("expense_categories").update({ active: !cat.active }).eq("id", cat.id);
+    if (e) throw e;
+    setExpenseCategories((prev) => prev.map((c) => (c.id === cat.id ? { ...c, active: !cat.active } : c)));
+  }, null);
+
+  // Moves a category one place and renumbers the whole list 1..n. Renumbering
+  // rather than swapping two values means the order is always well-defined even
+  // if two rows somehow ended up sharing a sort_order.
+  const move = (cat, direction) => run(async () => {
+    const idx = sorted.findIndex((c) => c.id === cat.id);
+    const target = idx + direction;
+    if (target < 0 || target >= sorted.length) return;
+    const reordered = [...sorted];
+    [reordered[idx], reordered[target]] = [reordered[target], reordered[idx]];
+    const client = await ensureSupabaseClient();
+    for (let i = 0; i < reordered.length; i++) {
+      if (reordered[i].sortOrder === i + 1) continue; // already correct
+      const { error: e } = await client.from("expense_categories").update({ sort_order: i + 1 }).eq("id", reordered[i].id);
+      if (e) throw e;
+    }
+    const nextOrders = Object.fromEntries(reordered.map((c, i) => [c.id, i + 1]));
+    setExpenseCategories((prev) => prev.map((c) => (nextOrders[c.id] ? { ...c, sortOrder: nextOrders[c.id] } : c)));
+  }, null);
+
+  const deleteCategory = (cat) => {
+    const used = usage[cat.name] || 0;
+    if (used > 0) {
+      window.alert(`"${cat.name}" is used by ${used} record${used === 1 ? "" : "s"}. Deactivate it instead — deleting would orphan those figures.`);
+      return;
+    }
+    if (!window.confirm(`Delete "${cat.name}"? Nothing currently uses it.`)) return;
+    run(async () => {
+      const client = await ensureSupabaseClient();
+      const { error: e } = await client.rpc("delete_expense_category", { cat_name: cat.name });
+      if (e) throw e;
+      setExpenseCategories((prev) => prev.filter((c) => c.id !== cat.id));
+      refreshUsage();
+    }, `"${cat.name}" deleted.`);
+  };
+
+  const th = { padding: "6px 8px", color: "#64748B", fontSize: 10.5, textTransform: "uppercase", textAlign: "left" };
+  const linkBtn = { background: "none", border: "none", padding: 0, fontSize: 11.5, fontWeight: 700, color: "#2A3E7A", cursor: "pointer", textDecoration: "underline" };
+
+  return (
+    <>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Config — expense categories</h1>
+      <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
+        The list every expense tag draws from — bank statement lines, body corp expenses, resident deduction claims and additional charges. The order set here is the order the dropdowns show, and each active category becomes a line on the analytics dashboard.
+      </p>
+
+      <Card>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>Add a category</div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <input
+            placeholder="Category name (e.g. Security)"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") addCategory(); }}
+            style={{ ...inputStyle, width: 280, textAlign: "left" }}
+          />
+          <button style={primaryBtn} onClick={addCategory} disabled={busy}>Add category</button>
+        </div>
+        {error && <div style={{ marginTop: 10, fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{error}</div>}
+        {notice && <div style={{ marginTop: 10, fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>{notice}</div>}
+      </Card>
+
+      <Card style={{ marginTop: 16 }}>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>
+          Categories ({sorted.filter((c) => c.active).length} active, {sorted.filter((c) => !c.active).length} retired)
+        </div>
+        <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              <th style={{ ...th, width: 70 }}>Order</th>
+              <th style={th}>Name</th>
+              <th style={{ ...th, textAlign: "right" }}>Records using it</th>
+              <th style={th}>Status</th>
+              <th style={{ ...th, textAlign: "right" }}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.length === 0 ? (
+              <tr><td colSpan={5} style={{ padding: 16, textAlign: "center", color: "#94A0AC" }}>No categories yet — add one above.</td></tr>
+            ) : sorted.map((c, i) => (
+              <tr key={c.id} style={{ borderTop: "1px solid #EEE7D6", opacity: c.active ? 1 : 0.55 }}>
+                <td style={{ padding: "8px" }}>
+                  <button disabled={busy || i === 0} onClick={() => move(c, -1)} title="Move up" style={{ ...linkBtn, marginRight: 8, opacity: i === 0 ? 0.3 : 1 }}>↑</button>
+                  <button disabled={busy || i === sorted.length - 1} onClick={() => move(c, 1)} title="Move down" style={{ ...linkBtn, opacity: i === sorted.length - 1 ? 0.3 : 1 }}>↓</button>
+                </td>
+                <td style={{ padding: "8px", fontWeight: 600 }}>{c.name}</td>
+                <td className="f-mono" style={{ padding: "8px", textAlign: "right", color: "#64748B" }}>{usage[c.name] ?? "—"}</td>
+                <td style={{ padding: "8px" }}>
+                  <span style={{
+                    background: c.active ? "#E4EFEA" : "#F1EAD3", color: c.active ? "#2F5D50" : "#8A6D1E",
+                    fontSize: 11, fontWeight: 700, padding: "3px 9px", borderRadius: 20,
+                  }}>
+                    {c.active ? "Active" : "Retired"}
+                  </span>
+                </td>
+                <td style={{ padding: "8px", textAlign: "right" }}>
+                  <button disabled={busy} onClick={() => renameCategory(c)} style={{ ...linkBtn, marginRight: 12 }}>Rename</button>
+                  <button disabled={busy} onClick={() => toggleActive(c)} style={{ ...linkBtn, marginRight: 12 }}>{c.active ? "Retire" : "Reactivate"}</button>
+                  <button disabled={busy} onClick={() => deleteCategory(c)} style={{ ...linkBtn, color: "#B5651D" }}>Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 12, lineHeight: 1.6 }}>
+          <strong>Rename</strong> cascades to every record already tagged with the old name, so historic figures stay intact.
+          <strong> Retire</strong> hides a category from new dropdowns while leaving past records tagged and still reported — this is what you want for a supplier you no longer use.
+          <strong> Delete</strong> is only permitted when nothing references the category.
+        </p>
+      </Card>
+    </>
+  );
+}
+
 function reconcileUnits(rows, bankTxns, remittanceDeductions = {}, remittanceAdvices = {}, period = CURRENT_PERIOD, manualPayments = []) {
   return rows.map((r) => {
     const ded = remittanceDeductions[r.id];
@@ -3297,8 +4070,9 @@ function ManualPaymentControls({ match, period, onAdd, onRemove }) {
 function Reconciliation({
   alloc, period, remittanceDeductions, setRemittanceDeductions, remittanceAdvices,
   bankTxns, manualPayments = [], onAddManualPayment, onRemoveManualPayment, onChangeAppliedPeriod,
-  onReviewTxn, onUploadStatement, statementMeta, statementStatus, statementError,
+  onReviewTxn, onTagTxn, onUploadStatement, statementMeta, statementStatus, statementError,
 }) {
+  const categoryNames = useExpenseCategoryNames();
   const fileInputRef = useRef(null);
 
   const approve = async (unitId) => {
@@ -3318,6 +4092,34 @@ function Reconciliation({
     }
   };
 
+  // Retag one line of a resident's deduction claim. Residents can pick a
+  // category when they submit, but often don't (or pick the wrong one), so the
+  // trustee gets the final say — these amounts are real Body Corp expenses and
+  // feed the analytics dashboard exactly like a bank debit does.
+  const retagDeductionItem = async (unitId, index, next) => {
+    const ded = remittanceDeductions[unitId];
+    if (!ded) return;
+    const nextItems = ded.items.map((it, i) => (i === index ? { ...it, expenseCategory: next } : it));
+    setRemittanceDeductions((prev) => ({ ...prev, [unitId]: { ...prev[unitId], items: nextItems } }));
+    try {
+      if (!ded.dbId) return; // demo data — local-only
+      const client = await ensureSupabaseClient();
+      const { error } = await client
+        .from("remittance_advices")
+        .update({
+          deductions: nextItems.map((it) => ({
+            amount: it.amount, comment: it.comment, expenseCategory: it.expenseCategory || null,
+          })),
+        })
+        .eq("id", ded.dbId);
+      if (error) throw error;
+    } catch (err) {
+      console.error("Retagging deduction failed:", err);
+      setRemittanceDeductions((prev) => ({ ...prev, [unitId]: { ...prev[unitId], items: ded.items } }));
+      window.alert("Couldn't save the deduction category — see browser console.");
+    }
+  };
+
   const matches = reconcileUnits(alloc.rows, bankTxns, remittanceDeductions, remittanceAdvices || {}, period, manualPayments);
 
   // The transaction listing shows this bank statement only. Lines pulled in
@@ -3332,6 +4134,9 @@ function Reconciliation({
   const needsReviewCount =
     bankTxns.filter((t) => t.category === "needs_review" && !t.reviewed).length +
     matches.filter((m) => m.status === "review").length;
+  // Debits with no expense tag — these land under "Unclassified" on the
+  // analytics dashboard until the trustee tags them.
+  const untaggedDebits = otherTxns.filter((t) => t.direction === "debit" && !t.expenseCategory).length;
 
   return (
     <>
@@ -3482,6 +4287,7 @@ function Reconciliation({
                         <thead>
                           <tr style={{ color: "#94A0AC", textAlign: "left", fontSize: 10, textTransform: "uppercase" }}>
                             <th style={{ padding: "2px 6px" }}>Description</th>
+                            <th style={{ padding: "2px 6px" }}>Expense tag</th>
                             <th style={{ padding: "2px 6px", textAlign: "right" }}>Amount</th>
                           </tr>
                         </thead>
@@ -3489,13 +4295,22 @@ function Reconciliation({
                           {dedItems.map((it, i) => (
                             <tr key={i} style={{ borderTop: "1px solid #EEE7D6" }}>
                               <td style={{ padding: "4px 6px", color: "#64748B" }}>{it.comment || "Deduction"}</td>
+                              <td style={{ padding: "4px 6px" }}>
+                                <ExpenseCategorySelect
+                                  value={it.expenseCategory}
+                                  onChange={(v) => retagDeductionItem(m.unit.id, i, v)}
+                                  names={categoryNames}
+                                  placeholder="Untagged"
+                                  style={{ fontSize: 11, padding: "3px 6px" }}
+                                />
+                              </td>
                               <td className="f-mono" style={{ padding: "4px 6px", textAlign: "right", color: "#B5651D" }}>−{rand(it.amount)}</td>
                             </tr>
                           ))}
                         </tbody>
                         <tfoot>
                           <tr style={{ borderTop: "1px solid #1B2A38" }}>
-                            <td style={{ padding: "4px 6px", fontWeight: 700 }}>Total deductions</td>
+                            <td colSpan={2} style={{ padding: "4px 6px", fontWeight: 700 }}>Total deductions</td>
                             <td className="f-mono" style={{ padding: "4px 6px", textAlign: "right", fontWeight: 700, color: "#B5651D" }}>−{rand(m.ded.amount)}</td>
                           </tr>
                         </tfoot>
@@ -3521,12 +4336,18 @@ function Reconciliation({
       <Card style={{ marginTop: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
           <div style={{ fontWeight: 700, fontSize: 13.5 }}>All bank statement lines ({bankTxns.length})</div>
-          {needsReviewCount > 0 && (
-            <div style={{ fontSize: 12, color: "#8A6D1E", fontWeight: 600 }}>{needsReviewCount} to review</div>
-          )}
+          <div style={{ display: "flex", gap: 14 }}>
+            {untaggedDebits > 0 && (
+              <div style={{ fontSize: 12, color: "#B5651D", fontWeight: 600 }}>{untaggedDebits} untagged expense{untaggedDebits === 1 ? "" : "s"}</div>
+            )}
+            {needsReviewCount > 0 && (
+              <div style={{ fontSize: 12, color: "#8A6D1E", fontWeight: 600 }}>{needsReviewCount} to review</div>
+            )}
+          </div>
         </div>
         <p style={{ fontSize: 12, color: "#64748B", marginBottom: 12 }}>
           Every line from the statement, categorised — council payments, interest, and bank charges are captured here too, not just resident levy payments, so nothing is silently dropped.
+          Tag each <strong>debit</strong> with an expense category: that tag is what the analytics dashboard reports on. Anything left untagged appears there as “Unclassified”.
         </p>
         <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", fontSize: 12.5, borderCollapse: "collapse", minWidth: 820 }}>
@@ -3536,6 +4357,7 @@ function Reconciliation({
               <th style={{ padding: "6px 8px" }}>Description</th>
               <th style={{ padding: "6px 8px", textAlign: "right" }}>Amount</th>
               <th style={{ padding: "6px 8px" }}>Category</th>
+              <th style={{ padding: "6px 8px" }}>Expense tag</th>
               <th style={{ padding: "6px 8px" }}>Unit</th>
               <th style={{ padding: "6px 8px" }}>Note</th>
               <th style={{ padding: "6px 8px" }}>Review</th>
@@ -3552,6 +4374,18 @@ function Reconciliation({
                   {t.direction === "debit" ? "−" : ""}{rand(t.amount)}
                 </td>
                 <td style={{ padding: "8px" }}><CategoryBadge category={t.category} /></td>
+                <td style={{ padding: "8px" }}>
+                  {t.direction === "debit" ? (
+                    <ExpenseCategorySelect
+                      value={t.expenseCategory}
+                      onChange={(v) => onTagTxn(t, v)}
+                      names={categoryNames}
+                      placeholder="Untagged"
+                    />
+                  ) : (
+                    <span style={{ color: "#C7CDD4" }}>—</span>
+                  )}
+                </td>
                 <td className="f-mono" style={{ padding: "8px" }}>{t.matchedUnit || "—"}</td>
                 <td style={{ padding: "8px", color: "#64748B", fontSize: 11.5 }}>{t.note}</td>
                 <td style={{ padding: "8px" }}>
@@ -3940,7 +4774,7 @@ function ResidentPortal({
 }) {
   const [files, setFiles] = useState([]); // multiple proof-of-payment documents
   // Itemised deductions — one row per Body Corp expense paid personally.
-  const [deductionItems, setDeductionItems] = useState([{ amount: "", comment: "" }]);
+  const [deductionItems, setDeductionItems] = useState([{ amount: "", comment: "", expenseCategory: "" }]);
   const [amountPaid, setAmountPaid] = useState("");
   const [datePaid, setDatePaid] = useState("");
   const [notifyStatus, setNotifyStatus] = useState(null); // null | "sending" | "sent" | "failed" | "save-failed"
@@ -3951,9 +4785,9 @@ function ResidentPortal({
 
   const updateDeductionItem = (i, field, value) =>
     setDeductionItems((prev) => prev.map((d, idx) => (idx === i ? { ...d, [field]: value } : d)));
-  const addDeductionItem = () => setDeductionItems((prev) => [...prev, { amount: "", comment: "" }]);
+  const addDeductionItem = () => setDeductionItems((prev) => [...prev, { amount: "", comment: "", expenseCategory: "" }]);
   const removeDeductionItem = (i) =>
-    setDeductionItems((prev) => (prev.length <= 1 ? [{ amount: "", comment: "" }] : prev.filter((_, idx) => idx !== i)));
+    setDeductionItems((prev) => (prev.length <= 1 ? [{ amount: "", comment: "", expenseCategory: "" }] : prev.filter((_, idx) => idx !== i)));
   // The deduction card for the viewed period. In token/tenant mode it comes from
   // the per-period statement RPC (so past-month deductions load from the DB);
   // in trustee mode it comes from the period-scoped remittanceDeductions state,
@@ -3981,7 +4815,12 @@ function ResidentPortal({
       const saved = await submitRemittanceToDb(selectedUnit, {
         amountPaid: paid,
         datePaid: datePaid || null,
-        deductions: deductionItems.map((d) => ({ amount: parseAmount(d.amount), comment: d.comment.trim() })),
+        deductions: deductionItems.map((d) => ({
+          amount: parseAmount(d.amount),
+          comment: d.comment.trim(),
+          // Optional — the trustee can retag on the reconciliation page.
+          expenseCategory: d.expenseCategory || null,
+        })),
         proofFiles: files,
       });
       dbId = saved.id;
@@ -4105,7 +4944,7 @@ function ResidentPortal({
             E.g. the garden service or Blockwatch fee. Add each expense on its own line — the total comes off what you pay the Body Corp this month, provided you can produce proof of payment.
           </p>
           {deductionItems.map((item, i) => (
-            <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "flex-start" }}>
+            <div key={i} className="wrap-sm" style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "flex-start" }}>
               <input
                 placeholder="Amount (R)"
                 type="text"
@@ -4119,6 +4958,12 @@ function ResidentPortal({
                 value={item.comment}
                 onChange={(e) => updateDeductionItem(i, "comment", e.target.value)}
                 style={{ ...inputStyle, flex: 1, textAlign: "left" }}
+              />
+              <ExpenseCategorySelect
+                value={item.expenseCategory}
+                onChange={(v) => updateDeductionItem(i, "expenseCategory", v)}
+                placeholder="Type of expense"
+                style={{ padding: "10px", fontSize: 16, minWidth: 150 }}
               />
               <button
                 type="button"
