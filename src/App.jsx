@@ -3297,7 +3297,10 @@ function fyMonths(fy) {
 }
 const ymOf = (dateStr) => String(dateStr).slice(0, 7);
 
-function buildFinancialYearReport({ fy, txns, ops, remits, charges, manualPays = [], categories }) {
+function buildFinancialYearReport({
+  fy, txns, ops, remits, charges, manualPays = [], categories,
+  unitNumbers = {}, chaserImported = true, chaserMonth = null,
+}) {
   const months = fyMonths(fy);
   const blank = () => Object.fromEntries(months.map((m) => [m, 0]));
   const add = (bucket, ym, amount) => {
@@ -3356,12 +3359,14 @@ function buildFinancialYearReport({ fy, txns, ops, remits, charges, manualPays =
       .map((t) => `${t.matched_unit_id}|${ymOf(t.applied_period)}`)
   );
   let provisionalTotal = 0;
+  const provisionalDetail = [];
   manualPays.forEach((m) => {
     const ym = ymOf(m.applied_period);
     if (bankedKeys.has(`${m.unit_id}|${ym}`)) return; // superseded by the real thing
     const amount = Number(m.amount) || 0;
     if (income["Owner Contributions"][ym] === undefined) return;
     provisionalTotal += amount;
+    provisionalDetail.push({ unit: unitNumbers[m.unit_id] || null, ym, amount });
     add(income["Owner Contributions"], ym, amount);
   });
 
@@ -3417,14 +3422,68 @@ function buildFinancialYearReport({ fy, txns, ops, remits, charges, manualPays =
   });
   const surplusRow = Object.fromEntries(months.map((m) => [m, totalIncomeRow[m] - totalExpenseRow[m]]));
 
+  const surplus = sumRow(totalIncomeRow) - sumRow(totalExpenseRow);
+
+  // ---- Footnotes ----
+  // Built from the figures themselves, so they appear, renumber and disappear
+  // on their own as payments are allocated, statements imported and expenses
+  // tagged. Nothing here is hard-coded to a month or a unit.
+  const footnotes = [];
+  const noteRefs = {};                       // row label -> [footnote numbers]
+  const note = (label, text) => {
+    footnotes.push(text);
+    if (!noteRefs[label]) noteRefs[label] = [];
+    noteRefs[label].push(footnotes.length);
+  };
+  const monthName = (ym) => {
+    const [y, m] = ym.split("-");
+    return `${MONTH_NAMES[Number(m) - 1]} ${y}`;
+  };
+
+  if (deductionTotal > 0) {
+    note("Owner Contributions",
+      `Includes ${rand(deductionTotal)} of levies settled by approved deductions — Body Corp expenses residents paid personally. The matching amounts appear under expenditure, so the surplus is not overstated.`);
+  }
+  if (provisionalTotal > 0) {
+    const byUnit = provisionalDetail
+      .map((d) => `${d.unit ? `Unit ${d.unit}` : "an unidentified unit"} ${rand(d.amount)} (${monthName(d.ym)})`)
+      .join(", ");
+    note("Owner Contributions",
+      `Includes ${rand(provisionalTotal)} recorded manually and not yet confirmed on a bank statement: ${byUnit}. Each entry drops out automatically once the matching bank line is imported, so it cannot be double counted.`);
+  }
+  expenseRows.forEach((r) => {
+    if (r.recovered > 0) {
+      note(r.label,
+        `${rand(r.recovered)} of this cost was recovered from units as an additional charge. That recovery arrives inside Owner Contributions and is deliberately not netted off here, so the gross cost to the Body Corp stays visible.`);
+    }
+  });
+  if ((expenseRows.find((r) => r.label === UNCLASSIFIED)?.total || 0) > 0) {
+    note(UNCLASSIFIED,
+      `Expenditure with no category assigned yet. Tag the relevant debits on the Bank reconciliation page — and any untagged deduction claims below them — to move this onto the right lines.`);
+  }
+  if (!chaserImported && chaserMonth) {
+    note("__surplus__",
+      `Incomplete year. July levies are collected on the ${monthName(chaserMonth)} bank statement, which has not been imported yet, so contributions and this figure are understated by up to a month of levies. Import that statement to close the year off.`);
+  }
+
   return {
     months, incomeRows, expenseRows,
     totalIncome: sumRow(totalIncomeRow), totalExpense: sumRow(totalExpenseRow),
-    totalIncomeRow, totalExpenseRow, surplusRow,
-    surplus: sumRow(totalIncomeRow) - sumRow(totalExpenseRow),
-    deductionTotal, provisionalTotal,
+    totalIncomeRow, totalExpenseRow, surplusRow, surplus,
+    deductionTotal, provisionalTotal, provisionalDetail,
+    footnotes, noteRefs,
     unclassified: expenseRows.find((r) => r.label === UNCLASSIFIED)?.total || 0,
   };
+}
+
+// Superscript markers next to a line item, e.g. "Owner Contributions ¹ ²".
+function NoteRef({ nums }) {
+  if (!nums || nums.length === 0) return null;
+  return (
+    <sup style={{ color: "#8A6D1E", fontWeight: 700, fontSize: 9.5, marginLeft: 3 }}>
+      {nums.join(",")}
+    </sup>
+  );
 }
 
 function Analytics({ expenseCategories }) {
@@ -3484,7 +3543,7 @@ function Analytics({ expenseCategories }) {
         const wideFrom = `${from.slice(0, 4)}-05-01`;   // FY start less 3 months
         const wideTo = `${to.slice(0, 4)}-10-31`;       // FY end plus 3 months
         const client = await ensureSupabaseClient();
-        const [txns, manualPays, ops, remits, charges] = await Promise.all([
+        const [txns, manualPays, ops, remits, charges, unitRows] = await Promise.all([
           client.from("bank_transactions").select("txn_date, period, applied_period, matched_unit_id, direction, amount, category, expense_category")
             .gte("txn_date", wideFrom).lte("txn_date", wideTo),
           client.from("manual_payments").select("unit_id, applied_period, amount")
@@ -3496,25 +3555,27 @@ function Analytics({ expenseCategories }) {
             .gte("period", from).lte("period", to),
           client.from("additional_charges").select("period, amount, expense_category")
             .gte("period", from).lte("period", to),
+          // Only to name units in the manual-allocation footnote.
+          client.from("units").select("id, unit_number"),
         ]);
-        const bad = [txns, manualPays, ops, remits, charges].find((r) => r.error);
+        const bad = [txns, manualPays, ops, remits, charges, unitRows].find((r) => r.error);
         if (bad) throw bad.error;
         if (!alive) return;
-        const built = buildFinancialYearReport({
+        // The FY's last statement month (July) is collected on the following
+        // month's bank statement. Until that statement is imported, July shows
+        // almost no contributions and the surplus reads as a false deficit —
+        // so the report says so rather than let the number be misread.
+        const chaserMonth = ymOf(nextPeriod(`${to.slice(0, 4)}-07-01`));
+        setReport(buildFinancialYearReport({
           fy,
           txns: txns.data || [], ops: ops.data || [],
           remits: remits.data || [], charges: charges.data || [],
           manualPays: manualPays.data || [],
           categories: expenseCategories,
-        });
-        // The FY's last statement month (July) is collected on the following
-        // month's bank statement. Until that statement is imported, July shows
-        // almost no contributions and the surplus reads as a false deficit —
-        // so say so rather than let the number be misread.
-        const chaserMonth = ymOf(nextPeriod(`${to.slice(0, 4)}-07-01`));
-        built.collectionsPending = !(txns.data || []).some((t) => ymOf(t.txn_date) === chaserMonth);
-        built.chaserMonth = chaserMonth;
-        setReport(built);
+          unitNumbers: Object.fromEntries((unitRows.data || []).map((u) => [u.id, u.unit_number])),
+          chaserImported: (txns.data || []).some((t) => ymOf(t.txn_date) === chaserMonth),
+          chaserMonth,
+        }));
         setStatus("ready");
       } catch (err) {
         console.error("Building the financial dashboard failed:", err);
@@ -3576,25 +3637,6 @@ function Analytics({ expenseCategories }) {
             />
           </div>
 
-          {report.collectionsPending && (
-            <Card style={{ marginBottom: 16, borderColor: "#EAD9C4", background: "#FBF6EC" }}>
-              <div style={{ fontSize: 12.5, color: "#8A6D1E", fontWeight: 600 }}>
-                Contributions for this year are incomplete.
-                <span style={{ fontWeight: 400 }}>
-                  {" "}July {String(fy).split("/")[1]}’s levies are paid on the {periodLabel(`${report.chaserMonth}-01`)} bank statement, which hasn’t been imported yet — so the July column and the surplus below are understated by roughly a month of levies. Import that statement to complete the year.
-                </span>
-              </div>
-            </Card>
-          )}
-          {report.unclassified > 0 && (
-            <Card style={{ marginBottom: 16, borderColor: "#EAD9C4", background: "#FBF6EC" }}>
-              <div style={{ fontSize: 12.5, color: "#8A6D1E", fontWeight: 600 }}>
-                {rand(report.unclassified)} of expenditure is untagged.
-                <span style={{ fontWeight: 400 }}> Tag the relevant debits on the Bank reconciliation page (and any deduction claims below them) to move it onto the right line.</span>
-              </div>
-            </Card>
-          )}
-
           <Card>
             <div className="no-print" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
               <div style={{ fontWeight: 700, fontSize: 13.5 }}>Income &amp; expenditure — {fy}</div>
@@ -3620,17 +3662,7 @@ function Analytics({ expenseCategories }) {
                     <tr key={r.label} style={{ borderTop: "1px solid #EEE7D6" }}>
                       <td style={{ padding: "7px 8px" }}>
                         {r.label}
-                        {r.label === "Owner Contributions" && (report.deductionTotal > 0 || report.provisionalTotal > 0) && (
-                          <span style={{ color: "#94A0AC", fontSize: 11 }}>
-                            {report.deductionTotal > 0 && ` — incl. ${rand(report.deductionTotal)} settled by approved deductions`}
-                            {report.provisionalTotal > 0 && (
-                              <span style={{ color: "#8A6D1E" }}>
-                                {report.deductionTotal > 0 ? "; " : " — "}
-                                incl. {rand(report.provisionalTotal)} recorded manually, not yet bank-confirmed
-                              </span>
-                            )}
-                          </span>
-                        )}
+                        <NoteRef nums={report.noteRefs[r.label]} />
                       </td>
                       {showMonths && report.months.map((m) => (
                         <td key={m} className="f-mono" style={{ ...td, color: r.row[m] ? "#1B2A38" : "#C7CDD4" }}>{r.row[m] ? rand(r.row[m]) : "—"}</td>
@@ -3653,9 +3685,7 @@ function Analytics({ expenseCategories }) {
                         {r.label === UNCLASSIFIED
                           ? <span style={{ color: "#B5651D", fontWeight: 600 }}>{r.label}</span>
                           : r.label}
-                        {r.recovered > 0 && (
-                          <span style={{ color: "#94A0AC", fontSize: 11 }}> — {rand(r.recovered)} recovered via additional charges</span>
-                        )}
+                        <NoteRef nums={report.noteRefs[r.label]} />
                       </td>
                       {showMonths && report.months.map((m) => (
                         <td key={m} className="f-mono" style={{ ...td, color: r.row[m] ? "#1B2A38" : "#C7CDD4" }}>{r.row[m] ? rand(r.row[m]) : "—"}</td>
@@ -3675,6 +3705,7 @@ function Analytics({ expenseCategories }) {
                   <tr style={{ borderTop: "2px solid #1B2A38" }}>
                     <td style={{ padding: "10px 8px", fontWeight: 700, fontSize: 13.5 }}>
                       {report.surplus >= 0 ? "Surplus" : "Deficit"} — income less expenditure
+                      <NoteRef nums={report.noteRefs.__surplus__} />
                     </td>
                     {showMonths && report.months.map((m) => (
                       <td key={m} className="f-mono" style={{ ...td, fontWeight: 700, color: report.surplusRow[m] >= 0 ? "#2F5D50" : "#B5651D" }}>
@@ -3688,13 +3719,30 @@ function Analytics({ expenseCategories }) {
                 </tfoot>
               </table>
             </div>
-            <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 14, lineHeight: 1.6 }}>
-              Owner Contributions are attributed to the statement month they settle (a payment retargeted by the trustee follows the retarget), so a month column can be read against what that month billed. Interest, bank charges and council payments have no statement month and sit on their transaction date.
-              Payments recorded manually before the bank statement arrives are included, and drop out automatically the moment a real bank line appears for the same unit and month — so importing the statement can't double count.
-              Owner Contributions include levies settled by an approved deduction, so the matching expense below doesn't understate the surplus.
-              Additional charges billed to a unit arrive as part of Owner Contributions; where one recovers a specific cost it's shown against that line as a memo and is never netted off expenditure.
-              Body corp expenses flagged as duplicating a bank line or a deduction claim are excluded.
-            </p>
+            {report.footnotes.length > 0 && (
+              <div style={{ marginTop: 18, borderTop: "1px solid #E4DCC8", paddingTop: 12 }}>
+                <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "#64748B", marginBottom: 8 }}>
+                  Notes to the statement
+                </div>
+                <ol style={{ margin: 0, paddingLeft: 20, fontSize: 11.5, color: "#64748B", lineHeight: 1.65 }}>
+                  {report.footnotes.map((text, i) => (
+                    <li key={i} style={{ marginBottom: 5 }}>{text}</li>
+                  ))}
+                </ol>
+              </div>
+            )}
+
+            <div style={{ marginTop: 16, borderTop: "1px solid #E4DCC8", paddingTop: 12 }}>
+              <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "#64748B", marginBottom: 8 }}>
+                Basis of preparation
+              </div>
+              <p style={{ fontSize: 11.5, color: "#94A0AC", margin: 0, lineHeight: 1.65 }}>
+                Owner Contributions are attributed to the statement month they settle, so a month column can be read against what that month billed; a payment retargeted by the trustee follows the retarget. Interest, bank charges and council payments have no statement month and sit on their transaction date.
+                Payments recorded before the bank statement arrives are included and drop out automatically once the matching bank line is imported.
+                Body corp expenses flagged as duplicating a bank line or a deduction claim are excluded.
+                The financial year runs August to July.
+              </p>
+            </div>
           </Card>
         </div>
       )}
