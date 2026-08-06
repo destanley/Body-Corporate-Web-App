@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 6 August 2026 (supersedes the 4 August 2026 session 2 summary)
+Last updated: 6 August 2026, session 2 (supersedes the 6 August 2026 session 1 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -10,12 +10,12 @@ Last updated: 6 August 2026 (supersedes the 4 August 2026 session 2 summary)
 
 - **Repo:** `https://github.com/destanley/Body-Corporate-Web-App` (branch `main`)
 - **Local working folder:** `G:\Claude Playground\CoWork\el-corazon-web`
-- **Live app file:** `src/App.jsx` — the file `main.jsx` imports and the only one that renders. Single-file app, ~5,950 lines. (The old `src/ElCorazonWebApp_5.jsx` duplicate is **deleted**; don't reintroduce it.)
+- **Live app file:** `src/App.jsx` — the file `main.jsx` imports and the only one that renders. Single-file app, ~6,200 lines. (The old `src/ElCorazonWebApp_5.jsx` duplicate is **deleted**; don't reintroduce it.)
 - **Runtime CDN libraries** (never bundled, loaded on first use): supabase-js, pdf.js for bank-statement parsing, and **`docx@8.5.0` for the AGM report**. Adding one is preferred to growing the bundle.
 - **Build tooling:** Vite 7 + `@vitejs/plugin-react` 4.7 (React 18). Pinned to Vite 7 deliberately — Vite 8/Rolldown caused a `jsx` peer-dependency failure. Supabase config comes from env vars (`VITE_SUPABASE_URL`, `VITE_SUPABASE_KEY`).
 - **Hosting:** Cloudflare Pages (free), auto-deploys on push to `main`. Build command `npm run build`, output dir `dist`, framework preset "None". SPA routing via `public/_redirects` and `vercel.json`.
 - **Supabase project:** `ctqyxxlnnrgtyyxubsle` (org `liciwrkhrrsserpzjjzn`, eu-west-1, Postgres 17, "El Corazon").
-- **Edge function:** `gmail-import` writes `email_imports` using the service role (bypasses RLS).
+- **Edge function:** `gmail-import` writes `email_imports` using the service role (bypasses RLS). Runs daily at 04:00 UTC via pg_cron (`gmail-import-daily`, jobid 1). **Its source is not in this repo** — it lives only in Supabase. See `docs/RUNBOOK-gmail-import.md` when imports stop.
 - **SQL applied via the Supabase MCP** takes effect immediately with no redeploy. Frontend changes need commit + push + a Cloudflare build. **A stale `dist/` or a cached `index.html` is the usual reason a change "didn't work" — rebuild and hard-refresh before debugging code.**
 - Migrations are mirrored into `migrations/*.sql` for the record after being applied.
 
@@ -73,7 +73,40 @@ Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 20
 
 ---
 
-## Done on 6 August 2026
+## Done on 6 August 2026, session 2
+
+### 1. Invoice allocation module reworked
+Frontend only — no DB changes. All three were trustee-requested.
+
+- **"Confirm allocation & generate statements" moved to Meter readings**, sitting beside "Save readings" (which drops to secondary styling). Readings are the last input before statements can be produced, so the action belongs at the end of that page. **The button is still a no-op stub** — it has no `onClick` and never did. Wiring it up is outstanding.
+- **The per-unit allocation table and both explanatory paragraphs were removed** from the Allocation page. It is now the heading plus the two bulk council-invoice cards. Per-unit figures live on Levy breakdown and Statement preview.
+- **Bulk water and bulk electricity now default to 0,00 when no bill has been captured for the month.** This was a real data-integrity bug, not cosmetics: `loadAppData` fell back to the hard-coded `COUNCIL_INVOICE` seed (66 kL / R951.19 / 2 374 kWh / R6 114.24 — actual **June 2026** figures) whenever `council_invoices` had no row for the selected period. Last month's numbers therefore presented as this month's with nothing on screen saying so.
+
+**How it works now:** new `COUNCIL_INVOICE_NO_BILL` constant zeroes only the four bulk fields; `loadAppData` returns `councilInvoiceMissing: !inv` alongside it. That flag is threaded into `UtilityBills` and `Allocation` as `billMissing`, and it:
+- renders an amber "no council bills captured for <month>" notice on both;
+- suppresses the common-property provision check, which would otherwise read a nonsense negative gap against a zero bulk figure;
+- clears itself the moment bill figures are saved (a row then exists).
+
+The bill-driven per-unit inputs (Water Demand Levy, Sewer, Electricity Service/Network) deliberately still carry forward — they barely move month to month and only feed the AGM levy suggestions, so zeroing them would break the levy grid for no benefit.
+
+### 2. Gmail import outage found and documented
+**The daily import has been dead since 14 July 2026.** `cron.job_run_details` reported `succeeded` every single day throughout, because pg_cron only sees that the HTTP request was *queued* — it never sees the response. The actual response in `net._http_response`:
+
+```
+500  {"ok":false,"error":"Gmail token error: {"error":"invalid_grant","error_description":"Bad Request"}"}
+```
+
+The Gmail OAuth refresh token is dead. **Leading hypothesis: the Google OAuth consent screen is still in "Testing" status**, where Google expires refresh tokens after 7 days unconditionally. The edge function was created 14 July and the last successful import was 14 July — the dates fit. Publishing the consent screen to "In production" removes the timer permanently (no Google verification needed for a personal-scale app; you accept an "unverified app" warning at consent instead).
+
+Consequence for the app: no council bills and no bank statements have imported for August. Which is precisely the condition the zero-default above now surfaces honestly instead of hiding behind June's figures.
+
+**`docs/RUNBOOK-gmail-import.md`** was written to cover this end to end: diagnosis queries, an error-to-cause table, the full re-mint procedure, how to test without waiting for 04:00, how to force a retry of a stuck email, and a monthly health check. **Read it before debugging this again — the "cron says succeeded" trap will otherwise cost an hour every time.**
+
+Reference facts worth having to hand: secrets are `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` / `GMAIL_REFRESH_TOKEN` / `CRON_SECRET` on the edge function; the cron's shared secret is the Vault entry `gmail_import_cron_secret`; the required scope is `gmail.modify` (**not** `readonly` — the function applies `Imported` / `Needs review` labels, and without them every email reprocesses forever); watched accounts are CoJ water `300993014`, CoJ electricity `220022810`, FNB `61123184551`.
+
+---
+
+## Done on 6 August 2026, session 1
 
 Both pieces live on the **Financial dashboard** (`tab === "analytics"`). No DB changes were made this session — read-only additions.
 
@@ -185,6 +218,9 @@ Reconciliation moved onto `applied_period`; `manual_payments` table and UI added
 - **Enter the FY 2026/2027 levies.** Select **August 2026** in the period selector, open Levy breakdown, apply the AGM increases over the carried-forward FY2025/26 figures, save. `levy_rates` and `levy_manual_entries` currently hold **2025/2026 only** — nothing exists for FY27 yet.
 - **Import the August 2026 bank statement** — closes out FY2025/26, supersedes the two manual allocations (Unit 1 R3,865.29, Unit 2 R1,380.63) automatically, and clears the incomplete-year footnote.
 - Review and delete the 9 superseded `ops_expenses` rows once satisfied they are genuine duplicates.
+- **Fix the Gmail import** — it has imported nothing since 14 July. Follow `docs/RUNBOOK-gmail-import.md` §3: publish the OAuth consent screen to production, re-mint the refresh token via the OAuth Playground with scope `gmail.modify`, update `GMAIL_REFRESH_TOKEN`, then test with the manual `net.http_post` in §5. Until this is done, August bills and bank statements will not arrive.
+- **The July 2026 FNB statement is stuck at `needs_review`** and will *not* retry on its own — it is already labelled in Gmail. Forcing it needs both the Gmail label removed and the `email_imports` row deleted (runbook §6).
+- **Mirror the `gmail-import` edge function source into the repo** (`supabase/functions/gmail-import/index.ts`). It currently exists only in Supabase; losing the project loses the function.
 - **Delete the stale git lock** `.git\objects\maintenance.lock` — `del .git\objects\maintenance.lock`. The sandbox cannot remove it. (Recreated 6 Aug: the working agreement below was breached — a `git fetch` was run from the sandbox before that rule was read. See "Read this summary at the start of each new conversation".)
 
 **Deployment & ops**
@@ -204,6 +240,8 @@ Reconciliation moved onto `applied_period`; `manual_payments` table and UI added
 - **Capture FY2026/2027 rates so the AGM report's "proposed" columns fill themselves.** Present: water bands (all 8). Missing: a `levy_rates` row for 2026/2027 (common-property provisions, water demand levy, electricity service and network charges) and a `levy_manual_entries` grid — section 10 carries this year's figures forward and labels itself as doing so.
 - Backfill `electricity_rates.financial_year = '2026/2027'` on the R2.81 row (currently null; resolved by `effective_from` instead).
 - Insurance schedule, garden salary/bonus and the Blockwatch fee have **no tables** — they are typed into Word each year. Worth a capture UI if that becomes annoying.
+- **Wire up "Confirm allocation & generate statements."** It has been a no-op stub since it was written; moving it to Meter readings hasn't changed that. Decide what it should actually do — most likely persist the computed statement rows for the period so a statement can't drift after it's issued.
+- **Add monitoring for the Gmail import** so a silent failure surfaces in days, not weeks. Runbook §7 has the two queries; a scheduled task on the 10th of each month would do it.
 - Real owner names in `units` (pending the public-GitHub-exposure decision).
 - Deduction-approval edge cases (proof never produced; claimed amount ≠ actual invoice).
 - The incomplete-year footnote hard-codes the word "July". Correct for an Aug–Jul FY; would need updating if that convention ever changes.
@@ -219,6 +257,8 @@ Reconciliation moved onto `applied_period`; `manual_payments` table and UI added
 - Consider long-term effects before changing the **live** DB; when uncertain, ask. Keep credit usage low; prefer the simplest change that works.
 - **Never delete live financial records to "clean up" — flag them instead** (see `superseded_reason`). Let Devon decide.
 - Read this summary at the start of each new conversation.
+- **The Claude Project knowledge base holds a badly stale copy of `App.jsx`** — 3,520 lines against the real 6,200, missing `applied_period`, manual payments, expense categories, the financial dashboard and the Aug–Jul FY helpers. **Never read or patch it.** The only source of truth is `G:\Claude Playground\CoWork\el-corazon-web\src\App.jsx`. (6 Aug: three changes were built against the cached copy and had to be redone.)
+- **The `G:\` mount takes a few seconds to appear at session start.** If the first directory listing doesn't show `el-corazon-web`, wait and list again — do **not** fall back to the Project knowledge copy, which is what caused the above.
 - Claude cannot write to the Claude Projects knowledge base — **this file must be copied in manually** to update it. The repo copy at `El-Corazon-Project-Summary.md` is the master.
 - Git: the remote occasionally has commits not present locally (multi-machine). **Always `git pull --rebase origin main` before starting new work**, and commit before pulling — rebase refuses to run on a dirty tree. During a rebase, `--ours`/`--theirs` are reversed vs a normal merge.
 - **Do not run git commands against `G:\` from the Linux sandbox** — not even read-only ones like `git status` or `git diff`. It creates `.git/*.lock` files it has no permission to remove, which then block Devon's own git. If it happens: `del .git\index.lock`, `del .git\HEAD.lock`, `del .git\objects\maintenance.lock`.
