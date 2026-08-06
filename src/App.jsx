@@ -4118,7 +4118,7 @@ async function fetchAgmExtras(fy) {
   const { from, to } = fyBounds(fy);
   const nextFrom = fyBounds(nfy).from;
 
-  const [units, bands, elec, levies, split, ops, txns, invoices] = await Promise.all([
+  const [units, bands, elec, levies, split, ops, txns, invoices, remits] = await Promise.all([
     client.from("units").select("id, unit_number, participation_quota").order("unit_number"),
     client.from("water_tariff_bands").select("*").in("financial_year", [fy, nfy]).order("from_kl"),
     client.from("electricity_rates").select("rate_per_kwh, effective_from").order("effective_from"),
@@ -4130,8 +4130,13 @@ async function fetchAgmExtras(fy) {
       .gte("txn_date", from).lte("txn_date", to),
     client.from("council_invoices").select("period, sewer_charge_per_unit, water_demand_levy_per_unit")
       .gte("period", from).lte("period", to).order("period", { ascending: false }).limit(1),
+    // Approved deductions are a third source of expenditure — a resident paid a
+    // Body Corp cost personally and it was set off against their levy. They
+    // carry no ops_expenses or bank row of their own.
+    client.from("remittance_advices").select("unit_id, period, deduction_approved, deduction_amount, deduction_comment, deductions")
+      .gte("period", from).lte("period", to),
   ]);
-  const bad = [units, bands, elec, levies, split, ops, txns, invoices].find((r) => r.error);
+  const bad = [units, bands, elec, levies, split, ops, txns, invoices, remits].find((r) => r.error);
   if (bad) throw bad.error;
 
   const unitList = (units.data || []).map((u) => ({
@@ -4174,17 +4179,46 @@ async function fetchAgmExtras(fy) {
   const levySplit = Object.keys(nextGrid).length ? nextGrid : gridFor(fy);
   const levySplitIsCarriedOver = Object.keys(nextGrid).length === 0;
 
-  // Miscellaneous expenses: operating-expense rows plus any bank debit tagged
-  // to the same category, sorted by date.
+  // Every individual item tagged Miscellaneous, from all three sources that
+  // feed an expenditure line in buildFinancialYearReport — operating expenses,
+  // bank debits, and approved resident deductions. Listing all three is what
+  // makes this table add up to the Miscellaneous line in section 1; omitting
+  // deductions was why it previously fell short.
   const MISC = "Miscellaneous";
   const misc = [];
   (ops.data || []).forEach((e) => {
     if (e.category !== MISC) return;
-    misc.push({ date: e.expense_date, amount: round2(Math.abs(Number(e.amount) || 0)), desc: e.notes || MISC });
+    misc.push({ date: e.expense_date, amount: round2(Math.abs(Number(e.amount) || 0)), desc: e.notes || MISC, source: "Body corp expense" });
   });
   (txns.data || []).forEach((t) => {
     if (t.direction !== "debit" || t.expense_category !== MISC) return;
-    misc.push({ date: t.txn_date, amount: round2(Math.abs(Number(t.amount) || 0)), desc: t.description_raw || MISC });
+    misc.push({ date: t.txn_date, amount: round2(Math.abs(Number(t.amount) || 0)), desc: t.description_raw || MISC, source: "Bank payment" });
+  });
+  (remits.data || []).forEach((r) => {
+    if (!r.deduction_approved) return;
+    // Same shape-tolerance as the report: a claim either itemises its
+    // deductions or carries a single untagged amount (which lands in
+    // Unclassified, not here).
+    const items = Array.isArray(r.deductions) && r.deductions.length
+      ? r.deductions
+      : (Number(r.deduction_amount) > 0 ? [{ amount: r.deduction_amount, expenseCategory: null, description: r.deduction_comment }] : []);
+    items.forEach((it) => {
+      if ((it.expenseCategory || null) !== MISC) return;
+      const amount = round2(Math.abs(Number(it.amount) || 0));
+      if (!(amount > 0)) return;
+      const who = noById[r.unit_id] ? `Unit ${noById[r.unit_id]}` : "a unit";
+      // Each line of a claim carries its own `comment`; the claim-level
+      // deduction_comment is only a fallback for a single untagged amount.
+      // Using the claim comment per item would print the whole claim's text
+      // against every one of its lines.
+      const what = it.comment || it.description || it.note || r.deduction_comment || MISC;
+      misc.push({
+        date: r.period,
+        amount,
+        desc: `${what} — paid by ${who}, recovered by levy deduction`,
+        source: "Approved deduction",
+      });
+    });
   });
   misc.sort((a, b) => String(a.date).localeCompare(String(b.date)));
 
@@ -4329,8 +4363,11 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras }) {
   const miscReported = round2((report.expenseRows.find((r) => r.label === "Miscellaneous") || {}).total || 0);
   c3.push(row(["Total", "", money(miscReported), ""], ["left", "left", "right", "left"], true, BAND));
   C.push(tbl(c3));
+  // The rows above cover all three sources that feed the Miscellaneous line, so
+  // these should agree. If they ever don't, the document says so rather than
+  // quietly printing a total the rows don't support.
   if (Math.abs(miscReported - miscItemised) > 0.005) {
-    C.push(hint(`The total is the Miscellaneous line from section 1 (${money(miscReported)}). The rows above itemise ${money(miscItemised)} of it; the ${money(round2(miscReported - miscItemised))} difference is approved resident deductions tagged to this category, which carry no separate expense record.`));
+    C.push(hint(`The total shown is the Miscellaneous line from section 1 (${money(miscReported)}); the rows above itemise ${money(miscItemised)}. The ${money(round2(Math.abs(miscReported - miscItemised)))} difference means an item is tagged Miscellaneous somewhere the itemisation doesn't reach — check the Bank reconciliation and Body corp expenses pages before the meeting.`));
   }
 
   // ---------- Landscape D: section 4 ----------
