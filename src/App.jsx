@@ -4033,9 +4033,278 @@ function Analytics({ expenseCategories }) {
               </p>
             </div>
           </Card>
+
+          <UsageTrends fy={fy} />
         </div>
       )}
     </>
+  );
+}
+
+// ---------- Usage trends (CoJ bulk vs units combined vs common property) ----------
+// Two line charts on the Financial dashboard: what the council metered for the
+// complex, what the seven unit meters account for, and the flat common-property
+// provision actually billed. Driven by the dashboard's own financial-year
+// selector, so switching year switches the charts.
+//
+// Common property here is the BILLED PROVISION (levy_rates), not "bulk minus
+// meters". The derived gap goes negative in several months because council
+// invoice periods don't line up with reading months — that discrepancy is
+// already surfaced on the Utility bills provision check, where it belongs.
+
+// The twelve statement periods of a financial year, 1 Aug -> 31 Jul, as the
+// "YYYY-MM-01" strings council_invoices and monthly_usage key on.
+function fyPeriods(fy) {
+  const start = Number(String(fy).split("/")[0]);
+  return Array.from({ length: 12 }, (_, i) => {
+    const month = (7 + i) % 12;            // 7 = August
+    const year = i < 5 ? start : start + 1;
+    return `${year}-${String(month + 1).padStart(2, "0")}-01`;
+  });
+}
+
+// One financial year of bulk council usage, metered unit usage, and that year's
+// common-property provision. Three queries, no per-month round trips.
+async function fetchUsageTrend(fy) {
+  const client = await ensureSupabaseClient();
+  const { from, to } = fyBounds(fy);
+  const [inv, usage, levy] = await Promise.all([
+    client.from("council_invoices")
+      .select("period, bulk_water_kl, bulk_elec_kwh")
+      .gte("period", from).lte("period", to),
+    client.from("monthly_usage")
+      .select("period, water_current, water_previous, electricity_current, electricity_previous")
+      .gte("period", from).lte("period", to),
+    client.from("levy_rates")
+      .select("common_property_water_kl, common_property_electricity_kwh")
+      .eq("financial_year", fy).limit(1),
+  ]);
+  const failed = [inv, usage, levy].find((r) => r.error);
+  if (failed) throw failed.error;
+
+  const bulkW = {}, bulkE = {};
+  (inv.data || []).forEach((r) => {
+    const p = String(r.period).slice(0, 10);
+    bulkW[p] = r.bulk_water_kl == null ? null : Number(r.bulk_water_kl);
+    bulkE[p] = r.bulk_elec_kwh == null ? null : Number(r.bulk_elec_kwh);
+  });
+
+  // Each unit's own consumption (current less previous), summed. round2 at the
+  // subtraction, same as the Readings screen, so float noise never accumulates
+  // across seven units.
+  const unitW = {}, unitE = {};
+  (usage.data || []).forEach((r) => {
+    const p = String(r.period).slice(0, 10);
+    const w = round2(Number(r.water_current || 0) - Number(r.water_previous || 0));
+    const e = round2(Number(r.electricity_current || 0) - Number(r.electricity_previous || 0));
+    unitW[p] = round2((unitW[p] || 0) + w);
+    unitE[p] = round2((unitE[p] || 0) + e);
+  });
+
+  // No levy_rates row for an older FY — fall back to the app defaults rather
+  // than dropping the line entirely.
+  const lr = (levy.data || [])[0];
+  const cpWater = lr && lr.common_property_water_kl != null
+    ? Number(lr.common_property_water_kl) : COMMON_PROPERTY_WATER_KL;
+  const cpElec = lr && lr.common_property_electricity_kwh != null
+    ? Number(lr.common_property_electricity_kwh) : COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT;
+
+  // A month with neither a council invoice nor readings stays null so the line
+  // breaks there instead of dropping to zero, and the flat provision line is
+  // only drawn across months that actually have data.
+  const periods = fyPeriods(fy);
+  const has = (p) => bulkW[p] != null || bulkE[p] != null || unitW[p] != null || unitE[p] != null;
+
+  return {
+    labels: periods.map((p) => {
+      const [y, m] = p.split("-");
+      return `${MONTH_NAMES[parseInt(m, 10) - 1].slice(0, 3)} ${y.slice(2)}`;
+    }),
+    water: {
+      bulk: periods.map((p) => (bulkW[p] == null ? null : bulkW[p])),
+      units: periods.map((p) => (unitW[p] == null ? null : unitW[p])),
+      common: periods.map((p) => (has(p) ? cpWater : null)),
+    },
+    electricity: {
+      bulk: periods.map((p) => (bulkE[p] == null ? null : bulkE[p])),
+      units: periods.map((p) => (unitE[p] == null ? null : unitE[p])),
+      common: periods.map((p) => (has(p) ? cpElec : null)),
+    },
+  };
+}
+
+// Picks a readable y axis: a 1/2/2.5/5 x 10^n gridline step, then the smallest
+// multiple of that step which clears the data. Sizing the step first (rather
+// than rounding the maximum up to a round number) keeps the lines filling the
+// plot instead of squashing into the bottom third.
+function niceAxis(maxVal, targetTicks = 4) {
+  if (!(maxVal > 0)) return { max: 1, ticks: [0, 1] };
+  const raw = maxVal / targetTicks;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / mag;
+  const step = (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * mag;
+  const max = Math.ceil(maxVal / step) * step;
+  const ticks = [];
+  for (let t = 0; t <= max + step / 1000; t += step) ticks.push(Math.round(t * 1000) / 1000);
+  return { max, ticks };
+}
+
+// A minimal multi-series line chart. Hand-rolled SVG deliberately: no chart
+// library in the bundle, and it prints with the rest of the dashboard.
+function TrendChart({ labels, series, unit }) {
+  const W = 760, H = 280;
+  const M = { top: 16, right: 14, bottom: 34, left: 58 };
+  const iw = W - M.left - M.right;
+  const ih = H - M.top - M.bottom;
+
+  const all = series.flatMap((s) => s.values).filter((v) => v != null && isFinite(v));
+  if (!all.length) {
+    return (
+      <div style={{ padding: "36px 0", textAlign: "center", color: "#94A0AC", fontSize: 13 }}>
+        No usage captured for this financial year yet.
+      </div>
+    );
+  }
+  const { max, ticks } = niceAxis(Math.max(...all));
+  const x = (i) => M.left + (labels.length > 1 ? (i / (labels.length - 1)) * iw : iw / 2);
+  const y = (v) => M.top + ih - (v / max) * ih;
+
+  // Null-safe path: a gap in the data lifts the pen instead of drawing through
+  // it, so a missing month reads as missing rather than as zero.
+  const pathFor = (values) => {
+    let d = "", pen = false;
+    values.forEach((v, i) => {
+      if (v == null || !isFinite(v)) { pen = false; return; }
+      d += `${pen ? "L" : "M"}${x(i).toFixed(1)} ${y(v).toFixed(1)} `;
+      pen = true;
+    });
+    return d.trim();
+  };
+  const fmt = (v) => (Number.isInteger(v) ? v.toLocaleString("en-ZA") : v.toFixed(1));
+
+  return (
+    <div className="scroll-x" style={{ margin: "0 -4px" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ minWidth: 520, display: "block" }} role="img">
+        {ticks.map((t, i) => (
+          <g key={i}>
+            <line x1={M.left} x2={W - M.right} y1={y(t)} y2={y(t)} stroke="#EEE7D6" strokeWidth="1" />
+            <text x={M.left - 9} y={y(t) + 4} textAnchor="end"
+                  fontFamily="'IBM Plex Mono', monospace" fontSize="10.5" fill="#94A0AC">
+              {fmt(t)}
+            </text>
+          </g>
+        ))}
+        <line x1={M.left} x2={M.left} y1={M.top} y2={M.top + ih} stroke="#D8D0BE" strokeWidth="1" />
+
+        {labels.map((lab, i) => (
+          <text key={i} x={x(i)} y={H - 12} textAnchor="middle"
+                fontFamily="'Inter', sans-serif" fontSize="10.5" fill="#64748B">
+            {lab}
+          </text>
+        ))}
+
+        {series.map((s) => (
+          <g key={s.label}>
+            <path d={pathFor(s.values)} fill="none" stroke={s.color} strokeWidth={s.dashed ? 2 : 2.2}
+                  strokeDasharray={s.dashed ? "6 4" : undefined}
+                  strokeLinejoin="round" strokeLinecap="round" />
+            {!s.dashed && s.values.map((v, i) =>
+              v == null || !isFinite(v) ? null : (
+                <circle key={i} cx={x(i)} cy={y(v)} r="3" fill="#fff" stroke={s.color} strokeWidth="1.8">
+                  <title>{`${s.label} · ${labels[i]} · ${v.toLocaleString("en-ZA")} ${unit}`}</title>
+                </circle>
+              )
+            )}
+          </g>
+        ))}
+
+        <text x={M.left - 9} y={M.top - 4} textAnchor="end"
+              fontFamily="'Inter', sans-serif" fontSize="10" fill="#94A0AC">{unit}</text>
+      </svg>
+    </div>
+  );
+}
+
+function ChartLegend({ series }) {
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 18, marginTop: 10 }}>
+      {series.map((s) => (
+        <span key={s.label} style={{ display: "inline-flex", alignItems: "center", gap: 7, fontSize: 12.5, color: "#1B2A38" }}>
+          <svg width="22" height="8" style={{ flex: "none" }}>
+            <line x1="0" y1="4" x2="22" y2="4" stroke={s.color} strokeWidth="2.2"
+                  strokeDasharray={s.dashed ? "5 3" : undefined} strokeLinecap="round" />
+          </svg>
+          {s.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function UsageTrends({ fy }) {
+  const [data, setData] = useState(null);
+  const [status, setStatus] = useState("loading"); // loading | ready | error
+
+  useEffect(() => {
+    if (!fy) return;
+    let alive = true;
+    setStatus("loading");
+    fetchUsageTrend(fy)
+      .then((d) => { if (alive) { setData(d); setStatus("ready"); } })
+      .catch((err) => {
+        console.error("Loading usage trends failed:", err);
+        if (alive) setStatus("error");
+      });
+    return () => { alive = false; };
+  }, [fy]);
+
+  const elecSeries = data ? [
+    { label: "CoJ bulk meter", color: "#1B2A38", values: data.electricity.bulk },
+    { label: "All units combined", color: "#2F5D50", values: data.electricity.units },
+    { label: "Common property (billed provision)", color: "#B5651D", dashed: true, values: data.electricity.common },
+  ] : [];
+  const waterSeries = data ? [
+    { label: "CoJ bulk meter", color: "#1B2A38", values: data.water.bulk },
+    { label: "All units combined", color: "#2F5D50", values: data.water.units },
+    { label: "Common property (billed provision)", color: "#B5651D", dashed: true, values: data.water.common },
+  ] : [];
+
+  return (
+    <div style={{ marginTop: 18 }}>
+      <div style={{ fontWeight: 700, fontSize: 13.5, textTransform: "uppercase", letterSpacing: 0.4, color: "#64748B", marginBottom: 12 }}>
+        Usage trends — {fy} ({fyLabel(fy)})
+      </div>
+
+      {status === "loading" && (
+        <Card><div style={{ color: "#94A0AC", fontSize: 13 }}>Loading usage…</div></Card>
+      )}
+      {status === "error" && (
+        <Card><div style={{ color: "#B5651D", fontWeight: 600, fontSize: 13 }}>
+          Couldn’t load usage trends — see browser console.
+        </div></Card>
+      )}
+
+      {status === "ready" && data && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(420px, 1fr))", gap: 14 }}>
+          <Card>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 2 }}>Electricity (kWh / month)</div>
+            <div style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}>
+              Council bulk meter vs the seven unit meters combined vs the common-property provision.
+            </div>
+            <TrendChart labels={data.labels} series={elecSeries} unit="kWh" />
+            <ChartLegend series={elecSeries} />
+          </Card>
+          <Card>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 2 }}>Water (kL / month)</div>
+            <div style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}>
+              Council bulk meter vs the seven unit meters combined vs the common-property provision.
+            </div>
+            <TrendChart labels={data.labels} series={waterSeries} unit="kL" />
+            <ChartLegend series={waterSeries} />
+          </Card>
+        </div>
+      )}
+    </div>
   );
 }
 
