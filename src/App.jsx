@@ -4041,16 +4041,21 @@ function Analytics({ expenseCategories }) {
   );
 }
 
-// ---------- Usage trends (CoJ bulk vs units combined vs common property) ----------
-// Two line charts on the Financial dashboard: what the council metered for the
-// complex, what the seven unit meters account for, and the flat common-property
-// provision actually billed. Driven by the dashboard's own financial-year
-// selector, so switching year switches the charts.
+// ---------- Usage trends (CoJ bulk vs units vs total allocated) ----------
+// Two line charts on the Financial dashboard, driven by the dashboard's own
+// financial-year selector. Three lines each:
+//   1. CoJ bulk meter          — what the council metered for the whole complex
+//   2. All units combined      — what the seven unit meters account for
+//   3. Units + common property — 2 plus the common-property provision, i.e.
+//                                everything the body corp has allocated
 //
-// Common property here is the BILLED PROVISION (levy_rates), not "bulk minus
-// meters". The derived gap goes negative in several months because council
-// invoice periods don't line up with reading months — that discrepancy is
-// already surfaced on the Utility bills provision check, where it belongs.
+// Line 3 is the one to read against line 1: where it sits below the bulk line
+// the council metered consumption nobody was billed for; where it sits above,
+// the complex billed more than the council metered that month. The provision
+// is the flat billed figure from levy_rates (20 kL / 300 kWh), not "bulk minus
+// meters" — that derived gap goes negative in several months because council
+// invoice periods don't line up with reading months, and it already has a home
+// on the Utility bills provision check.
 
 // The twelve statement periods of a financial year, 1 Aug -> 31 Jul, as the
 // "YYYY-MM-01" strings council_invoices and monthly_usage key on.
@@ -4109,11 +4114,10 @@ async function fetchUsageTrend(fy) {
   const cpElec = lr && lr.common_property_electricity_kwh != null
     ? Number(lr.common_property_electricity_kwh) : COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT;
 
-  // A month with neither a council invoice nor readings stays null so the line
-  // breaks there instead of dropping to zero, and the flat provision line is
-  // only drawn across months that actually have data.
+  // A month with no readings stays null so the line breaks there instead of
+  // dropping to zero. The allocated line is units + the common-property
+  // provision, so it only exists where there are readings to add it to.
   const periods = fyPeriods(fy);
-  const has = (p) => bulkW[p] != null || bulkE[p] != null || unitW[p] != null || unitE[p] != null;
 
   return {
     labels: periods.map((p) => {
@@ -4123,13 +4127,14 @@ async function fetchUsageTrend(fy) {
     water: {
       bulk: periods.map((p) => (bulkW[p] == null ? null : bulkW[p])),
       units: periods.map((p) => (unitW[p] == null ? null : unitW[p])),
-      common: periods.map((p) => (has(p) ? cpWater : null)),
+      allocated: periods.map((p) => (unitW[p] == null ? null : round2(unitW[p] + cpWater))),
     },
     electricity: {
       bulk: periods.map((p) => (bulkE[p] == null ? null : bulkE[p])),
       units: periods.map((p) => (unitE[p] == null ? null : unitE[p])),
-      common: periods.map((p) => (has(p) ? cpElec : null)),
+      allocated: periods.map((p) => (unitE[p] == null ? null : round2(unitE[p] + cpElec))),
     },
+    provision: { water: cpWater, electricity: cpElec },
   };
 }
 
@@ -4261,12 +4266,12 @@ function UsageTrends({ fy }) {
   const elecSeries = data ? [
     { label: "CoJ bulk meter", color: "#1B2A38", values: data.electricity.bulk },
     { label: "All units combined", color: "#2F5D50", values: data.electricity.units },
-    { label: "Common property (billed provision)", color: "#B5651D", dashed: true, values: data.electricity.common },
+    { label: `Units + common property (+${data.provision.electricity} kWh)`, color: "#B5651D", dashed: true, values: data.electricity.allocated },
   ] : [];
   const waterSeries = data ? [
     { label: "CoJ bulk meter", color: "#1B2A38", values: data.water.bulk },
     { label: "All units combined", color: "#2F5D50", values: data.water.units },
-    { label: "Common property (billed provision)", color: "#B5651D", dashed: true, values: data.water.common },
+    { label: `Units + common property (+${data.provision.water} kL)`, color: "#B5651D", dashed: true, values: data.water.allocated },
   ] : [];
 
   return (
@@ -4289,7 +4294,9 @@ function UsageTrends({ fy }) {
           <Card>
             <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 2 }}>Electricity (kWh / month)</div>
             <div style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}>
-              Council bulk meter vs the seven unit meters combined vs the common-property provision.
+              Council bulk meter vs the seven unit meters combined. The dotted line adds the
+              common-property provision — where it falls short of the bulk line, that month’s
+              consumption wasn’t fully allocated.
             </div>
             <TrendChart labels={data.labels} series={elecSeries} unit="kWh" />
             <ChartLegend series={elecSeries} />
@@ -4297,7 +4304,9 @@ function UsageTrends({ fy }) {
           <Card>
             <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 2 }}>Water (kL / month)</div>
             <div style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}>
-              Council bulk meter vs the seven unit meters combined vs the common-property provision.
+              Council bulk meter vs the seven unit meters combined. The dotted line adds the
+              common-property provision — where it falls short of the bulk line, that month’s
+              consumption wasn’t fully allocated.
             </div>
             <TrendChart labels={data.labels} series={waterSeries} unit="kL" />
             <ChartLegend series={waterSeries} />
