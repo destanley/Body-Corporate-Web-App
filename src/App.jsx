@@ -82,6 +82,22 @@ const COUNCIL_INVOICE = {
   elecNetworkFee: 1125.75,
 };
 
+// Used when no council_invoices row exists for the selected period - i.e. the
+// council utility bills for that month haven't arrived (or haven't been
+// captured) yet. The app used to fall back to the seed invoice above, which
+// made June 2026's bulk figures look like the current month's. Bulk water and
+// bulk electricity now default to 0.00 instead, so an uncaptured month reads
+// as empty rather than as stale data. The bill-driven per-unit inputs (Water
+// Demand Levy, Sewer, Electricity Service/Network) are left as-is - they
+// barely move month to month and only feed the AGM levy suggestions.
+const COUNCIL_INVOICE_NO_BILL = {
+  ...COUNCIL_INVOICE,
+  bulkWaterKl: 0,
+  bulkWaterRand: 0,
+  bulkElecKwh: 0,
+  bulkElecRand: 0,
+};
+
 // Levy line items — one amount per unit, per item, in statement order.
 // Rules (trustee-confirmed, 12 July 2026), all VAT-inclusive on the statement:
 //   Insurance                  — individualised per unit per year, manual entry
@@ -862,7 +878,11 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
           elecServiceFee: Number(inv.electricity_service_fee || 0),
           elecNetworkFee: Number(inv.electricity_network_fee || 0),
         }
-      : COUNCIL_INVOICE,
+      : COUNCIL_INVOICE_NO_BILL,
+    // True when this month has no council_invoices row at all - the utility
+    // bills haven't been received/captured, so the bulk figures above are the
+    // zero defaults, not real numbers.
+    councilInvoiceMissing: !inv,
   };
 }
 
@@ -1508,7 +1528,8 @@ export default function App() {
   // dropdown and the analytics dashboard read from it.
   const [expenseCategories, setExpenseCategories] = useState(EXPENSE_CATEGORIES_FALLBACK);
   const [readings, setReadings] = useState(READINGS);
-  const [councilInvoice, setCouncilInvoice] = useState(COUNCIL_INVOICE);
+  const [councilInvoice, setCouncilInvoice] = useState(COUNCIL_INVOICE_NO_BILL);
+  const [councilInvoiceMissing, setCouncilInvoiceMissing] = useState(true);
   // Manual overrides of the computed utility due lines, per unit, for the
   // selected period — used to align a past statement to what was physically sent.
   const [statementOverrides, setStatementOverrides] = useState({});
@@ -1615,6 +1636,7 @@ export default function App() {
         setOpsExpenses(data.opsExpenses);
         if (data.expenseCategories && data.expenseCategories.length) setExpenseCategories(data.expenseCategories);
         setCouncilInvoice(data.councilInvoice);
+        setCouncilInvoiceMissing(!!data.councilInvoiceMissing);
         setStatementOverrides(data.statementOverrides || {});
         // Reset the statement view for the selected month: show its data if
         // present, otherwise clear last month's so nothing stale lingers.
@@ -1823,8 +1845,15 @@ export default function App() {
             {tab === "readings" && <Readings readings={readings} setReadings={setReadings} period={selectedPeriod} />}
             {tab === "allocation" && (
               <>
-                <UtilityBills councilInvoice={councilInvoice} setCouncilInvoice={setCouncilInvoice} alloc={alloc} period={selectedPeriod} />
-                <Allocation alloc={alloc} />
+                <UtilityBills
+                  councilInvoice={councilInvoice}
+                  setCouncilInvoice={setCouncilInvoice}
+                  alloc={alloc}
+                  period={selectedPeriod}
+                  billMissing={councilInvoiceMissing}
+                  setBillMissing={setCouncilInvoiceMissing}
+                />
+                <Allocation alloc={alloc} billMissing={councilInvoiceMissing} />
               </>
             )}
             {tab === "reconciliation" && (
@@ -2352,9 +2381,12 @@ function Readings({ readings, setReadings, period = CURRENT_PERIOD }) {
         <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10 }}>
           {status === "saved" && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>✓ Saved to database</span>}
           {status === "error" && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>Couldn't save — see browser console</span>}
-          <button style={primaryBtn} onClick={save} disabled={status === "saving"}>
+          <button style={secondaryBtn} onClick={save} disabled={status === "saving"}>
             {status === "saving" ? "Saving…" : "Save readings"}
           </button>
+          {/* Moved here from the Invoice allocation page - readings are the
+              last input before statements can be produced. */}
+          <button style={primaryBtn}>Confirm allocation &amp; generate statements</button>
         </div>
       </Card>
     </>
@@ -2383,7 +2415,7 @@ const readingInputStyle = {
 };
 
 // ---------- Utility bills (feeds the levy suggestions & provision check) ----------
-function UtilityBills({ councilInvoice, setCouncilInvoice, alloc, period = CURRENT_PERIOD }) {
+function UtilityBills({ councilInvoice, setCouncilInvoice, alloc, period = CURRENT_PERIOD, billMissing = false, setBillMissing }) {
   const waterInputRef = useRef(null);
   const elecInputRef = useRef(null);
   const [status, setStatus] = useState("idle"); // idle | parsing | review | saving | saved | error
@@ -2431,6 +2463,7 @@ function UtilityBills({ councilInvoice, setCouncilInvoice, alloc, period = CURRE
       };
       await saveCouncilInvoiceToDb(next);
       setCouncilInvoice(next);
+      if (setBillMissing) setBillMissing(false); // a row now exists for this period
       setStatus("saved");
       setNote("Bill figures saved — levy suggestions and the provision check update immediately.");
       setTimeout(() => setStatus("idle"), 3000);
@@ -2465,6 +2498,16 @@ function UtilityBills({ councilInvoice, setCouncilInvoice, alloc, period = CURRE
   return (
     <Card style={{ marginBottom: 20 }}>
       <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Utility bills — {periodLabel(period)}</div>
+      {billMissing && (
+        <div style={{
+          background: "#FBF3E6", border: "1px solid #E4C9A0", borderRadius: 7,
+          padding: "9px 12px", fontSize: 12.5, color: "#8A5A1D", marginBottom: 10, lineHeight: 1.6,
+        }}>
+          <b>No council bills captured for {periodLabel(period)}.</b> Bulk water and bulk
+          electricity are showing as R0.00 / 0 rather than carrying last month's figures
+          forward. Upload or enter the bills below to replace them.
+        </div>
+      )}
       <p style={{ fontSize: 12.5, color: "#64748B", marginBottom: 12 }}>
         Upload the council water and electricity bills; recognised figures fill the fields below for checking before anything is saved. These figures drive the bill-driven levy lines (Water Demand Levy, Sewerage, Electricity Service &amp; Network Charges) and the provision check.
       </p>
@@ -2500,82 +2543,61 @@ function UtilityBills({ councilInvoice, setCouncilInvoice, alloc, period = CURRE
       </div>
       <div style={{ marginTop: 14, borderTop: "1px dashed #D8D0BE", paddingTop: 12, fontSize: 12.5, color: "#64748B", lineHeight: 1.7 }}>
         <b>Common property provision check</b> (bulk minus the sum of unit meters):
-        <br />Water — {verdict(waterDiff, "kL", COMMON_PROPERTY_WATER_KL, waterGap)}
-        <br />Electricity — {verdict(elecDiff, "kWh", alloc.commonPropertyElectricityKwh, elecGap)}
+        {billMissing ? (
+          <><br />Waiting on this month's council bills — the check needs real bulk figures.</>
+        ) : (
+          <>
+            <br />Water — {verdict(waterDiff, "kL", COMMON_PROPERTY_WATER_KL, waterGap)}
+            <br />Electricity — {verdict(elecDiff, "kWh", alloc.commonPropertyElectricityKwh, elecGap)}
+          </>
+        )}
       </div>
     </Card>
   );
 }
 
 // ---------- Allocation ----------
-function Allocation({ alloc }) {
+// Council-invoice summary only. The per-unit allocation table and the billing
+// narrative that used to sit under it were removed (6 Aug 2026) - the per-unit
+// figures live on the Levy breakdown and statement pages, and the "Confirm
+// allocation & generate statements" action moved to the Meter readings page.
+function Allocation({ alloc, billMissing = false }) {
   const ci = alloc.councilInvoice;
   return (
     <>
-      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Council invoice allocation</h1>
-      <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
-        Water and electricity are billed per unit on actual consumption, plus VAT. Sewerage and common-area water/electricity are covered by the AGM levy breakdown, not billed again here. Refuse and the basic municipal charge are no longer billed to units at all.
-      </p>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 14 }}>Council invoice allocation</h1>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 14, marginBottom: 20 }}>
+      {billMissing && (
+        <Card style={{ marginBottom: 14, background: "#FBF3E6", border: "1px solid #E4C9A0" }}>
+          <div style={{ fontSize: 12.5, color: "#8A5A1D", lineHeight: 1.6 }}>
+            No council bills have been captured for this month yet, so bulk water and bulk
+            electricity default to R0.00. Capture them under <b>Utility bills</b> above.
+          </div>
+        </Card>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 14 }}>
         <Card>
           <div style={{ fontSize: 11, color: "#64748B", textTransform: "uppercase", marginBottom: 6 }}>Bulk water (council invoice)</div>
           <div className="f-mono" style={{ fontSize: 17, fontWeight: 600 }}>{rand(ci.bulkWaterRand)}</div>
-          <div style={{ fontSize: 12, color: "#94A0AC", marginTop: 4 }}>{ci.bulkWaterKl} kL · metered sum {alloc.totalW.toFixed(2)} kL · common {alloc.commonWater.toFixed(2)} kL</div>
-          <div style={{ fontSize: 11.5, marginTop: 6, color: "#64748B" }}>
-            Actual metered common-area gap valued at {rand(alloc.commonWaterCostTotal)}, vs. the suggested "Common Property Water" figure from the fixed {COMMON_PROPERTY_WATER_KL}kL standard: {rand(alloc.commonPropertyWaterCost)} total ({rand(alloc.commonPropertyWaterPerUnit)}/unit) — a reference for the manual levy grid, not billed automatically.
-          </div>
+          <div style={{ fontSize: 12, color: "#94A0AC", marginTop: 4 }}>{ci.bulkWaterKl} kL · metered sum {alloc.totalW.toFixed(2)} kL{billMissing ? "" : ` · common ${alloc.commonWater.toFixed(2)} kL`}</div>
+          {!billMissing && (
+            <div style={{ fontSize: 11.5, marginTop: 6, color: "#64748B" }}>
+              Actual metered common-area gap valued at {rand(alloc.commonWaterCostTotal)}, vs. the suggested "Common Property Water" figure from the fixed {COMMON_PROPERTY_WATER_KL}kL standard: {rand(alloc.commonPropertyWaterCost)} total ({rand(alloc.commonPropertyWaterPerUnit)}/unit) — a reference for the manual levy grid, not billed automatically.
+            </div>
+          )}
         </Card>
         <Card>
           <div style={{ fontSize: 11, color: "#64748B", textTransform: "uppercase", marginBottom: 6 }}>Bulk electricity (council invoice)</div>
           <div className="f-mono" style={{ fontSize: 17, fontWeight: 600 }}>{rand(ci.bulkElecRand)}</div>
-          <div style={{ fontSize: 12, color: "#94A0AC", marginTop: 4 }}>{ci.bulkElecKwh} kWh · metered sum {alloc.totalE.toFixed(2)} kWh · common {alloc.commonElec.toFixed(2)} kWh</div>
-          <div style={{ fontSize: 11.5, marginTop: 6, color: "#64748B" }}>
-            Actual metered common-area gap valued at {rand(alloc.commonElecCostTotal)}, vs. the suggested "Common Property Electricity" figure from the configurable {alloc.commonPropertyElectricityKwh}kWh standard: {rand(alloc.commonPropertyElecCost)} total ({rand(alloc.commonPropertyElecPerUnit)}/unit) — a reference for the manual levy grid, not billed automatically.
-          </div>
+          <div style={{ fontSize: 12, color: "#94A0AC", marginTop: 4 }}>{ci.bulkElecKwh} kWh · metered sum {alloc.totalE.toFixed(2)} kWh{billMissing ? "" : ` · common ${alloc.commonElec.toFixed(2)} kWh`}</div>
+          {!billMissing && (
+            <div style={{ fontSize: 11.5, marginTop: 6, color: "#64748B" }}>
+              Actual metered common-area gap valued at {rand(alloc.commonElecCostTotal)}, vs. the suggested "Common Property Electricity" figure from the configurable {alloc.commonPropertyElectricityKwh}kWh standard: {rand(alloc.commonPropertyElecCost)} total ({rand(alloc.commonPropertyElecPerUnit)}/unit) — a reference for the manual levy grid, not billed automatically.
+            </div>
+          )}
         </Card>
       </div>
-      <p style={{ color: "#64748B", fontSize: 12, marginTop: -8, marginBottom: 18 }}>
-        Water and electricity are charged to units using the tariff bands under <b>Tariffs &amp; rates</b>, not a proportional split of the invoice — so the invoice totals above won't match the billed totals exactly. That's expected, not an error to chase down. Units using more than 6kL get the municipal free first-6kL allowance; units at or under 6kL are billed every kL at the first paid rate instead (a minimum charge, so low usage never bills R0.00). Common property water always uses the real, unmodified scale. Refuse ({rand(ci.refuse)}) and the basic municipal charge ({rand(ci.fixedBasic)}) are on the council invoice but not recovered from any unit — confirm that's intentional.
-      </p>
-
-      <Card>
-        <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", fontSize: 12.5, borderCollapse: "collapse", minWidth: 780 }}>
-          <thead>
-            <tr style={{ color: "#64748B", textAlign: "right", fontSize: 10.5, textTransform: "uppercase" }}>
-              <th style={{ padding: "6px 6px", textAlign: "left" }}>Unit</th>
-              <th style={{ padding: "6px 6px" }}>Electricity</th>
-              <th style={{ padding: "6px 6px" }}>Water</th>
-              <th style={{ padding: "6px 6px" }}>Sub-Total</th>
-              <th style={{ padding: "6px 6px" }}>VAT</th>
-              <th style={{ padding: "6px 6px" }}>Utilities due</th>
-              <th style={{ padding: "6px 6px" }}>Levy</th>
-              <th style={{ padding: "6px 6px" }}>Additional</th>
-              <th style={{ padding: "6px 6px", color: "#1B2A38" }}>Total due</th>
-            </tr>
-          </thead>
-          <tbody>
-            {alloc.rows.map((r) => (
-              <tr key={r.id} style={{ borderTop: "1px solid #EEE7D6" }} className="f-mono">
-                <td style={{ padding: "8px 6px", textAlign: "left", fontWeight: 600 }}>{r.id}</td>
-                <td style={{ padding: "8px 6px", textAlign: "right" }}>{rand(r.elecCost)}</td>
-                <td style={{ padding: "8px 6px", textAlign: "right" }}>{rand(r.waterCost)}</td>
-                <td style={{ padding: "8px 6px", textAlign: "right" }}>{rand(r.subTotal)}</td>
-                <td style={{ padding: "8px 6px", textAlign: "right" }}>{rand(r.vat)}</td>
-                <td style={{ padding: "8px 6px", textAlign: "right" }}>{rand(r.utilitiesDue)}</td>
-                <td style={{ padding: "8px 6px", textAlign: "right" }}>{rand(r.levy)}</td>
-                <td style={{ padding: "8px 6px", textAlign: "right", color: r.additionalTotal ? "#B5651D" : "#94A0AC" }}>{rand(r.additionalTotal)}</td>
-                <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 700 }}>{rand(r.total)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        </div>
-        <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", gap: 10 }}>
-          <button style={primaryBtn}>Confirm allocation & generate statements</button>
-        </div>
-      </Card>
     </>
   );
 }
