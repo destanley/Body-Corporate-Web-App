@@ -3765,6 +3765,58 @@ function buildFinancialYearReport({
   };
 }
 
+// Loads one financial year and builds its income & expenditure report. Split
+// out of the Analytics screen so the AGM report can call it a second time for
+// the comparative prior year without duplicating the fetch.
+async function loadFyReport(fy, categories) {
+  const { from, to } = fyBounds(fy);
+  // Resident payments are bucketed by the statement month they settle, which
+  // can be up to two months before the bank month (the trustee can retarget
+  // that far back). So the bank fetch is widened by three months either side;
+  // buildFinancialYearReport drops anything that ends up outside the financial
+  // year once bucketed.
+  const wideFrom = `${from.slice(0, 4)}-05-01`;   // FY start less 3 months
+  const wideTo = `${to.slice(0, 4)}-10-31`;       // FY end plus 3 months
+  const client = await ensureSupabaseClient();
+  const [txns, manualPays, ops, remits, charges, unitRows] = await Promise.all([
+    client.from("bank_transactions").select("txn_date, period, applied_period, matched_unit_id, direction, amount, category, expense_category")
+      .gte("txn_date", wideFrom).lte("txn_date", wideTo),
+    client.from("manual_payments").select("unit_id, applied_period, amount")
+      .gte("applied_period", from).lte("applied_period", to),
+    // Rows flagged as duplicating a bank line or a deduction are excluded.
+    client.from("ops_expenses").select("expense_date, category, amount")
+      .is("superseded_reason", null).gte("expense_date", from).lte("expense_date", to),
+    client.from("remittance_advices").select("period, deduction_approved, deduction_amount, deductions")
+      .gte("period", from).lte("period", to),
+    client.from("additional_charges").select("period, amount, expense_category")
+      .gte("period", from).lte("period", to),
+    // Only to name units in the manual-allocation footnote.
+    client.from("units").select("id, unit_number"),
+  ]);
+  const bad = [txns, manualPays, ops, remits, charges, unitRows].find((r) => r.error);
+  if (bad) throw bad.error;
+  // The FY's last statement month (July) is collected on the following month's
+  // bank statement. Until that statement is imported, July shows almost no
+  // contributions and the surplus reads as a false deficit — so the report says
+  // so rather than let the number be misread.
+  const chaserMonth = ymOf(nextPeriod(`${to.slice(0, 4)}-07-01`));
+  const report = buildFinancialYearReport({
+    fy,
+    txns: txns.data || [], ops: ops.data || [],
+    remits: remits.data || [], charges: charges.data || [],
+    manualPays: manualPays.data || [],
+    categories,
+    unitNumbers: Object.fromEntries((unitRows.data || []).map((u) => [u.id, u.unit_number])),
+    chaserImported: (txns.data || []).some((t) => ymOf(t.txn_date) === chaserMonth),
+    chaserMonth,
+  });
+  // Whether this year predates the system at all — the AGM report leaves the
+  // comparative column blank rather than printing a column of zeros that reads
+  // as "we earned and spent nothing".
+  report.hasData = (txns.data || []).length > 0 || (ops.data || []).length > 0;
+  return report;
+}
+
 // Superscript markers next to a line item, e.g. "Owner Contributions ¹ ²".
 function NoteRef({ nums }) {
   if (!nums || nums.length === 0) return null;
@@ -3782,6 +3834,25 @@ function Analytics({ expenseCategories }) {
   const [status, setStatus] = useState("loading"); // loading | ready | error
   const [error, setError] = useState(null);
   const [showMonths, setShowMonths] = useState(false);
+  const [agmStatus, setAgmStatus] = useState("idle"); // idle | working | error
+
+  // Builds the AGM report for the selected financial year. The comparative
+  // prior year is loaded on demand rather than held in state — it's only ever
+  // needed here, and it keeps the dashboard's own load a single year.
+  const generateAgmReport = async () => {
+    setAgmStatus("working");
+    try {
+      const [prevReport, extras] = await Promise.all([
+        loadFyReport(previousFY(fy), expenseCategories).catch(() => null),
+        fetchAgmExtras(fy),
+      ]);
+      await exportAgmReportDocx({ fy, report, prevReport, extras });
+      setAgmStatus("idle");
+    } catch (err) {
+      console.error("Generating the AGM report failed:", err);
+      setAgmStatus("error");
+    }
+  };
 
   // Which financial years actually have bank data, newest first. Defaults to the
   // most recent one with data rather than the calendar-current FY — on 4 August
@@ -3821,56 +3892,12 @@ function Analytics({ expenseCategories }) {
     if (!fy) return;
     let alive = true;
     setStatus("loading");
-    (async () => {
-      try {
-        const { from, to } = fyBounds(fy);
-        // Resident payments are bucketed by the statement month they settle,
-        // which can be up to two months before the bank month (the trustee can
-        // retarget that far back). So the bank fetch is widened by three months
-        // either side; buildFinancialYearReport drops anything that ends up
-        // outside the financial year once bucketed.
-        const wideFrom = `${from.slice(0, 4)}-05-01`;   // FY start less 3 months
-        const wideTo = `${to.slice(0, 4)}-10-31`;       // FY end plus 3 months
-        const client = await ensureSupabaseClient();
-        const [txns, manualPays, ops, remits, charges, unitRows] = await Promise.all([
-          client.from("bank_transactions").select("txn_date, period, applied_period, matched_unit_id, direction, amount, category, expense_category")
-            .gte("txn_date", wideFrom).lte("txn_date", wideTo),
-          client.from("manual_payments").select("unit_id, applied_period, amount")
-            .gte("applied_period", from).lte("applied_period", to),
-          // Rows flagged as duplicating a bank line or a deduction are excluded.
-          client.from("ops_expenses").select("expense_date, category, amount")
-            .is("superseded_reason", null).gte("expense_date", from).lte("expense_date", to),
-          client.from("remittance_advices").select("period, deduction_approved, deduction_amount, deductions")
-            .gte("period", from).lte("period", to),
-          client.from("additional_charges").select("period, amount, expense_category")
-            .gte("period", from).lte("period", to),
-          // Only to name units in the manual-allocation footnote.
-          client.from("units").select("id, unit_number"),
-        ]);
-        const bad = [txns, manualPays, ops, remits, charges, unitRows].find((r) => r.error);
-        if (bad) throw bad.error;
-        if (!alive) return;
-        // The FY's last statement month (July) is collected on the following
-        // month's bank statement. Until that statement is imported, July shows
-        // almost no contributions and the surplus reads as a false deficit —
-        // so the report says so rather than let the number be misread.
-        const chaserMonth = ymOf(nextPeriod(`${to.slice(0, 4)}-07-01`));
-        setReport(buildFinancialYearReport({
-          fy,
-          txns: txns.data || [], ops: ops.data || [],
-          remits: remits.data || [], charges: charges.data || [],
-          manualPays: manualPays.data || [],
-          categories: expenseCategories,
-          unitNumbers: Object.fromEntries((unitRows.data || []).map((u) => [u.id, u.unit_number])),
-          chaserImported: (txns.data || []).some((t) => ymOf(t.txn_date) === chaserMonth),
-          chaserMonth,
-        }));
-        setStatus("ready");
-      } catch (err) {
+    loadFyReport(fy, expenseCategories)
+      .then((r) => { if (alive) { setReport(r); setStatus("ready"); } })
+      .catch((err) => {
         console.error("Building the financial dashboard failed:", err);
         if (alive) { setStatus("error"); setError("Couldn't build the dashboard — see browser console."); }
-      }
-    })();
+      });
     return () => { alive = false; };
   }, [fy, expenseCategories]);
 
@@ -3894,9 +3921,21 @@ function Analytics({ expenseCategories }) {
           >
             {availableFys.map((y) => <option key={y} value={y}>{y} ({fyLabel(y)})</option>)}
           </select>
-          <button onClick={() => window.print()} style={{ ...primaryBtn, padding: "7px 14px" }}>Print / PDF</button>
+          <button onClick={() => window.print()} style={{ ...secondaryBtn, padding: "7px 14px" }}>Print / PDF</button>
+          <button
+            onClick={generateAgmReport}
+            disabled={status !== "ready" || agmStatus === "working"}
+            style={{ ...primaryBtn, padding: "7px 14px", opacity: status !== "ready" || agmStatus === "working" ? 0.6 : 1 }}
+          >
+            {agmStatus === "working" ? "Generating…" : "Generate AGM report"}
+          </button>
         </div>
       </div>
+      {agmStatus === "error" && (
+        <div className="no-print" style={{ color: "#B5651D", fontSize: 12.5, fontWeight: 600, marginBottom: 10, textAlign: "right" }}>
+          Couldn’t generate the AGM report — see browser console.
+        </div>
+      )}
       <p className="no-print" style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
         Year to date. Owner contributions are shown against the <strong>statement month they settle</strong>, not the month the money arrived — levies for month M are paid on the M+1 bank statement, so this is what lets a column be compared against what that month billed. Everything else has no statement month and is shown on the date it occurred. Approved resident deductions count as both a contribution and an expense. The body corp financial year runs August to July.
       </p>
@@ -4039,6 +4078,381 @@ function Analytics({ expenseCategories }) {
       )}
     </>
   );
+}
+
+// ---------- AGM annual report (editable .docx) ----------
+// Loads the docx library from a CDN once, the same pattern as supabase-js and
+// pdf.js elsewhere in this file, so nothing is added to the bundle.
+let docxLoadPromise = null;
+function ensureDocxLoaded() {
+  if (window.docx) return Promise.resolve(window.docx);
+  if (docxLoadPromise) return docxLoadPromise;
+  docxLoadPromise = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js";
+    s.onload = () => resolve(window.docx);
+    s.onerror = () => reject(new Error("Could not load docx"));
+    document.head.appendChild(s);
+  });
+  return docxLoadPromise;
+}
+
+// "2025/2026" -> "2026/2027".
+function nextFY(fy) {
+  const start = Number(String(fy).split("/")[0]);
+  return `${start + 1}/${start + 2}`;
+}
+
+// Everything the AGM report needs beyond the income & expenditure report
+// itself: the unit list, this year's and next year's tariffs, the levy split,
+// and the miscellaneous expense detail.
+//
+// Tariff lookups differ by table on purpose. water_tariff_bands carries a
+// populated financial_year, so it is keyed on that. electricity_rates does not
+// (the 2026/2027 rate was captured with a null financial_year), so it is
+// resolved the way the rest of the app resolves it — the most recent
+// effective_from on or before the financial year's first day.
+async function fetchAgmExtras(fy) {
+  const client = await ensureSupabaseClient();
+  const nfy = nextFY(fy);
+  const { from, to } = fyBounds(fy);
+  const nextFrom = fyBounds(nfy).from;
+
+  const [units, bands, elec, levies, split, ops, txns, invoices] = await Promise.all([
+    client.from("units").select("id, unit_number, participation_quota").order("unit_number"),
+    client.from("water_tariff_bands").select("*").in("financial_year", [fy, nfy]).order("from_kl"),
+    client.from("electricity_rates").select("rate_per_kwh, effective_from").order("effective_from"),
+    client.from("levy_rates").select("*").in("financial_year", [fy, nfy]),
+    client.from("levy_manual_entries").select("unit_id, financial_year, item_label, amount").in("financial_year", [fy, nfy]),
+    client.from("ops_expenses").select("expense_date, category, amount, notes")
+      .is("superseded_reason", null).gte("expense_date", from).lte("expense_date", to),
+    client.from("bank_transactions").select("txn_date, description_raw, amount, direction, expense_category")
+      .gte("txn_date", from).lte("txn_date", to),
+    client.from("council_invoices").select("period, sewer_charge_per_unit, water_demand_levy_per_unit")
+      .gte("period", from).lte("period", to).order("period", { ascending: false }).limit(1),
+  ]);
+  const bad = [units, bands, elec, levies, split, ops, txns, invoices].find((r) => r.error);
+  if (bad) throw bad.error;
+
+  const unitList = (units.data || []).map((u) => ({
+    id: u.id, no: u.unit_number, pq: Number(u.participation_quota) || 0,
+  }));
+
+  // Water bands, one row per band with the current and next year's rate side
+  // by side. Keyed on band_label so a renamed or reordered band still lines up.
+  const byLabel = {};
+  (bands.data || []).forEach((b) => {
+    const k = b.band_label;
+    if (!byLabel[k]) byLabel[k] = { label: k, from: Number(b.from_kl), to: b.to_kl == null ? null : Number(b.to_kl), curr: null, next: null };
+    if (b.financial_year === fy) byLabel[k].curr = Number(b.rate_per_kl);
+    if (b.financial_year === nfy) byLabel[k].next = Number(b.rate_per_kl);
+  });
+  const waterBands = Object.values(byLabel).sort((a, b) => a.from - b.from);
+
+  const rateAsOf = (dateStr) => {
+    const applicable = (elec.data || []).filter((r) => String(r.effective_from) <= dateStr);
+    return applicable.length ? Number(applicable[applicable.length - 1].rate_per_kwh) : null;
+  };
+
+  const levyFor = (year) => (levies.data || []).find((r) => r.financial_year === year) || {};
+
+  // Levy split per unit. Next year's grid if it has been captured, otherwise
+  // this year's as the starting point for the AGM to adjust.
+  const noById = Object.fromEntries(unitList.map((u) => [u.id, u.no]));
+  const gridFor = (year) => {
+    const out = {};
+    (split.data || []).forEach((r) => {
+      if (r.financial_year !== year) return;
+      const no = noById[r.unit_id];
+      if (!no) return;
+      if (!out[no]) out[no] = {};
+      out[no][r.item_label] = Number(r.amount);
+    });
+    return out;
+  };
+  const nextGrid = gridFor(nfy);
+  const levySplit = Object.keys(nextGrid).length ? nextGrid : gridFor(fy);
+  const levySplitIsCarriedOver = Object.keys(nextGrid).length === 0;
+
+  // Miscellaneous expenses: operating-expense rows plus any bank debit tagged
+  // to the same category, sorted by date.
+  const MISC = "Miscellaneous";
+  const misc = [];
+  (ops.data || []).forEach((e) => {
+    if (e.category !== MISC) return;
+    misc.push({ date: e.expense_date, amount: round2(Math.abs(Number(e.amount) || 0)), desc: e.notes || MISC });
+  });
+  (txns.data || []).forEach((t) => {
+    if (t.direction !== "debit" || t.expense_category !== MISC) return;
+    misc.push({ date: t.txn_date, amount: round2(Math.abs(Number(t.amount) || 0)), desc: t.description_raw || MISC });
+  });
+  misc.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+  // Blockwatch is carried by the Body Corp and paid by a unit, so the actual
+  // cost lives in the operating-expense log rather than on a levy line.
+  const bwRows = (ops.data || []).filter((e) => /blockwatch/i.test(e.category || ""));
+  const bwTotal = round2(bwRows.reduce((s, e) => s + Math.abs(Number(e.amount) || 0), 0));
+  const inv = (invoices.data || [])[0] || {};
+
+  return {
+    fy, nfy, units: unitList, waterBands,
+    elecCurr: rateAsOf(from), elecNext: rateAsOf(nextFrom),
+    levyCurr: levyFor(fy), levyNext: levyFor(nfy),
+    levySplit, levySplitIsCarriedOver,
+    misc,
+    blockwatch: { actualTotal: bwTotal, monthCount: bwRows.length, monthly: bwRows.length ? round2(bwTotal / bwRows.length) : null },
+    sewerPerUnit: inv.sewer_charge_per_unit == null ? null : Number(inv.sewer_charge_per_unit),
+    demandLevyPerUnit: inv.water_demand_levy_per_unit == null ? null : Number(inv.water_demand_levy_per_unit),
+  };
+}
+
+// Builds and downloads the AGM annual report as an editable .docx. Sections the
+// database can fill are filled; the rest render as tables with empty cells so
+// the figures can be typed straight into Word before the meeting.
+async function exportAgmReportDocx({ fy, report, prevReport, extras }) {
+  const D = await ensureDocxLoaded();
+  const {
+    Document, Packer, Paragraph, TextRun, HeadingLevel,
+    Table, TableRow, TableCell, WidthType, AlignmentType, PageOrientation,
+  } = D;
+  const { nfy, units, waterBands, elecCurr, elecNext, levyCurr, levyNext, levySplit, levySplitIsCarriedOver, misc, blockwatch, sewerPerUnit, demandLevyPerUnit } = extras;
+  const prev = prevReport && prevReport.hasData ? prevReport : null;
+
+  // en-ZA formats money as "R 1 234,56" — spaces separate thousands. Every one
+  // of those becomes a non-breaking space so an amount can never be split
+  // across two lines inside a narrow table cell.
+  const nb = (s) => String(s).replace(/\s/g, " ");
+  const money = (n) => (n == null || n === "" ? "" : nb("R " + round2(Number(n) || 0).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })));
+  const dec = (n) => round2(Number(n) || 0).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  // Same value without the "R" prefix, for grids wide enough that repeating the
+  // prefix on every column is what pushes an amount onto a second line. Those
+  // tables carry an "all figures in rand" note instead.
+  const amt = (n) => (n == null || n === "" ? "" : nb(dec(n)));
+
+  const H1 = (text) => new Paragraph({ text, heading: HeadingLevel.HEADING_1, spacing: { before: 320, after: 140 } });
+  const H2 = (text) => new Paragraph({ text, heading: HeadingLevel.HEADING_2, spacing: { before: 200, after: 100 } });
+  const para = (text, opts = {}) => new Paragraph({ spacing: { after: 100 }, children: [new TextRun({ text, ...opts })] });
+  const hint = (text) => para(text, { italics: true, size: 18, color: "94A0AC" });
+  const tc = (text, { bold = false, align = "left", shade, size, tight = false } = {}) => new TableCell({
+    shading: shade ? { fill: shade } : undefined,
+    margins: tight ? { top: 20, bottom: 20, left: 40, right: 40 } : { top: 40, bottom: 40, left: 90, right: 90 },
+    children: [new Paragraph({
+      alignment: align === "right" ? AlignmentType.RIGHT : (align === "center" ? AlignmentType.CENTER : AlignmentType.LEFT),
+      children: [new TextRun({ text: text == null || text === "" ? "" : String(text), bold, size })],
+    })],
+  });
+  const row = (cells, aligns = [], bold = false, shade, opts = {}) =>
+    new TableRow({ children: cells.map((c, i) => tc(c, { bold, align: aligns[i] || "left", shade, ...opts })) });
+  const tbl = (rows) => new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows });
+  const hrow = (labels, aligns = [], opts = {}) => new TableRow({
+    tableHeader: true,
+    children: labels.map((l, i) => new TableCell({
+      shading: { fill: "1B2A38" },
+      margins: opts.tight ? { top: 20, bottom: 20, left: 40, right: 40 } : { top: 40, bottom: 40, left: 90, right: 90 },
+      children: [new Paragraph({
+        alignment: aligns[i] === "right" ? AlignmentType.RIGHT : (aligns[i] === "center" ? AlignmentType.CENTER : AlignmentType.LEFT),
+        children: [new TextRun({ text: String(l), bold: true, color: "FFFFFF", size: opts.size })],
+      })],
+    })),
+  });
+  const BAND = "E7E1D3";
+  // Wide grids get 8pt text and tighter padding so a full "1 234,56" stays on
+  // one line instead of wrapping mid-number.
+  const WIDE = { size: 16, tight: true };
+
+  // ---------- Portrait A: cover + section 1 ----------
+  const A = [];
+  A.push(new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 60 }, children: [new TextRun({ text: "El Corazon Body Corporate", bold: true, size: 40 })] }));
+  A.push(new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 40 }, children: [new TextRun({ text: `Annual General Meeting report — FY ${fy}`, size: 28 })] }));
+  A.push(new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 240 }, children: [new TextRun({ text: fyLabel(fy), italics: true, color: "64748B", size: 20 })] }));
+
+  A.push(H1("1. Income & expenditure — year on year"));
+  const a1 = [hrow(["Line", `FY ${previousFY(fy)}`, `FY ${fy}`], ["left", "right", "right"])];
+  const yoy = (label, cur, isPrev) => row([label, isPrev == null ? "" : isPrev, cur], ["left", "right", "right"]);
+  a1.push(row(["Income", "", ""], [], true, BAND));
+  report.incomeRows.forEach((r) => {
+    const p = prev && prev.incomeRows.find((x) => x.label === r.label);
+    a1.push(yoy(r.label, money(r.total), p ? money(p.total) : ""));
+  });
+  a1.push(row(["Total income", prev ? money(prev.totalIncome) : "", money(report.totalIncome)], ["left", "right", "right"], true));
+  a1.push(row(["Expenditure", "", ""], [], true, BAND));
+  report.expenseRows.forEach((r) => {
+    const p = prev && prev.expenseRows.find((x) => x.label === r.label);
+    a1.push(yoy(r.label, money(r.total), p ? money(p.total) : ""));
+  });
+  a1.push(row(["Total expenditure", prev ? money(prev.totalExpense) : "", money(report.totalExpense)], ["left", "right", "right"], true));
+  a1.push(row(["Surplus / (deficit)", prev ? money(prev.surplus) : "", money(report.surplus)], ["left", "right", "right"], true, BAND));
+  A.push(tbl(a1));
+  if (!prev) {
+    A.push(hint(`FY ${previousFY(fy)} predates the system, so the comparative column is left blank — type last year's approved figures in before the meeting.`));
+  }
+
+  // ---------- Landscape B: section 2 ----------
+  const B = [];
+  B.push(H1("2. Income & expenditure — month to month"));
+  // "2025-08" -> "Aug 25", matching the column headings on the dashboard.
+  const mLabel = (ym) => {
+    const [y, m] = String(ym).split("-");
+    return `${MONTH_NAMES[Number(m) - 1].slice(0, 3)} ${y.slice(2)}`;
+  };
+  const mAligns = ["left", ...report.months.map(() => "right"), "right"];
+  const b2 = [hrow(["Line", ...report.months.map(mLabel), "Total"], mAligns, WIDE)];
+  const brow = (cells, bold = false, shade) => row(cells, mAligns, bold, shade, WIDE);
+  const mrow = (r) => brow([r.label, ...report.months.map((m) => amt(r.row[m])), amt(r.total)]);
+  b2.push(brow(["Income", ...report.months.map(() => ""), ""], true, BAND));
+  report.incomeRows.forEach((r) => b2.push(mrow(r)));
+  b2.push(brow(["Total income", ...report.months.map((m) => amt(report.totalIncomeRow[m])), amt(report.totalIncome)], true));
+  b2.push(brow(["Expenditure", ...report.months.map(() => ""), ""], true, BAND));
+  report.expenseRows.forEach((r) => b2.push(mrow(r)));
+  b2.push(brow(["Total expenditure", ...report.months.map((m) => amt(report.totalExpenseRow[m])), amt(report.totalExpense)], true));
+  b2.push(brow(["Surplus / (deficit)", ...report.months.map((m) => amt(report.surplusRow[m])), amt(report.surplus)], true, BAND));
+  B.push(tbl(b2));
+  B.push(hint("All figures in rand, including cents. The R prefix is dropped so each amount stays on one line. Owner contributions sit in the statement month they settle, not the month the money arrived."));
+
+  // ---------- Portrait C: section 3 ----------
+  const C = [];
+
+  C.push(H1("3. Miscellaneous expenses"));
+  const c3 = [hrow(["Month", "Year", "Amount", "Description"], ["left", "left", "right", "left"])];
+  misc.forEach((it) => {
+    const y = String(it.date).slice(0, 4);
+    const m = MONTH_NAMES[parseInt(String(it.date).slice(5, 7), 10) - 1] || "";
+    c3.push(row([m, y, money(it.amount), it.desc], ["left", "left", "right", "left"]));
+  });
+  if (!misc.length) c3.push(row(["", "", "", "No miscellaneous expenses recorded this year."], ["left", "left", "right", "left"]));
+  // The total is taken from the report's own Miscellaneous line, not from the
+  // sum of the rows above, so this table can never contradict the figure on the
+  // dashboard and in section 1. The report line also folds in approved resident
+  // deductions and nets nothing off for additional-charge recoveries; where that
+  // differs from the itemised rows, the gap is stated rather than hidden.
+  const miscItemised = round2(misc.reduce((s, it) => s + it.amount, 0));
+  const miscReported = round2((report.expenseRows.find((r) => r.label === "Miscellaneous") || {}).total || 0);
+  c3.push(row(["Total", "", money(miscReported), ""], ["left", "left", "right", "left"], true, BAND));
+  C.push(tbl(c3));
+  if (Math.abs(miscReported - miscItemised) > 0.005) {
+    C.push(hint(`The total is the Miscellaneous line from section 1 (${money(miscReported)}). The rows above itemise ${money(miscItemised)} of it; the ${money(round2(miscReported - miscItemised))} difference is approved resident deductions tagged to this category, which carry no separate expense record.`));
+  }
+
+  // ---------- Landscape D: section 4 ----------
+  const Dsec = [];
+  Dsec.push(H1("4. Insurance schedule (per unit)"));
+  Dsec.push(hint("Blank cells are for entry from the insurer's schedule. On landscape so the nine columns fit without splitting an amount across lines."));
+  const insCols = ["Unit No", "Sqm", "Sum Ins", "Premium", "Com Prop", "Sasria", "Broker", "Per Annum", "Per Month"];
+  const insAligns = ["left", "right", "right", "right", "right", "right", "right", "right", "right"];
+  const c4 = [hrow(insCols, insAligns)];
+  units.forEach((u) => c4.push(row([`Unit ${u.no}`, "", "", "", "", "", "", "", ""], insAligns)));
+  c4.push(row(["Total", "", "", "", "", "", "", "", ""], insAligns, true, BAND));
+  Dsec.push(tbl(c4));
+
+  // ---------- Portrait E: sections 5 to 9 ----------
+  const E = [];
+
+  E.push(H1("5. Blockwatch"));
+  const c5 = [hrow(["Item", "Amount"], ["left", "right"])];
+  c5.push(row(["Monthly fee payable — current", blockwatch.monthly == null ? "" : money(blockwatch.monthly)], ["left", "right"]));
+  c5.push(row([`Total paid in FY ${fy} (recorded)`, money(blockwatch.actualTotal)], ["left", "right"]));
+  c5.push(row([`Monthly fee payable — proposed FY ${nfy}`, ""], ["left", "right"]));
+  E.push(tbl(c5));
+  E.push(para("Carried by the Body Corp and paid directly by a unit, then recovered by levy deduction against proof of payment — so it shows at R 0.00 on the levy statement.", { size: 20 }));
+
+  E.push(H1("6. Garden service"));
+  const gardenActual = (report.expenseRows.find((r) => r.label === "Garden Service") || {}).total || 0;
+  const c6 = [hrow(["Item", "Amount / value"], ["left", "right"])];
+  c6.push(row([`Total servicing costs FY ${fy} (actual)`, money(gardenActual)], ["left", "right"]));
+  c6.push(row(["Total salary (annual)", ""], ["left", "right"]));
+  c6.push(row(["Proposed salary increase (%)", ""], ["left", "right"]));
+  c6.push(row(["Proposed year-end bonus", ""], ["left", "right"]));
+  E.push(tbl(c6));
+  E.push(hint("Servicing cost is the actual spend recorded this year. Salary, increase and bonus are for approval at the meeting."));
+
+  E.push(H1("7. Water tariffs"));
+  E.push(H2("Increasing block tariff (R / kL)"));
+  const c7 = [hrow(["Band (kL)", `Current — FY ${fy}`, `Proposed — FY ${nfy}`], ["left", "right", "right"])];
+  waterBands.forEach((b) => c7.push(row([b.label, b.curr == null ? "" : money(b.curr), b.next == null ? "" : money(b.next)], ["left", "right", "right"])));
+  E.push(tbl(c7));
+  E.push(H2("Provision, demand levy and sewerage"));
+  const c7b = [hrow(["Item", `Current — FY ${fy}`, `Proposed — FY ${nfy}`], ["left", "right", "right"])];
+  const cpw = (l) => (l.common_property_water_kl == null ? "" : nb(`${Number(l.common_property_water_kl)} kL`));
+  c7b.push(row(["Common property provision (kL / month)", cpw(levyCurr) || nb(`${COMMON_PROPERTY_WATER_KL} kL`), cpw(levyNext)], ["left", "right", "right"]));
+  c7b.push(row(["Water Demand Levy (per unit / month)",
+    money(levyCurr.water_demand_levy != null ? levyCurr.water_demand_levy : demandLevyPerUnit),
+    levyNext.water_demand_levy == null ? "" : money(levyNext.water_demand_levy)], ["left", "right", "right"]));
+  c7b.push(row(["Sewerage (per unit / month)", sewerPerUnit == null ? "" : money(sewerPerUnit), ""], ["left", "right", "right"]));
+  E.push(tbl(c7b));
+
+  E.push(H1("8. Electricity tariffs"));
+  const c8 = [hrow(["Item", `Current — FY ${fy}`, `Proposed — FY ${nfy}`], ["left", "right", "right"])];
+  c8.push(row(["Flat rate (R / kWh)",
+    elecCurr == null ? "" : nb("R " + elecCurr.toFixed(4)),
+    elecNext == null ? "" : nb("R " + elecNext.toFixed(4))], ["left", "right", "right"]));
+  const cpe = (l) => (l.common_property_electricity_kwh == null ? "" : nb(`${Number(l.common_property_electricity_kwh)} kWh`));
+  c8.push(row(["Common property provision (kWh / month)", cpe(levyCurr) || nb(`${COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT} kWh`), cpe(levyNext)], ["left", "right", "right"]));
+  c8.push(row(["Electricity Service Charge (complex, excl VAT)",
+    levyCurr.electricity_service_fee == null ? "" : money(levyCurr.electricity_service_fee),
+    levyNext.electricity_service_fee == null ? "" : money(levyNext.electricity_service_fee)], ["left", "right", "right"]));
+  c8.push(row(["Electricity Network Charge (complex, excl VAT)",
+    levyCurr.electricity_network_fee == null ? "" : money(levyCurr.electricity_network_fee),
+    levyNext.electricity_network_fee == null ? "" : money(levyNext.electricity_network_fee)], ["left", "right", "right"]));
+  E.push(tbl(c8));
+  if (!levyNext || levyNext.financial_year == null) {
+    E.push(hint(`No FY ${nfy} levy rates have been captured yet, so the proposed column is blank where the figure isn't already on the tariff tables. Capture them on Tariffs & rates to have them fill automatically.`));
+  }
+
+  E.push(H1("9. Service notes"));
+  E.push(H2("Fire extinguisher servicing"));
+  E.push(para("Annual servicing of the complex's fire extinguishers, paid directly by the Body Corp and never billed to a unit. Recorded in the operating-expense log.", { size: 20 }));
+  E.push(H2("Garden service"));
+  E.push(para("Grounds maintenance carried by the Body Corp, most commonly paid personally by a unit and reimbursed via a levy deduction with proof of payment. Shown at R 0.00 on the levy statement.", { size: 20 }));
+  E.push(H2("Blockwatch"));
+  E.push(para(`Neighbourhood watch contribution carried by the Body Corp and paid directly by a unit; shown at R 0.00 on the levy statement. Recorded cost for FY ${fy} was ${money(blockwatch.actualTotal)}.`, { size: 20 }));
+  E.push(H2("CSOS"));
+  E.push(para("The statutory Community Schemes Ombud Service levy, paid by the Body Corp. Tracked in the operating-expense log for the annual report.", { size: 20 }));
+
+  // ---------- Landscape F: section 10 ----------
+  // Nine columns of rand amounts; landscape so no figure has to wrap.
+  const F = [];
+  F.push(H1(`10. Levy split — proposed for FY ${nfy}`));
+  if (levySplitIsCarriedOver) {
+    F.push(hint(`No FY ${nfy} levy grid has been captured yet, so this table carries forward the FY ${fy} figures as a starting point. Adjust each line for the new year.`));
+  }
+  const uCols = units.map((u) => `U${u.no}`);
+  const lAligns = ["left", ...uCols.map(() => "right"), "right"];
+  const c10 = [hrow(["Levy item", ...uCols, "Total"], lAligns, WIDE)];
+  const colTotals = Object.fromEntries(units.map((u) => [u.no, 0]));
+  LEVY_ITEMS.forEach((item) => {
+    const vals = units.map((u) => (levySplit[u.no] && levySplit[u.no][item] != null ? Number(levySplit[u.no][item]) : null));
+    units.forEach((u, i) => { colTotals[u.no] = round2(colTotals[u.no] + (vals[i] || 0)); });
+    const lineTotal = round2(vals.reduce((a, v) => a + (v || 0), 0));
+    c10.push(row([item, ...vals.map((v) => (v == null ? "" : money(v))), lineTotal ? money(lineTotal) : ""], lAligns, false, undefined, WIDE));
+  });
+  const grand = round2(units.reduce((a, u) => a + colTotals[u.no], 0));
+  c10.push(row(["Total per unit", ...units.map((u) => (colTotals[u.no] ? money(colTotals[u.no]) : "")), grand ? money(grand) : ""], lAligns, true, BAND, WIDE));
+  F.push(tbl(c10));
+
+  F.push(new Paragraph({ spacing: { before: 300 }, children: [new TextRun({ text: `Prepared ${new Date().toLocaleDateString("en-ZA")} · El Corazon Body Corporate finance trustee.`, italics: true, size: 18, color: "94A0AC" })] }));
+
+  const portrait = { page: { size: { orientation: PageOrientation.PORTRAIT } } };
+  const landscape = { page: { size: { orientation: PageOrientation.LANDSCAPE } } };
+  const doc = new Document({
+    styles: { default: { document: { run: { font: "Calibri", size: 20 } } } },
+    sections: [
+      { properties: portrait, children: A },
+      { properties: landscape, children: B },
+      { properties: portrait, children: C },
+      { properties: landscape, children: Dsec },
+      { properties: portrait, children: E },
+      { properties: landscape, children: F },
+    ],
+  });
+  const blob = await Packer.toBlob(doc);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `ElCorazon-AGM-Report-FY${fy.replace("/", "-")}.docx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
 // ---------- Usage trends (CoJ bulk vs units vs total allocated) ----------
