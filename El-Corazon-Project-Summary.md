@@ -159,6 +159,19 @@ An expenditure line has **three** sources — operating expenses, bank debits, a
 
 > **Worth auditing:** any other figure derived from a single source. The three-source rule applies to every expenditure line, and Blockwatch was the one place it was forgotten.
 
+### Source audit of the whole report (prompted by the Blockwatch bug)
+Every figure in the report was traced to the tables it reads. **Sections 1, 2, 3, 4 and 7 were already correct** (all three sources); 5, 10 and the tariff bands are single-source by design. Three further problems found, all now fixed.
+
+**Section 8 — the "Current" column showed next year's rate.** `council_invoices` was fetched `order by period desc limit 1`, so the Current column carried **the last month of the year, not the year's rate**. Sewerage rose from R697.73 to R774.48 in July 2026 — the final month — so the report showed **R774.48 current against R774.48 new** and told the meeting the tariff was unchanged when it had just risen 11%. Now takes the rate the FY **opened** on, and where a council tariff moved mid-year the report names the old rate, the new rate and the month it moved, so the increase already charged is stated before the meeting is asked to approve the next one. The note is suppressed for the demand-levy row, which prefers the `levy_rates` figure (what the scheme bills a unit, R124.00) over the council charge — different numbers, not comparable.
+
+**Section 9 — the service notes asserted where a cost was recorded, and were wrong twice.** "Fire extinguisher servicing … recorded in the operating-expense log" is a **bank debit** (R1,466.25); "CSOS … tracked in the operating-expense log" is mostly **levy deductions** (R712.20). Same wrong assumption that produced the Blockwatch bug. The notes no longer claim a source — a cost can reach the report from any of three — and each now derives its recorded cost from **its own line in section 1**, so CSOS and fire extinguisher finally show a figure at all (previously only garden and Blockwatch did).
+
+**CSOS R376.41 — investigated, not a duplicate.** An `ops_expenses` row (2026-06-02, empty notes, no supersede reason) matched a CSOS deduction of the identical amount (Jan 2026, "Oct–Dec 2025"). CSOS is quarterly and the amounts repeat, so it was ambiguous from the data alone. **Confirmed by the trustee as a genuine separate quarter**; the row's `notes` now say so explicitly, with the date of the decision, so the next audit doesn't re-open it. Had it been a duplicate, section 1 CSOS would have been overstated by R376.41.
+
+> **Noted, not actioned:** the FY 2025/2026 insurance bank debit is **R24,309.71** against a schedule total of R24,365.16 — a R55.45 gap, most likely a mid-year adjustment. It will read as a variance between section 1 and section 5.
+
+**The rule this audit establishes:** an expenditure figure has **three** sources — `ops_expenses`, `bank_transactions`, approved `remittance_advices` deductions. Anything that reads fewer is a bug waiting to be found. Prefer taking a total from `report.expenseRows`, which aggregates all three, over recomputing it.
+
 ### Lesson: test the parser against pdf.js, not a stand-in
 `pdfplumber` (or any other extractor) is **not** a valid proxy for `extractPdfLines`. pdf.js groups text on a *rounded* y-position, so a table row splits in ways no other tool reproduces — and right-aligned columns can land on a line *before* their label. To test parser changes properly:
 

@@ -4527,8 +4527,13 @@ async function fetchAgmExtras(fy) {
       .is("superseded_reason", null).gte("expense_date", from).lte("expense_date", to),
     client.from("bank_transactions").select("txn_date, description_raw, amount, direction, expense_category")
       .gte("txn_date", from).lte("txn_date", to),
+    // Every month of the year, oldest first — not just the latest one. The
+    // "Current" column means the rate the year was billed on, and taking the
+    // most recent invoice reported a tariff that rose in the final month as if
+    // it had applied all year. Worse, where the new-year figure matched it the
+    // report told the meeting the tariff was unchanged when it had just risen.
     client.from("council_invoices").select("period, sewer_charge_per_unit, water_demand_levy_per_unit")
-      .gte("period", from).lte("period", to).order("period", { ascending: false }).limit(1),
+      .gte("period", from).lte("period", to).order("period", { ascending: true }),
     // Approved deductions are a third source of expenditure — a resident paid a
     // Body Corp cost personally and it was set off against their levy. They
     // carry no ops_expenses or bank row of their own.
@@ -4651,7 +4656,21 @@ async function fetchAgmExtras(fy) {
   // a claim with something else is still one month, and two entries in one
   // month must not halve the implied monthly fee.
   const bwMonthCount = new Set(bwItems.map((i) => String(i.date).slice(0, 7))).size;
-  const inv = (invoices.data || [])[0] || {};
+  // Council tariffs for the "Current — FY" column. The rate the year opened on
+  // is the one the scheme was billed on for the bulk of it, so that is what
+  // "current" means here; a change part-way through is reported separately
+  // rather than silently replacing it.
+  const invRows = invoices.data || [];
+  const rateAtStart = (field) => {
+    const r = invRows.find((x) => x[field] != null);
+    return r ? Number(r[field]) : null;
+  };
+  const rateChange = (field) => {
+    const first = invRows.find((x) => x[field] != null);
+    if (!first) return null;
+    const moved = invRows.find((x) => x[field] != null && Number(x[field]) !== Number(first[field]));
+    return moved ? { from: Number(first[field]), to: Number(moved[field]), at: moved.period } : null;
+  };
 
   // Insurance schedule keyed by unit number. Per-annum is the sum of the four
   // charge columns and per-month is a twelfth of it — both derived here rather
@@ -4702,8 +4721,10 @@ async function fetchAgmExtras(fy) {
       checkedBy: st.checked_by || null,
     },
     blockwatch: { actualTotal: bwTotal, monthCount: bwMonthCount, monthly: bwMonthCount ? round2(bwTotal / bwMonthCount) : null },
-    sewerPerUnit: inv.sewer_charge_per_unit == null ? null : Number(inv.sewer_charge_per_unit),
-    demandLevyPerUnit: inv.water_demand_levy_per_unit == null ? null : Number(inv.water_demand_levy_per_unit),
+    sewerPerUnit: rateAtStart("sewer_charge_per_unit"),
+    demandLevyPerUnit: rateAtStart("water_demand_levy_per_unit"),
+    sewerChange: rateChange("sewer_charge_per_unit"),
+    demandLevyChange: rateChange("water_demand_levy_per_unit"),
   };
 }
 
@@ -4720,6 +4741,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
     nfy, units, waterBands, elecCurr, elecNext, levyCurr, levyNext,
     levySplit, levySplitIsCarriedOver, misc, maintenance,
     insuranceRows, insuranceHasData, settings, blockwatch, sewerPerUnit, demandLevyPerUnit,
+    sewerChange, demandLevyChange,
   } = extras;
   const prev = prevReport && prevReport.hasData ? prevReport : null;
 
@@ -4975,6 +4997,22 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
     sewerPerUnit == null ? "" : money(sewerPerUnit),
     settings.seweragePerUnitNew == null ? "" : money(settings.seweragePerUnitNew)], ["left", "right", "right"]));
   E.push(tbl(c7b));
+  // A council tariff that moved part-way through the year would otherwise be
+  // invisible: the Current column carries the rate the year opened on, so the
+  // increase already charged needs saying out loud before the meeting is asked
+  // to approve next year's.
+  // Only for rows whose Current figure actually came off the council invoice.
+  // The demand levy row prefers the levy_rates figure — what the scheme bills a
+  // unit — and that is a different number from what the council charges, so
+  // reporting a council movement against it would be comparing two things.
+  const tariffMoves = [
+    sewerChange && `sewerage rose from ${money(sewerChange.from)} to ${money(sewerChange.to)} per unit in ${periodLabel(sewerChange.at)}`,
+    levyCurr.water_demand_levy == null && demandLevyChange
+      && `the water demand levy rose from ${money(demandLevyChange.from)} to ${money(demandLevyChange.to)} per unit in ${periodLabel(demandLevyChange.at)}`,
+  ].filter(Boolean);
+  if (tariffMoves.length) {
+    E.push(hint(`The Current column is the rate FY ${fy} opened on. During the year ${tariffMoves.join(", and ")} — so part of the increase has already been charged.`));
+  }
 
   E.push(H2("Electricity — Increasing tariffs"));
   const c8 = [hrow(["Item", CUR, NEW], ["left", "right", "right"])];
@@ -5040,14 +5078,25 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
   // ---------- Portrait E2: section 9 ----------
   const E2 = [];
   E2.push(H1("9. Service notes"));
+  // Each note takes its recorded cost from its own line in section 1, so it
+  // cannot contradict the statement and cannot go stale. The notes used to
+  // assert WHERE a cost was recorded — "in the operating-expense log" — which
+  // was wrong for fire extinguisher servicing (a bank debit) and for CSOS
+  // (mostly levy deductions), and was the same assumption that had Blockwatch
+  // reporting R 0.00. A cost reaches the report from any of three sources and
+  // the note has no business claiming which.
+  const recorded = (label) => {
+    const r = report.expenseRows.find((x) => x.label === label);
+    return r && r.total ? ` Recorded cost for FY ${fy} was ${money(r.total)}.` : "";
+  };
   E2.push(H2("Fire extinguisher servicing"));
-  E2.push(para("Annual servicing of the complex's fire extinguishers, paid directly by the Body Corp and never billed to a unit. Recorded in the operating-expense log.", { size: 20 }));
+  E2.push(para(`Annual servicing of the complex's fire extinguishers, paid directly by the Body Corp and never billed to a unit.${recorded("Fire Extinguisher Servicing")}`, { size: 20 }));
   E2.push(H2("Garden service"));
-  E2.push(para(`Grounds maintenance carried by the Body Corp, most commonly paid personally by a unit and reimbursed via a levy deduction with proof of payment. Shown at R 0.00 on the levy statement. Recorded cost for FY ${fy} was ${money(gardenActual)}.`, { size: 20 }));
+  E2.push(para(`Grounds maintenance carried by the Body Corp, most commonly paid personally by a unit and reimbursed via a levy deduction with proof of payment. Shown at R 0.00 on the levy statement.${recorded("Garden Service")}`, { size: 20 }));
   E2.push(H2("Blockwatch"));
-  E2.push(para(`Neighbourhood watch contribution carried by the Body Corp and paid directly by a unit; shown at R 0.00 on the levy statement. Recorded cost for FY ${fy} was ${money(blockwatch.actualTotal)}.`, { size: 20 }));
+  E2.push(para(`Neighbourhood watch contribution carried by the Body Corp and paid directly by a unit, then recovered by levy deduction; shown at R 0.00 on the levy statement.${recorded("BlockWatch")}`, { size: 20 }));
   E2.push(H2("CSOS"));
-  E2.push(para("The statutory Community Schemes Ombud Service levy, paid by the Body Corp. Tracked in the operating-expense log for the annual report.", { size: 20 }));
+  E2.push(para(`The statutory Community Schemes Ombud Service levy, payable quarterly. Carried by the Body Corp, whether paid directly or by a unit and recovered by levy deduction.${recorded("CSOS")}`, { size: 20 }));
   if (gs.servicesNoteAnnualEstimate != null) {
     E2.push(para(`Note: it is recommended that the above services are once again paid by the body corporate to keep levies low. The estimated annual cost of this would be ${money(gs.servicesNoteAnnualEstimate)}.`, { size: 20 }));
   }
