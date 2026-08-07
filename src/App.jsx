@@ -1236,13 +1236,23 @@ async function saveReadingsToDb(readings) {
   if (error) throw error;
 }
 
-async function saveTariffsToDb({ waterSets, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh, commonPropertyWaterKl }) {
+// Tariffs & rates saves one section at a time — four independent writers, each
+// touching only its own table. They were a single function behind one button;
+// splitting them means a failure in one section can't abandon another
+// half-written, and the trustee can correct a VAT rate without also committing
+// a water rate set they were still working on.
+const throwIfBad = (results) => {
+  const bad = results.find((x) => x && x.error);
+  if (bad) throw bad.error;
+};
+
+// Water: one or more rate sets, each keyed by its own effective date. Upsert by
+// (effective_from, band_label), so a date with no set yet is created and an
+// existing one is corrected in place. Only the sets the trustee actually
+// touched are passed in — untouched history is never rewritten.
+async function saveWaterBandsToDb(waterSets) {
   const client = await ensureSupabaseClient();
   const updates = [];
-  // Water: one or more rate sets, each keyed by its own effective date. Upsert
-  // by (effective_from, band_label), so a date with no set yet is created and
-  // an existing one is corrected in place. Only the sets the trustee actually
-  // touched are passed in — untouched history is never rewritten.
   (waterSets || []).forEach((set) => {
     set.bands.forEach((b) => {
       updates.push(client.from("water_tariff_bands").upsert({
@@ -1252,35 +1262,48 @@ async function saveTariffsToDb({ waterSets, electricityRate, electricityEffectiv
       }, { onConflict: "effective_from,band_label" }));
     });
   });
-  // Electricity rate: upsert by effective_from (unique constraint).
-  updates.push(client.from("electricity_rates").upsert({
+  throwIfBad(await Promise.all(updates));
+}
+
+// Electricity rate: upsert by effective_from (unique constraint).
+async function saveElectricityRateToDb({ electricityRate, electricityEffectiveFrom }) {
+  const client = await ensureSupabaseClient();
+  const { error } = await client.from("electricity_rates").upsert({
     rate_per_kwh: electricityRate,
     effective_from: electricityEffectiveFrom,
     financial_year: null,
-  }, { onConflict: "effective_from" }));
-  // VAT is not date-scoped per rate set — single global rate.
-  updates.push(client.from("vat_rates").update({ rate: vatRate }).gte("effective_from", "1900-01-01"));
-  // Levy rates: check if a row exists for this FY, then update or insert.
-  // Can't use upsert because PostgreSQL enforces NOT NULL on INSERT values
-  // before checking ON CONFLICT, and we don't want to overwrite the other
-  // columns (water_demand_levy etc.) with zeros when the row already exists.
-  const existingLevy = await client.from("levy_rates").select("financial_year").eq("financial_year", FY_ACTIVE).limit(1);
-  if (existingLevy.data?.length > 0) {
-    updates.push(client.from("levy_rates").update({
-      common_property_electricity_kwh: commonPropertyElectricityKwh,
-      common_property_water_kl: commonPropertyWaterKl,
-    }).eq("financial_year", FY_ACTIVE));
-  } else {
-    updates.push(client.from("levy_rates").insert({
-      financial_year: FY_ACTIVE,
-      common_property_electricity_kwh: commonPropertyElectricityKwh,
-      common_property_water_kl: commonPropertyWaterKl,
-      water_demand_levy: 0, electricity_service_fee: 0, electricity_network_fee: 0,
-    }));
-  }
-  const results = await Promise.all(updates);
-  const bad = results.find((x) => x.error);
-  if (bad) throw bad.error;
+  }, { onConflict: "effective_from" });
+  if (error) throw error;
+}
+
+// VAT is not date-scoped per rate set — single global rate.
+async function saveVatRateToDb(vatRate) {
+  const client = await ensureSupabaseClient();
+  const { error } = await client.from("vat_rates").update({ rate: vatRate }).gte("effective_from", "1900-01-01");
+  if (error) throw error;
+}
+
+// Common property standards, keyed by financial year. Check whether a row
+// exists for the FY, then update or insert — not an upsert, because PostgreSQL
+// enforces NOT NULL on the INSERT values before checking ON CONFLICT, which
+// would overwrite the sibling columns (water_demand_levy etc.) with zeros when
+// the row already exists.
+async function saveCommonPropertyStandardsToDb({ commonPropertyElectricityKwh, commonPropertyWaterKl }) {
+  const client = await ensureSupabaseClient();
+  const existing = await client.from("levy_rates").select("financial_year").eq("financial_year", FY_ACTIVE).limit(1);
+  if (existing.error) throw existing.error;
+  const { error } = existing.data?.length > 0
+    ? await client.from("levy_rates").update({
+        common_property_electricity_kwh: commonPropertyElectricityKwh,
+        common_property_water_kl: commonPropertyWaterKl,
+      }).eq("financial_year", FY_ACTIVE)
+    : await client.from("levy_rates").insert({
+        financial_year: FY_ACTIVE,
+        common_property_electricity_kwh: commonPropertyElectricityKwh,
+        common_property_water_kl: commonPropertyWaterKl,
+        water_demand_levy: 0, electricity_service_fee: 0, electricity_network_fee: 0,
+      });
+  if (error) throw error;
 }
 
 // Every grid cell is stored — the levy grid is fully manual.
@@ -3458,6 +3481,21 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
 }
 
 // ---------- Rate settings (trustee-editable tariffs) ----------
+// Save control for one section of Tariffs & rates. Each card owns its own, so
+// it is always unambiguous which figures a given button writes.
+function SectionSave({ state = "idle", dirty, onSave, label = "Save" }) {
+  return (
+    <div style={{ marginTop: 14, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 10, flexWrap: "wrap" }}>
+      {dirty && state === "idle" && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>Unsaved changes</span>}
+      {state === "saved" && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>✓ Saved</span>}
+      {state === "error" && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>Couldn’t save — see browser console</span>}
+      <button style={primaryBtn} onClick={onSave} disabled={state === "saving"}>
+        {state === "saving" ? "Saving…" : label}
+      </button>
+    </div>
+  );
+}
+
 function RateSettings({
   waterBands, waterBandHistory, onSaved,
   electricityRate, setElectricityRate,
@@ -3568,28 +3606,77 @@ function RateSettings({
     ...b, rate2025: currentDate ? rateFor(currentDate, b.label) : 0,
   }));
 
-  const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | saved | error
-  const save = async () => {
-    setSaveStatus("saving");
+  // Each section saves on its own, so each carries its own status rather than
+  // one shared flag that would light up all four cards at once.
+  const [status, setStatus] = useState({}); // section -> idle | saving | saved | error
+  const setSectionStatus = (key, value) =>
+    setStatus((prev) => ({ ...prev, [key]: value }));
+
+  // Electricity, VAT and the common-property standards are edited as LOCAL
+  // drafts and only pushed to the app once their own section saves.
+  //
+  // Two reasons. A save reloads app data so every screen picks up the new
+  // figures, and with four independent buttons that reload would silently
+  // revert whatever was typed into the other three. And an unsaved rate has no
+  // business changing what the dashboard bills on — which is exactly why the
+  // water card below has always kept its edits local.
+  const [elecDraft, setElecDraft] = useState(electricityRate);
+  const [elecDateDraft, setElecDateDraft] = useState(electricityEffectiveFrom || "");
+  const [vatDraft, setVatDraft] = useState(vatRate);
+  const [waterKlDraft, setWaterKlDraft] = useState(commonPropertyWaterKl);
+  const [elecKwhDraft, setElecKwhDraft] = useState(commonPropertyElectricityKwh);
+
+  // A draft follows the app whenever it is clean. Once it differs it is the
+  // trustee's unsaved work and a reload must not overwrite it.
+  const elecDirty = elecDraft !== electricityRate || (elecDateDraft || "") !== (electricityEffectiveFrom || "");
+  const vatDirty = vatDraft !== vatRate;
+  const standardsDirty = waterKlDraft !== commonPropertyWaterKl || elecKwhDraft !== commonPropertyElectricityKwh;
+  useEffect(() => { if (!elecDirty) { setElecDraft(electricityRate); setElecDateDraft(electricityEffectiveFrom || ""); } },
+    [electricityRate, electricityEffectiveFrom]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (!vatDirty) setVatDraft(vatRate); }, [vatRate]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!standardsDirty) { setWaterKlDraft(commonPropertyWaterKl); setElecKwhDraft(commonPropertyElectricityKwh); }
+  }, [commonPropertyWaterKl, commonPropertyElectricityKwh]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // One save runner: set saving, write, apply to the app, reload, clear.
+  const runSave = (key, write, apply) => async () => {
+    setSectionStatus(key, "saving");
     try {
-      // Only push sets that were actually touched — never rewrite history.
-      const waterSets = columns
-        .filter((c) => c.editable && isUnsaved(c.date))
-        .map((c) => ({
-          effectiveFrom: c.date,
-          bands: bandDefs.map((b) => ({ label: b.label, from: b.from, to: b.to, rate: rateFor(c.date, b.label) })),
-        }));
-      await saveTariffsToDb({ waterSets, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh, commonPropertyWaterKl });
-      setEdits({});
-      setAddedDates([]);
-      setSaveStatus("saved");
-      if (onSaved) onSaved(); // reload so every screen sees the new set
-      setTimeout(() => setSaveStatus("idle"), 2500);
+      await write();
+      if (apply) apply();
+      setSectionStatus(key, "saved");
+      if (onSaved) onSaved(); // reload so every screen sees the new figures
+      setTimeout(() => setSectionStatus(key, "idle"), 2500);
     } catch (err) {
-      console.error("Saving tariffs failed:", err);
-      setSaveStatus("error");
+      console.error(`Saving ${key} failed:`, err);
+      setSectionStatus(key, "error");
     }
   };
+
+  const saveWater = runSave("water", async () => {
+    // Only push sets that were actually touched — never rewrite history.
+    const waterSets = columns
+      .filter((c) => c.editable && isUnsaved(c.date))
+      .map((c) => ({
+        effectiveFrom: c.date,
+        bands: bandDefs.map((b) => ({ label: b.label, from: b.from, to: b.to, rate: rateFor(c.date, b.label) })),
+      }));
+    await saveWaterBandsToDb(waterSets);
+  }, () => { setEdits({}); setAddedDates([]); });
+
+  const saveElectricity = runSave("electricity",
+    () => saveElectricityRateToDb({ electricityRate: elecDraft, electricityEffectiveFrom: elecDateDraft || null }),
+    () => { setElectricityRate(elecDraft); setElectricityEffectiveFrom(elecDateDraft || null); });
+
+  const saveVat = runSave("vat",
+    () => saveVatRateToDb(vatDraft),
+    () => setVatRate(vatDraft));
+
+  const saveStandards = runSave("standards",
+    () => saveCommonPropertyStandardsToDb({
+      commonPropertyElectricityKwh: elecKwhDraft, commonPropertyWaterKl: waterKlDraft,
+    }),
+    () => { setCommonPropertyElectricityKwh(elecKwhDraft); setCommonPropertyWaterKl(waterKlDraft); });
 
   // Format a date string for display (e.g. "2025-07-01" → "1 Jul 2025")
   const fmtDate = (d) => {
@@ -3727,6 +3814,7 @@ function RateSettings({
         <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 10 }}>
           Increase % compares the two most recent sets. Superseded sets are read-only so statements already issued keep the rates they were billed on.
         </p>
+        <SectionSave state={status.water} dirty={dirty} onSave={saveWater} label="Save water rates" />
       </Card>
 
       <Card style={{ marginTop: 16 }}>
@@ -3737,20 +3825,21 @@ function RateSettings({
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
           <span style={{ fontSize: 12, fontWeight: 600, color: "#64748B" }}>Effective from</span>
           <input
-            type="date" value={electricityEffectiveFrom || ""}
-            onChange={(e) => setElectricityEffectiveFrom(e.target.value)}
+            type="date" value={elecDateDraft || ""}
+            onChange={(e) => setElecDateDraft(e.target.value)}
             style={{ ...inputStyle, width: 160, textAlign: "left", borderColor: "#2F5D50", fontWeight: 700 }}
           />
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <span style={{ fontSize: 13.5 }} className="f-mono">R</span>
           <input
-            type="number" step="0.0001" value={electricityRate}
-            onChange={(e) => setElectricityRate(parseFloat(e.target.value) || 0)}
+            type="number" step="0.0001" value={elecDraft}
+            onChange={(e) => setElecDraft(parseFloat(e.target.value) || 0)}
             style={{ ...inputStyle, width: 120, borderColor: "#2F5D50", fontWeight: 700 }}
           />
           <span style={{ fontSize: 13.5, color: "#64748B" }}>per kWh</span>
         </div>
+        <SectionSave state={status.electricity} dirty={elecDirty} onSave={saveElectricity} label="Save electricity rate" />
       </Card>
 
       <Card style={{ marginTop: 16 }}>
@@ -3760,12 +3849,13 @@ function RateSettings({
         </p>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <input
-            type="number" step="0.01" value={vatRate * 100}
-            onChange={(e) => setVatRate((parseFloat(e.target.value) || 0) / 100)}
+            type="number" step="0.01" value={round2(vatDraft * 100)}
+            onChange={(e) => setVatDraft((parseFloat(e.target.value) || 0) / 100)}
             style={{ ...inputStyle, width: 100, borderColor: "#2F5D50", fontWeight: 700 }}
           />
           <span style={{ fontSize: 13.5, color: "#64748B" }}>% (currently {(vatRate * 100).toFixed(2)}%)</span>
         </div>
+        <SectionSave state={status.vat} dirty={vatDirty} onSave={saveVat} label="Save VAT rate" />
       </Card>
 
       <Card style={{ marginTop: 16 }}>
@@ -3793,8 +3883,8 @@ function RateSettings({
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <span style={{ fontSize: 13, width: 220 }}>Common Property Water standard</span>
             <input
-              type="number" step="1" min="0" value={commonPropertyWaterKl}
-              onChange={(e) => setCommonPropertyWaterKl(parseFloat(e.target.value) || 0)}
+              type="number" step="1" min="0" value={waterKlDraft}
+              onChange={(e) => setWaterKlDraft(parseFloat(e.target.value) || 0)}
               style={{ ...inputStyle, width: 110, borderColor: "#2F5D50", fontWeight: 700 }}
             />
             <span style={{ fontSize: 11.5, color: "#94A0AC" }}>kL / month, billed on the real tariff scale above (free first 6kL included), split 7 ways</span>
@@ -3802,28 +3892,21 @@ function RateSettings({
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <span style={{ fontSize: 13, width: 220 }}>Common Property Electricity standard</span>
             <input
-              type="number" step="1" min="0" value={commonPropertyElectricityKwh}
-              onChange={(e) => setCommonPropertyElectricityKwh(parseFloat(e.target.value) || 0)}
+              type="number" step="1" min="0" value={elecKwhDraft}
+              onChange={(e) => setElecKwhDraft(parseFloat(e.target.value) || 0)}
               style={{ ...inputStyle, width: 110, borderColor: "#2F5D50", fontWeight: 700 }}
             />
             <span style={{ fontSize: 11.5, color: "#94A0AC" }}>kWh / month, billed at the flat rate above, split 7 ways</span>
           </div>
           <div style={{ fontSize: 12, color: "#64748B" }} className="f-mono">
-            Common Property Water: {rand(calcWaterCost(commonPropertyWaterKl, currentBandsForCalc))} total · {rand(calcWaterCost(commonPropertyWaterKl, currentBandsForCalc) / UNITS.length)} per unit
+            Common Property Water: {rand(calcWaterCost(waterKlDraft, currentBandsForCalc))} total · {rand(calcWaterCost(waterKlDraft, currentBandsForCalc) / UNITS.length)} per unit
             <br />
-            Common Property Electricity: {rand(commonPropertyElectricityKwh * electricityRate)} total · {rand((commonPropertyElectricityKwh * electricityRate) / UNITS.length)} per unit
+            Common Property Electricity: {rand(elecKwhDraft * elecDraft)} total · {rand((elecKwhDraft * elecDraft) / UNITS.length)} per unit
           </div>
         </div>
+        <SectionSave state={status.standards} dirty={standardsDirty} onSave={saveStandards} label={`Save standards for FY ${standardsMeta.financialYear || ""}`.trim()} />
       </Card>
 
-      <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10 }}>
-        {dirty && saveStatus === "idle" && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>Unsaved water rate changes</span>}
-        {saveStatus === "saved" && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>✓ Saved to database</span>}
-        {saveStatus === "error" && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>Couldn't save — see browser console</span>}
-        <button style={primaryBtn} onClick={save} disabled={saveStatus === "saving"}>
-          {saveStatus === "saving" ? "Saving…" : "Save tariffs & rates"}
-        </button>
-      </div>
     </>
   );
 }

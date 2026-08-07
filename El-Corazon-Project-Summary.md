@@ -159,6 +159,20 @@ An expenditure line has **three** sources — operating expenses, bank debits, a
 
 > **Worth auditing:** any other figure derived from a single source. The three-source rule applies to every expenditure line, and Blockwatch was the one place it was forgotten.
 
+### Tariffs & rates: each section saves on its own
+One button wrote all four sections at once, so correcting a VAT rate also committed a half-finished water rate set. Now each card has its own Save.
+
+- **`saveTariffsToDb` split into four writers** — `saveWaterBandsToDb`, `saveElectricityRateToDb`, `saveVatRateToDb`, `saveCommonPropertyStandardsToDb` — each touching only its own table. A failure in one can no longer leave another half-written. The combined function is gone; so is the single button at the bottom of the page.
+- Each card carries **its own status** (idle / saving / saved / error) via a shared `SectionSave` control, rather than one flag lighting up all four.
+
+**The non-obvious part: electricity, VAT and the standards are now local drafts.** A save calls `onSaved()`, which reloads app data — and with four independent buttons that reload would have **silently reverted whatever was typed into the other three cards**. So those three sections now hold their edits locally and only push to the app once their own section saves. A draft follows the app while it is clean; the moment it differs it is unsaved work and a reload leaves it alone.
+
+This also fixes something that was arguably wrong before: typing a VAT or electricity rate used to change what the dashboard billed on **immediately, before saving**. It no longer does — which is precisely the reasoning already recorded on the water card ("editing a future rate set here must not silently re-price the statements behind it"). All four sections now behave the same way.
+
+> Consequence worth knowing: an unsaved rate no longer previews on other screens. The common-property cost preview inside the card does use the drafts, so what that section will cost is still visible before committing.
+
+**Verified:** esbuild clean; no references left to `saveTariffsToDb`; the parent setters are called only on a successful save or on data load, never from an input's `onChange`.
+
 ### Common property standards made editable and FY-scoped
 The **water** standard was a hard-coded `COMMON_PROPERTY_WATER_KL = 20` used in seven places, labelled on screen as *"fixed, not configurable"*. `levy_rates.common_property_water_kl` already existed, with a default of 20 — **the column was dead**: nothing read it or wrote it except the AGM report and the usage-trend chart, both of which fell back to the constant. Changing the standard meant a code change and a deploy.
 
