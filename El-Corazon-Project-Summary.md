@@ -140,6 +140,25 @@ So the label row parses to a **confident, wrong R0.00** — not a null. Every nu
 
 Either failing puts a red block above the preview naming the problem in rands.
 
+### Section 6 Blockwatch reported R 0.00 against R 1,800.00 actually paid
+"Total paid in FY 2025/2026 (recorded)" was reading **`ops_expenses` only**:
+
+```js
+const bwRows = (ops.data || []).filter((e) => /blockwatch/i.test(e.category || ""));
+```
+
+There is not one Blockwatch row in `ops_expenses`, and not one in `bank_transactions`. **All twelve payments are approved levy deductions** — the unit that carries Blockwatch pays it personally every month and recovers it against proof of payment, so it never touches the Body Corp bank account. Confirmed against the live database: 12 items, 12 distinct months, R1,800.00, implying R150.00/month.
+
+An expenditure line has **three** sources — operating expenses, bank debits, approved deductions — and this one counted a third of them. Garden service (section 7) never had the bug because it reads `report.expenseRows`, which aggregates all three; Blockwatch was hand-rolled.
+
+**Fix.** `itemisedFor(category)` was generalised to `itemisedBy(match, label)`, so sections 3, 4 and the Blockwatch total now share one code path instead of Blockwatch keeping a private one that could drift. Matching is case-insensitive because the category reads `BlockWatch` while the operating-expense log has used `Blockwatch (actual cost)`. The displayed total is taken from the **section 1 BlockWatch line** (same as garden), so section 6 cannot contradict the dashboard; `blockwatch.actualTotal` is the same arithmetic over the same three sources and drives the implied monthly fee.
+
+`monthCount` now counts **distinct statement months**, not items — a month where Blockwatch shares a claim with something else (March and July 2026 both do) is still one month, and two entries in one month must not halve the implied monthly fee.
+
+**Two new checks in section 6:** if the section 1 line and the itemisation disagree, the report says so; and if fewer than 12 months carry a Blockwatch entry it names how many are missing, since a silently short year is exactly what went unnoticed here.
+
+> **Worth auditing:** any other figure derived from a single source. The three-source rule applies to every expenditure line, and Blockwatch was the one place it was forgotten.
+
 ### Lesson: test the parser against pdf.js, not a stand-in
 `pdfplumber` (or any other extractor) is **not** a valid proxy for `extractPdfLines`. pdf.js groups text on a *rounded* y-position, so a table row splits in ways no other tool reproduces — and right-aligned columns can land on a line *before* their label. To test parser changes properly:
 

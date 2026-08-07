@@ -4591,15 +4591,15 @@ async function fetchAgmExtras(fy) {
   // deductions was why it previously fell short.
   const MISC = "Miscellaneous";
   const MAINT = "Repairs & Maintenance";
-  const itemisedFor = (category) => {
+  const itemisedBy = (match, label) => {
     const out = [];
     (ops.data || []).forEach((e) => {
-      if (e.category !== category) return;
-      out.push({ date: e.expense_date, amount: round2(Math.abs(Number(e.amount) || 0)), desc: e.notes || category, source: "Body corp expense" });
+      if (!match(e.category)) return;
+      out.push({ date: e.expense_date, amount: round2(Math.abs(Number(e.amount) || 0)), desc: e.notes || label, source: "Body corp expense" });
     });
     (txns.data || []).forEach((t) => {
-      if (t.direction !== "debit" || t.expense_category !== category) return;
-      out.push({ date: t.txn_date, amount: round2(Math.abs(Number(t.amount) || 0)), desc: t.description_raw || category, source: "Bank payment" });
+      if (t.direction !== "debit" || !match(t.expense_category)) return;
+      out.push({ date: t.txn_date, amount: round2(Math.abs(Number(t.amount) || 0)), desc: t.description_raw || label, source: "Bank payment" });
     });
     (remits.data || []).forEach((r) => {
       if (!r.deduction_approved) return;
@@ -4610,7 +4610,7 @@ async function fetchAgmExtras(fy) {
         ? r.deductions
         : (Number(r.deduction_amount) > 0 ? [{ amount: r.deduction_amount, expenseCategory: null, description: r.deduction_comment }] : []);
       items.forEach((it) => {
-        if ((it.expenseCategory || null) !== category) return;
+        if (!match(it.expenseCategory || null)) return;
         const amount = round2(Math.abs(Number(it.amount) || 0));
         if (!(amount > 0)) return;
         const who = noById[r.unit_id] ? `Unit ${noById[r.unit_id]}` : "a unit";
@@ -4618,7 +4618,7 @@ async function fetchAgmExtras(fy) {
         // deduction_comment is only a fallback for a single untagged amount.
         // Using the claim comment per item would print the whole claim's text
         // against every one of its lines.
-        const what = it.comment || it.description || it.note || r.deduction_comment || category;
+        const what = it.comment || it.description || it.note || r.deduction_comment || label;
         out.push({
           date: r.period,
           amount,
@@ -4629,16 +4629,28 @@ async function fetchAgmExtras(fy) {
     });
     return out.sort((a, b) => String(a.date).localeCompare(String(b.date)));
   };
+  const itemisedFor = (category) => itemisedBy((c) => c === category, category);
   // Sections 3 and 4 are the same table over two different categories, so they
   // are built by the same function rather than a second hand-written copy that
   // could drift.
   const misc = itemisedFor(MISC);
   const maintenance = itemisedFor(MAINT);
 
-  // Blockwatch is carried by the Body Corp and paid by a unit, so the actual
-  // cost lives in the operating-expense log rather than on a levy line.
-  const bwRows = (ops.data || []).filter((e) => /blockwatch/i.test(e.category || ""));
-  const bwTotal = round2(bwRows.reduce((s, e) => s + Math.abs(Number(e.amount) || 0), 0));
+  // Blockwatch is carried by the Body Corp and paid by a unit. It used to be
+  // read from ops_expenses alone, which is why section 6 reported R 0.00 for a
+  // year in which R 1,800.00 was paid: the unit that carries it pays it
+  // personally every month and recovers it as an approved levy deduction, so
+  // there is no ops_expenses row and no bank row — all twelve payments are
+  // deductions. It now goes through the same three-source path as every other
+  // expenditure line, which is what Garden Service (section 7) already did.
+  // Matched case-insensitively because the category reads "BlockWatch" while
+  // the operating-expense log has used "Blockwatch (actual cost)".
+  const bwItems = itemisedBy((c) => /blockwatch/i.test(String(c || "")), "BlockWatch");
+  const bwTotal = round2(bwItems.reduce((s, i) => s + i.amount, 0));
+  // Distinct statement months, not item count: a month where Blockwatch shares
+  // a claim with something else is still one month, and two entries in one
+  // month must not halve the implied monthly fee.
+  const bwMonthCount = new Set(bwItems.map((i) => String(i.date).slice(0, 7))).size;
   const inv = (invoices.data || [])[0] || {};
 
   // Insurance schedule keyed by unit number. Per-annum is the sum of the four
@@ -4689,7 +4701,7 @@ async function fetchAgmExtras(fy) {
       preparedBy: st.prepared_by || null,
       checkedBy: st.checked_by || null,
     },
-    blockwatch: { actualTotal: bwTotal, monthCount: bwRows.length, monthly: bwRows.length ? round2(bwTotal / bwRows.length) : null },
+    blockwatch: { actualTotal: bwTotal, monthCount: bwMonthCount, monthly: bwMonthCount ? round2(bwTotal / bwMonthCount) : null },
     sewerPerUnit: inv.sewer_charge_per_unit == null ? null : Number(inv.sewer_charge_per_unit),
     demandLevyPerUnit: inv.water_demand_levy_per_unit == null ? null : Number(inv.water_demand_levy_per_unit),
   };
@@ -4892,9 +4904,16 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
   // The recorded monthly figure is the average of what actually went out; the
   // agreed fee is the one the meeting votes on, so a captured setting wins.
   const bwCurrent = settings.blockwatchMonthlyCurrent != null ? settings.blockwatchMonthlyCurrent : blockwatch.monthly;
+  // The total shown is the BlockWatch line from section 1, exactly as garden
+  // service below takes its own — so this table cannot contradict the figure on
+  // the dashboard and in section 1. `blockwatch.actualTotal` is the same
+  // arithmetic from the same three sources and is used to derive the monthly
+  // fee; a disagreement between them is reported rather than papered over.
+  const bwReported = (report.expenseRows.find((r) => r.label === "BlockWatch") || {}).total;
+  const bwTotalShown = bwReported == null ? blockwatch.actualTotal : bwReported;
   const c5 = [hrow(["Item", "Amount"], ["left", "right"])];
   c5.push(row(["Monthly fee payable — current", bwCurrent == null ? "" : money(bwCurrent)], ["left", "right"]));
-  c5.push(row([`Total paid in FY ${fy} (recorded)`, money(blockwatch.actualTotal)], ["left", "right"]));
+  c5.push(row([`Total paid in FY ${fy} (recorded)`, money(bwTotalShown)], ["left", "right"]));
   c5.push(row([`Monthly fee payable — proposed FY ${nfy}`,
     settings.blockwatchMonthlyProposed == null ? "" : money(settings.blockwatchMonthlyProposed)], ["left", "right"]));
   E.push(tbl(c5));
@@ -4905,6 +4924,11 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
       ? "Blockwatch contribution remains unchanged."
       : "Carried by the Body Corp and paid directly by a unit, then recovered by levy deduction against proof of payment — so it shows at R 0.00 on the levy statement.",
     { size: 20 }));
+  if (bwReported != null && Math.abs(round2(bwReported - blockwatch.actualTotal)) > 0.005) {
+    E.push(hint(`The total shown is the BlockWatch line from section 1 (${money(bwReported)}); itemising the operating expenses, bank debits and approved deductions tagged BlockWatch gives ${money(blockwatch.actualTotal)}. Check the Bank reconciliation and Body corp expenses pages before the meeting.`));
+  } else if (blockwatch.monthCount && blockwatch.monthCount < 12) {
+    E.push(hint(`Recorded over ${blockwatch.monthCount} of the year's 12 months — the remaining ${12 - blockwatch.monthCount} carry no BlockWatch expense, bank debit or approved deduction. If the fee was paid in those months it hasn't been captured.`));
+  }
 
   E.push(H1("7. Garden service"));
   const gardenActual = (report.expenseRows.find((r) => r.label === "Garden Service") || {}).total || 0;
