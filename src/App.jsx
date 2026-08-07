@@ -1284,10 +1284,14 @@ async function saveVatRateToDb(vatRate) {
 }
 
 // Common property standards, keyed by financial year. Check whether a row
-// exists for the FY, then update or insert — not an upsert, because PostgreSQL
-// enforces NOT NULL on the INSERT values before checking ON CONFLICT, which
-// would overwrite the sibling columns (water_demand_levy etc.) with zeros when
-// the row already exists.
+// exists for the FY, then update or insert — not an upsert, because an upsert
+// would carry the sibling columns (water_demand_levy etc.) into the INSERT
+// values and overwrite them when the row already exists.
+//
+// The sibling fees are written as NULL, never 0. Creating this row is a side
+// effect of saving the standards, and nobody has entered a demand levy or an
+// electricity charge at that point — zero would print in the report as R 0,00,
+// which reads as "the scheme charges nothing" rather than "not captured yet".
 async function saveCommonPropertyStandardsToDb({ commonPropertyElectricityKwh, commonPropertyWaterKl }) {
   const client = await ensureSupabaseClient();
   const existing = await client.from("levy_rates").select("financial_year").eq("financial_year", FY_ACTIVE).limit(1);
@@ -1301,7 +1305,7 @@ async function saveCommonPropertyStandardsToDb({ commonPropertyElectricityKwh, c
         financial_year: FY_ACTIVE,
         common_property_electricity_kwh: commonPropertyElectricityKwh,
         common_property_water_kl: commonPropertyWaterKl,
-        water_demand_levy: 0, electricity_service_fee: 0, electricity_network_fee: 0,
+        water_demand_levy: null, electricity_service_fee: null, electricity_network_fee: null,
       });
   if (error) throw error;
 }
@@ -4667,7 +4671,8 @@ async function fetchAgmExtras(fy) {
     // most recent invoice reported a tariff that rose in the final month as if
     // it had applied all year. Worse, where the new-year figure matched it the
     // report told the meeting the tariff was unchanged when it had just risen.
-    client.from("council_invoices").select("period, sewer_charge_per_unit, water_demand_levy_per_unit")
+    client.from("council_invoices")
+      .select("period, sewer_charge_per_unit, water_demand_levy_per_unit, electricity_service_fee, electricity_network_fee")
       .gte("period", from).lte("period", to).order("period", { ascending: true }),
     // Approved deductions are a third source of expenditure — a resident paid a
     // Body Corp cost personally and it was set off against their levy. They
@@ -4860,6 +4865,8 @@ async function fetchAgmExtras(fy) {
     demandLevyPerUnit: rateAtStart("water_demand_levy_per_unit"),
     sewerChange: rateChange("sewer_charge_per_unit"),
     demandLevyChange: rateChange("water_demand_levy_per_unit"),
+    elecServiceFeeInvoiced: rateAtStart("electricity_service_fee"),
+    elecNetworkFeeInvoiced: rateAtStart("electricity_network_fee"),
   };
 }
 
@@ -4876,7 +4883,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
     nfy, units, waterBands, elecCurr, elecNext, levyCurr, levyNext,
     levySplit, levySplitIsCarriedOver, misc, maintenance,
     insuranceRows, insuranceHasData, settings, blockwatch, sewerPerUnit, demandLevyPerUnit,
-    sewerChange, demandLevyChange,
+    sewerChange, demandLevyChange, elecServiceFeeInvoiced, elecNetworkFeeInvoiced,
   } = extras;
   const prev = prevReport && prevReport.hasData ? prevReport : null;
 
@@ -5156,13 +5163,28 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
     elecNext == null ? "" : nb("R " + elecNext.toFixed(4))], ["left", "right", "right"]));
   const cpe = (l) => (l.common_property_electricity_kwh == null ? "" : nb(`${Number(l.common_property_electricity_kwh)} kWh`));
   c8.push(row(["Common property provision (kWh / month)", cpe(levyCurr) || nb(`${COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT} kWh`), cpe(levyNext)], ["left", "right", "right"]));
+  // An AGM-approved figure in levy_rates wins. Where there isn't one, the
+  // uploaded council bill is the next best evidence — the same fallback the
+  // demand levy row above already uses. Without it these two lines stayed
+  // empty no matter how many bills had been uploaded, because they only ever
+  // read levy_rates.
+  const fromInvoice = [];
+  const feeCell = (approved, invoiced, label) => {
+    if (approved != null) return money(approved);
+    if (invoiced == null) return "";
+    if (!fromInvoice.includes(label)) fromInvoice.push(label);
+    return money(invoiced);
+  };
   c8.push(row(["Electricity Service Charge (complex, excl VAT)",
-    levyCurr.electricity_service_fee == null ? "" : money(levyCurr.electricity_service_fee),
+    feeCell(levyCurr.electricity_service_fee, elecServiceFeeInvoiced, "service charge"),
     levyNext.electricity_service_fee == null ? "" : money(levyNext.electricity_service_fee)], ["left", "right", "right"]));
   c8.push(row(["Electricity Network Charge (complex, excl VAT)",
-    levyCurr.electricity_network_fee == null ? "" : money(levyCurr.electricity_network_fee),
+    feeCell(levyCurr.electricity_network_fee, elecNetworkFeeInvoiced, "network charge"),
     levyNext.electricity_network_fee == null ? "" : money(levyNext.electricity_network_fee)], ["left", "right", "right"]));
   E.push(tbl(c8));
+  if (fromInvoice.length) {
+    E.push(hint(`The electricity ${fromInvoice.join(" and ")} shown for FY ${fy} ${fromInvoice.length > 1 ? "are" : "is"} taken from the uploaded council invoice, not from an AGM-approved rate — no figure has been captured on Tariffs & rates for this year. Confirm before the meeting.`));
+  }
   if (!levyNext || levyNext.financial_year == null) {
     E.push(hint(`No FY ${nfy} levy rates have been captured yet, so the "New" column is blank where the figure isn't already on the tariff tables. Capture them on Tariffs & rates to have them fill automatically.`));
   }

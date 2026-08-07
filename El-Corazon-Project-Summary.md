@@ -159,6 +159,19 @@ An expenditure line has **three** sources — operating expenses, bank debits, a
 
 > **Worth auditing:** any other figure derived from a single source. The three-source rule applies to every expenditure line, and Blockwatch was the one place it was forgotten.
 
+### Electricity service and network charges reported R 0,00 — two causes
+Reported as R 0,00 for FY 2026/2027 despite the August 2026 council bill being uploaded. `council_invoices` had it correctly (service **R304.12**, network **R1,227.18**); the report was reading somewhere else entirely.
+
+**Cause 1 — zeros written by the standards save (introduced and fixed the same day).** `levy_rates`' three fee columns were `NOT NULL`, so creating a row for a new FY — which now happens the moment the common property standards are saved for that year — had to put *something* in them, and that was `0`. Zero is not "not captured": the report printed **R 0,00**, which reads as *the scheme charges nothing* rather than *nobody has set this yet*. This was flagged as a known wart when the standards were made editable and it bit **within the hour**.
+- Migration `levy_rates_nullable_fees.sql` drops `NOT NULL` on `water_demand_levy`, `electricity_service_fee`, `electricity_network_fee`, and the insert now writes **null**. The FY 2026/2027 row created at 11:50 was corrected — fees back to null, the 20 kL / 300 kWh standards kept, because those were deliberately entered.
+- **Rule: a side effect that creates a row must not invent values for columns the user never filled in.** Null is the honest answer and renders as a blank cell for completion in Word.
+
+**Cause 2 — those two rows never read the uploaded bill (pre-existing).** They read `levy_rates` only, so they would have stayed blank however many bills were uploaded. The demand levy row directly above them has always had a council-invoice fallback; these two were simply missed. They now use the same fallback, and the report **footnotes which figures came off the invoice rather than an AGM-approved rate**, so a bill-derived number is never mistaken for an approved one.
+
+> Not interchangeable in general: FY 2025/2026's approved `water_demand_levy` is **R124.00** against a council charge of R65.08–R107.74. The electricity fees happen to match the invoice; the demand levy does not. Hence the footnote rather than a silent substitution.
+
+**Verified against live data:** an FY 2026/2027 report now renders R304.12 and R1,227.18 from the August 2026 invoice, with the source footnote. FY 2025/2026 is untouched — it has approved figures (R278.98 / R1,125.75) which still win.
+
 ### Tariffs & rates: each section saves on its own
 One button wrote all four sections at once, so correcting a VAT rate also committed a half-finished water rate set. Now each card has its own Save.
 
