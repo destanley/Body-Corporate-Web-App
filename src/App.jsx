@@ -6226,7 +6226,16 @@ function InsurancePage() {
         payload[f.key] = f.kind === "money" ? num(policy[f.key]) : txt(policy[f.key]);
       });
       const { error: se } = await client.from("agm_report_settings").upsert(payload, { onConflict: "financial_year" });
-      if (se) throw se;
+      // The two writes are separate tables and the grid has already committed by
+      // this point, so a failure here is PARTIAL — and a bare "save failed" sent
+      // someone hunting for a grid that had in fact saved perfectly well. Say
+      // which half survived.
+      if (se) {
+        throw new Error(
+          `The per-unit schedule saved, but the policy details did not: ${se.message}. `
+          + `If this mentions a missing column, the insurance_policy_metadata migration hasn't been applied to this database.`
+        );
+      }
       setNotice(`Saved for FY ${fy}. Section 5 of the AGM report and the Insurance levy line both read from this.`);
     } catch (err) {
       console.error("Saving the insurance schedule failed:", err);

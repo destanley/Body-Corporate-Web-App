@@ -159,6 +159,19 @@ An expenditure line has **three** sources — operating expenses, bank debits, a
 
 > **Worth auditing:** any other figure derived from a single source. The three-source rule applies to every expenditure line, and Blockwatch was the one place it was forgotten.
 
+### Policy details vanished on refresh — the migration was never applied
+The insurance upload saved the per-unit grid but the policy number, insurer, cover start and policy total came back blank after a reload.
+
+**Cause: `insurance_policy_metadata.sql` was written but never run.** It was handed over as "additive and not yet applied", and then two later migrations *were* applied directly via the Supabase MCP — so the set of applied migrations quietly diverged from the set of written ones. The four `agm_report_settings` columns did not exist, the settings upsert failed on unknown columns, and the schedule rows — written first, in a separate statement — were already committed.
+
+That is why it looked like a partial save: the grid persisted, the policy details did not.
+
+- **Migration applied.** The four columns now exist; FY 2026/2027 carries policy `GWK-REN-ELCOR00006 - Renewal(1)`, Renasa, cover from 01 September, total R24,365.16, and FY 2025/2026's policy total is backfilled.
+- The uploaded FY 2026/2027 grid was **already correct** — Sasria at R105.78 per unit, premiums matching the schedule — confirming the parser fix held.
+- **The save now names which half survived** rather than reporting a bare failure, and says outright when the message looks like a missing column.
+
+> **Process rule: apply a migration in the same session it is written, or say plainly that it is outstanding.** "Not yet applied" in a handover note is not a mechanism — nothing tracks it, and the next session has no way to know. Every migration in `migrations/` is now applied.
+
 ### Ownership changes: pro-rata statements when a unit transfers mid-month
 Unit 4 sold with transfer on 6 August 2026 and both owners needed an August statement. The app could only ever hold **one statement per unit per period**, so the split had no home.
 
