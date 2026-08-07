@@ -6612,6 +6612,8 @@ function AgmReportSettings() {
       <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 0, marginBottom: 14, lineHeight: 1.6 }}>
         The garden, blockwatch, sewerage and sign-off figures used by the annual report.
         The insurance schedule moved to its own <b>Insurance</b> page, where the broker's schedule is uploaded and the per-unit figure is worked out — one editable grid over that table rather than two.
+        <br />
+        <b>The year above is the year the report covers</b>, not the year every figure applies to. The <i>current</i> fields are that year's; the <i>proposed</i> and <i>new</i> fields are what the meeting is asked to approve for the year after. A September 2026 AGM reporting on FY 2025/2026 therefore keeps both sets on <b>2025/2026</b>.
       </p>
 
       {status === "loading" && <div style={{ color: "#94A0AC", fontSize: 13 }}>Loading…</div>}
@@ -6636,7 +6638,11 @@ function AgmReportSettings() {
 
           <div style={{ marginTop: 18, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
             <button style={primaryBtn} onClick={save} disabled={busy}>
-              {busy ? "Saving…" : `Save AGM figures for FY ${fy}`}
+              {/* Deliberately not "…for FY <year>". The row holds this year's
+                  current figures AND next year's proposed ones, so naming a
+                  single year on the button reads as though the proposed
+                  columns belong to it too. */}
+              {busy ? "Saving…" : "Save AGM figures"}
             </button>
             {notice && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>{notice}</span>}
             {error && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{error}</span>}

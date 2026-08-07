@@ -159,6 +159,16 @@ An expenditure line has **three** sources — operating expenses, bank debits, a
 
 > **Worth auditing:** any other figure derived from a single source. The three-source rule applies to every expenditure line, and Blockwatch was the one place it was forgotten.
 
+### Config: AGM figures button wording, and what the year selector means
+The card read **"Save AGM figures for FY 2025/2026"**, which implies everything on it belongs to that year. It doesn't — and that is worth having written down, because it prompted a request to re-point the whole card at FY 2026/2027, which would have blanked this year's report.
+
+**The convention (unchanged, confirmed 7 August 2026):** the `agm_report_settings` row for FY X holds **X's current figures and X+1's proposed ones**. Section 7 takes "Current Rate Per Day" and "Proposed salary for FY 2026/2027" from the same row, and the report reads settings for the year it is generated for. The September 2026 AGM reports on **FY 2025/2026**, so both sets stay on the 2025/2026 row.
+
+- Button is now simply **"Save AGM figures"** — no year, since naming one is what misleads.
+- The card now states that the year selector is the **year the report covers**, not the year every figure applies to, and spells out that *current* fields are that year's while *proposed* and *new* fields are for the year after.
+
+> The alternative — keying every figure to the year it applies to, with the report reading Current from one row and New from the next — is cleaner as a data model and was offered. It was declined: it changes the report, makes the `proposed`/`new` columns redundant, and needs the existing figures migrated. Worth revisiting only if the current convention keeps causing this confusion.
+
 ### Policy details vanished on refresh — the migration was never applied
 The insurance upload saved the per-unit grid but the policy number, insurer, cover start and policy total came back blank after a reload.
 
