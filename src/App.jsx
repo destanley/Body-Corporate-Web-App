@@ -100,7 +100,8 @@ const COUNCIL_INVOICE_NO_BILL = {
 
 // Levy line items — one amount per unit, per item, in statement order.
 // Rules (trustee-confirmed, 12 July 2026), all VAT-inclusive on the statement:
-//   Insurance                  — individualised per unit per year, manual entry
+//   Insurance                  — individualised per unit, from the insurance
+//                                schedule (per annum / 12) — see the Insurance page
 //   Blockwatch                 — R0.00 per unit (complex cost ~R150/mo, paid by Unit 1)
 //   Garden Service             — R0.00 per unit (complex cost R352/visit, paid by Unit 2)
 //   Common Property Water      — 20kL on the real tariff scale, +VAT, ÷7
@@ -256,6 +257,194 @@ async function parseBankStatementPdf(file) {
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
   const lines = await extractPdfLines(pdf);
   return parseBankStatementLines(lines);
+}
+
+// ---------- Insurance schedule PDF parsing (client-side, via pdf.js) ----------
+// Reads the broker's annual Schedule of Insurance (GWK Welvaart / Renasa format,
+// validated against "2026 Renewal.pdf") and turns it into per-item figures the
+// allocation below can work from. Same client-side pdf.js approach as the bank
+// statement: no backend, and nothing is written until the trustee confirms the
+// preview — a mis-parse must never silently overwrite a year's schedule.
+//
+// The schedule lists one "Item" per insured thing. Items 1..7 are the units,
+// one further item is the common property (wall, fence, paving, gate, DB
+// boxes) and one is the geyser cover. Sasria and the broker fee are policy
+// level and appear only in the premium summary at the front.
+
+// "R16,766,714" / "R 2,206.95" -> Number. Returns null rather than NaN so a
+// missing figure stays visibly missing instead of poisoning a total.
+function parseInsMoney(s) {
+  if (s == null) return null;
+  const n = Number(String(s).replace(/[R\s,]/g, ""));
+  return isFinite(n) ? n : null;
+}
+
+// The last rand amount on a line. The premium summary puts the pro-rata
+// adjustment before the annual premium ("Broker Fee R0.00 R233.91"), and it is
+// always the annual figure we want.
+function lastRandOnLine(line) {
+  const all = String(line).match(/R\s?[\d,]+\.\d{2}/g);
+  return all && all.length ? parseInsMoney(all[all.length - 1]) : null;
+}
+
+// Item header, e.g.
+//   "Item 1 - Unit 1 in extent 193 square meters - @ R8 Sum Insured R1,854,576 Item Premium R2,206.95"
+//   "Item 8 - Wall and Electric Fence R266738 Paving Sum Insured R467,352 Item Premium R471.68"
+// The sum insured captured here is the schedule's "Total Sum Insured" (the
+// building value grossed up for the rent sub-section), which is the figure the
+// AGM report has always carried.
+const INS_ITEM_RE = /^Item\s+(\d+)\s*[-–]\s*(.*?)\s*Sum Insured\s*R\s?([\d,]+(?:\.\d{2})?)\s*Item Premium\s*R\s?([\d,]+\.\d{2})/i;
+
+// Turns the reconstructed lines into items plus the policy-level figures.
+// Geyser cover is read from each item's own "Geysers - Cover as Defined"
+// extension flag rather than from the free-text description on the geyser
+// item, because the flag is structured and the description is not.
+function parseInsuranceScheduleLines(lines) {
+  const items = [];
+  let current = null;
+  const policy = {
+    policyNumber: null, insurer: null, coverStart: null,
+    coverSubTotal: null, brokerFee: null, sasriaTotal: null,
+    policyTotal: null, totalSumInsured: null,
+  };
+
+  lines.forEach((raw) => {
+    const line = String(raw).replace(/\s+/g, " ").trim();
+
+    const m = line.match(INS_ITEM_RE);
+    if (m) {
+      const desc = m[2].trim();
+      const unitMatch = desc.match(/^Unit\s+(\d+)\b/i);
+      current = {
+        itemNo: Number(m[1]),
+        description: desc,
+        unitNo: unitMatch ? Number(unitMatch[1]) : null,
+        sumInsured: parseInsMoney(m[3]),
+        premium: parseInsMoney(m[4]),
+        geyserCovered: false,
+        isGeyserItem: /geyser/i.test(desc),
+      };
+      items.push(current);
+      return;
+    }
+
+    // Extension flags belong to the item block currently being read.
+    if (current && /^Geysers\s*[-–]\s*Cover as Defined\b/i.test(line)) {
+      current.geyserCovered = /\bYes\b/i.test(line);
+      return;
+    }
+
+    if (policy.policyNumber == null) {
+      const p = line.match(/^Policy Number:\s*(.+)$/i)
+        || line.match(/^Policy Number\s+(.+?)\s+Previous Policy Number/i);
+      if (p) { policy.policyNumber = p[1].trim(); return; }
+    }
+    if (policy.insurer == null) {
+      const i = line.match(/^Insurer\s+(.+?)\s+Insurer Policy Number/i);
+      if (i) { policy.insurer = i[1].trim(); return; }
+    }
+    if (policy.coverStart == null) {
+      const c = line.match(/Cover Starts From\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})/i);
+      if (c) { policy.coverStart = c[1].trim(); return; }
+    }
+    // "Buildings Combined Section 9 Yes Yes R16,766,714 R0.00 R23,390.81"
+    if (policy.totalSumInsured == null && /^Buildings Combined Section\b/i.test(line)) {
+      const si = line.match(/R\s?([\d,]+)(?:\s|$)/);
+      if (si) policy.totalSumInsured = parseInsMoney(si[1]);
+    }
+    if (/^Cover Sub-Total\b/i.test(line)) { policy.coverSubTotal = lastRandOnLine(line); return; }
+    if (/^Fee Sub-Total\b/i.test(line)) { policy.brokerFee = lastRandOnLine(line); return; }
+    if (/^Sasria Sub-Total\b/i.test(line)) { policy.sasriaTotal = lastRandOnLine(line); return; }
+    if (/^Total Annual Payment\b/i.test(line)) { policy.policyTotal = lastRandOnLine(line); return; }
+    // Fallbacks for the same figures where the sub-total rows don't survive
+    // line reconstruction.
+    if (policy.brokerFee == null && /^Broker Fee\b/i.test(line)) policy.brokerFee = lastRandOnLine(line);
+    if (policy.sasriaTotal == null && /^SASRIA\b/i.test(line)) policy.sasriaTotal = lastRandOnLine(line);
+    if (policy.coverSubTotal == null && /^TOTAL SECTION PREMIUM\b/i.test(line)) policy.coverSubTotal = lastRandOnLine(line);
+  });
+
+  // Items that aren't a unit are either the geyser cover or common property.
+  const geyserItems = items.filter((i) => i.unitNo == null && i.isGeyserItem);
+  const commonItems = items.filter((i) => i.unitNo == null && !i.isGeyserItem);
+  const sum = (arr, k) => (arr.length ? round2(arr.reduce((s, x) => s + (x[k] || 0), 0)) : 0);
+
+  return {
+    items,
+    unitItems: items.filter((i) => i.unitNo != null).sort((a, b) => a.unitNo - b.unitNo),
+    geyserItems,
+    commonItems,
+    geyserPremium: sum(geyserItems, "premium"),
+    geyserSumInsured: sum(geyserItems, "sumInsured"),
+    commonPropertyPremium: sum(commonItems, "premium"),
+    commonPropertySumInsured: sum(commonItems, "sumInsured"),
+    ...policy,
+  };
+}
+
+async function parseInsuranceSchedulePdf(file) {
+  const pdfjsLib = await ensurePdfJsLoaded();
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const lines = await extractPdfLines(pdf);
+  return parseInsuranceScheduleLines(lines);
+}
+
+// ---------- Insurance: per-unit allocation ----------
+// Trustee-confirmed rules (7 August 2026), reproducing exactly how the
+// FY 2025/2026 schedule was built by hand:
+//   Premium       — the unit's own item premium, plus an equal share of the
+//                   geyser item across only those units whose schedule carries
+//                   "Geysers - Cover as Defined: Yes". Folded into premium
+//                   rather than shown separately, so the report keeps its
+//                   nine columns and last year's figures still reconcile.
+//   Com prop      — the common property item premium, divided equally by unit.
+//   Sasria        — the policy Sasria total, divided equally by unit.
+//   Broker        — the broker fee, divided equally by unit.
+// Every per-unit figure is rounded to the cent, which is how the insurer's own
+// schedule adds up. Rounding seven ways rarely lands exactly on the policy
+// total, so the difference is surfaced rather than absorbed — see tieOut.
+function computeInsuranceAllocation(parsed, unitNumbers) {
+  const nos = (unitNumbers || []).slice().sort((a, b) => a - b);
+  const n = nos.length || 1;
+  const geyserUnits = parsed.unitItems.filter((i) => i.geyserCovered).map((i) => i.unitNo);
+  const geyserEach = geyserUnits.length ? round2((parsed.geyserPremium || 0) / geyserUnits.length) : 0;
+  const commonEach = round2((parsed.commonPropertyPremium || 0) / n);
+  const sasriaEach = round2((parsed.sasriaTotal || 0) / n);
+  const brokerEach = round2((parsed.brokerFee || 0) / n);
+
+  const rows = nos.map((no) => {
+    const item = parsed.unitItems.find((i) => i.unitNo === no) || null;
+    const geyserShare = geyserUnits.includes(no) ? geyserEach : 0;
+    const premium = item ? round2((item.premium || 0) + geyserShare) : null;
+    const perAnnum = premium == null ? null
+      : round2(premium + commonEach + sasriaEach + brokerEach);
+    return {
+      no,
+      matched: !!item,
+      description: item ? item.description : null,
+      sumInsured: item ? item.sumInsured : null,
+      ownPremium: item ? item.premium : null,
+      geyserCovered: geyserUnits.includes(no),
+      geyserShare,
+      premium,
+      commonProperty: commonEach,
+      sasria: sasriaEach,
+      brokerFee: brokerEach,
+      perAnnum,
+      perMonth: perAnnum == null ? null : round2(perAnnum / 12),
+    };
+  });
+
+  const allocated = round2(rows.reduce((s, r) => s + (r.perAnnum || 0), 0));
+  const policyTotal = parsed.policyTotal;
+  const variance = policyTotal == null ? null : round2(allocated - policyTotal);
+
+  return {
+    rows, geyserUnits, geyserEach, commonEach, sasriaEach, brokerEach,
+    allocated, policyTotal, variance,
+    unmatched: parsed.items.filter((i) => i.unitNo == null && !i.isGeyserItem && !parsed.commonItems.includes(i)),
+    missingUnits: nos.filter((no) => !parsed.unitItems.some((i) => i.unitNo === no)),
+  };
 }
 
 // ---------- Supabase (database) ----------
@@ -971,9 +1160,11 @@ async function saveLevyBreakdownToDb(levyBreakdown) {
 }
 
 // Suggested per-unit levy amounts from the confirmed rules — all VAT
-// inclusive. Insurance is null (individualised manual entry, never filled).
-// These drive the suggestions strip and the "fill grid" action on the Levy
-// breakdown page; the grid itself stays fully editable.
+// inclusive. Insurance is null here because it is the one line that differs per
+// unit: it comes from that unit's own row on the insurance schedule, which
+// LevySetup loads separately and applies per unit. These drive the suggestions
+// strip and the "fill grid" action on the Levy breakdown page; the grid itself
+// stays fully editable.
 function computeSuggestedLevyItems({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, councilInvoice }) {
   const withVat = (n) => n * (1 + vatRate);
   return {
@@ -1901,6 +2092,7 @@ export default function App() {
                 councilInvoice={councilInvoice}
               />
             )}
+            {tab === "insurance" && <InsurancePage />}
             {tab === "additional-charges" && (
               <AdditionalCharges additionalCharges={additionalCharges} setAdditionalCharges={setAdditionalCharges} />
             )}
@@ -2024,6 +2216,7 @@ function SideNav({ tab, setTab }) {
     ["dashboard", "Dashboard"],
     ["readings", "Meter readings"],
     ["levy-setup", "Levy breakdown (AGM)"],
+    ["insurance", "Insurance"],
     ["additional-charges", "Additional charges"],
     ["ops-expenses", "Body corp expenses"],
     ["allocation", "Invoice allocation"],
@@ -2607,12 +2800,55 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, wa
   // VAT-inclusive suggested values from the confirmed rules (bill figures +
   // rates). They pre-fill via the button below but every cell stays editable.
   const suggestions = computeSuggestedLevyItems({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, councilInvoice });
+
+  // Insurance is the one line that differs per unit, so it is loaded from that
+  // unit's own row on the insurance schedule rather than from the flat
+  // suggestions object: per annum (premium + common property + Sasria + broker)
+  // over twelve, exactly as section 5 of the AGM report prints it. Captured on
+  // the Insurance page. Like every other line it pre-fills and stays editable.
+  const [insurancePerUnit, setInsurancePerUnit] = useState({});
+  const insuranceFY = levyMeta.financialYear || FY_ACTIVE;
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const client = await ensureSupabaseClient();
+        const { data, error } = await client
+          .from("insurance_schedule").select("*").eq("financial_year", insuranceFY);
+        if (error) throw error;
+        if (!alive) return;
+        const byDbId = Object.fromEntries((data || []).map((r) => [r.unit_id, r]));
+        const map = {};
+        UNITS.forEach((u) => {
+          const r = u.dbId ? byDbId[u.dbId] : null;
+          if (!r) return;
+          const parts = [r.premium, r.common_property, r.sasria, r.broker_fee];
+          if (parts.every((v) => v == null)) return;
+          map[u.id] = round2(round2(parts.reduce((s, v) => s + (v || 0), 0)) / 12);
+        });
+        setInsurancePerUnit(map);
+      } catch (err) {
+        // A missing schedule is not an error worth blocking the grid over — the
+        // Insurance line simply stays as whatever is already in the cell.
+        console.error("Loading the insurance schedule for the levy grid failed:", err);
+      }
+    })();
+    return () => { alive = false; };
+  }, [insuranceFY]);
+
+  const insuranceCaptured = Object.keys(insurancePerUnit).length > 0;
+
   const fillCalculated = () => {
     setLevyBreakdown((prev) => {
       const next = {};
       UNITS.forEach((u) => {
         next[u.id] = { ...prev[u.id] };
         LEVY_ITEMS.forEach((item) => {
+          if (item === "Insurance") {
+            const v = insurancePerUnit[u.id];
+            if (v != null) next[u.id][item] = round2(v);
+            return;
+          }
           const s = suggestions[item];
           if (s !== null && s !== undefined) next[u.id][item] = round2(s);
         });
@@ -2673,7 +2909,17 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, wa
             <span className="f-mono">
               {LEVY_ITEMS.filter((i) => suggestions[i] !== null).map((i) => `${i} ${rand(suggestions[i])}`).join(" · ")}
             </span>
-            <br />Insurance stays manual — individualised per unit per year.
+            <br />
+            {insuranceCaptured ? (
+              <>
+                <b>Insurance</b> is per unit, from the FY {insuranceFY} insurance schedule (per annum ÷ 12):{" "}
+                <span className="f-mono">
+                  {UNITS.map((u) => `${u.id} ${insurancePerUnit[u.id] == null ? "—" : rand(insurancePerUnit[u.id])}`).join(" · ")}
+                </span>
+              </>
+            ) : (
+              <><b>Insurance</b> has no schedule captured for FY {insuranceFY} — upload the broker's schedule on the Insurance page and it fills here.</>
+            )}
           </div>
           <button style={secondaryBtn} onClick={fillCalculated}>Fill grid with calculated values</button>
         </div>
@@ -5283,6 +5529,442 @@ function Config({ expenseCategories, setExpenseCategories }) {
   );
 }
 
+// ---------- Insurance ----------
+// Section 5 of the AGM report ("Insurance schedule (per unit)") given its own
+// page, because it is the one part of the report that arrives as a document
+// from a third party once a year and then has to be turned into a per-unit
+// number that bills every month. Everything the report prints is derived here:
+// upload the broker's schedule, check the preview, save, and the Insurance levy
+// line picks it up on the Levy breakdown page.
+//
+// The grid used to live on Config alongside the garden and Blockwatch figures.
+// It was moved here rather than duplicated: two editable grids over one table
+// is how the two drift apart.
+const INS_FIELDS = [
+  { key: "sum_insured", label: "Sum insured" },
+  { key: "premium", label: "Premium" },
+  { key: "common_property", label: "Com prop" },
+  { key: "sasria", label: "Sasria" },
+  { key: "broker_fee", label: "Broker" },
+];
+const INS_POLICY_FIELDS = [
+  { key: "insurance_policy_number", label: "Policy number", kind: "text" },
+  { key: "insurance_insurer", label: "Insurer", kind: "text" },
+  { key: "insurance_cover_start", label: "Cover starts from", kind: "text" },
+  { key: "insurance_policy_total", label: "Policy total per annum", kind: "money" },
+];
+
+function InsurancePage() {
+  // The insurance policy renews 1 September but the body corp financial year
+  // runs 1 August – 31 July, so the year that matters is the one the levy is
+  // being set for. The next FY is offered first: a renewal always arrives to be
+  // captured against the year ahead.
+  const years = useMemo(() => {
+    const start = Number(periodToFY(CURRENT_PERIOD).split("/")[0]);
+    return [1, 0, -1, -2, -3].map((n) => `${start + n}/${start + n + 1}`);
+  }, []);
+  const [fy, setFy] = useState(years[0]);
+  const [units, setUnits] = useState([]);
+  const [ins, setIns] = useState({});        // unitId -> { field: string }
+  const [policy, setPolicy] = useState({});  // policy metadata, as strings
+  const [status, setStatus] = useState("loading");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState(null);
+  const [error, setError] = useState(null);
+
+  // Upload state. Nothing here touches `ins` until the trustee confirms — a
+  // parser that mis-reads the schedule must not be able to overwrite a year.
+  const [parsing, setParsing] = useState(false);
+  const [preview, setPreview] = useState(null);   // { parsed, alloc, fileName }
+  const [parseError, setParseError] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    setStatus("loading"); setNotice(null); setError(null); setPreview(null); setParseError(null);
+    (async () => {
+      try {
+        const client = await ensureSupabaseClient();
+        const [u, i, s] = await Promise.all([
+          client.from("units").select("id, unit_number, sqm").order("unit_number"),
+          client.from("insurance_schedule").select("*").eq("financial_year", fy),
+          client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1),
+        ]);
+        const bad = [u, i, s].find((r) => r.error);
+        if (bad) throw bad.error;
+        if (!alive) return;
+        setUnits((u.data || []).map((r) => ({ id: r.id, no: r.unit_number, sqm: r.sqm == null ? "" : String(r.sqm) })));
+        const byUnit = {};
+        (i.data || []).forEach((r) => {
+          byUnit[r.unit_id] = Object.fromEntries(INS_FIELDS.map((f) => [f.key, r[f.key] == null ? "" : String(r[f.key])]));
+        });
+        setIns(byUnit);
+        const row = (s.data || [])[0] || {};
+        setPolicy(Object.fromEntries(INS_POLICY_FIELDS.map((f) => [f.key, row[f.key] == null ? "" : String(row[f.key])])));
+        setStatus("ready");
+      } catch (err) {
+        console.error("Loading the insurance schedule failed:", err);
+        if (alive) setStatus("error");
+      }
+    })();
+    return () => { alive = false; };
+  }, [fy]);
+
+  // "1234,56" and "1234.56" mean the same thing to a South African typing into
+  // this form; parseFloat on the comma form silently returns 1234.
+  const num = (v) => {
+    const t = String(v ?? "").trim().replace(/\s/g, "").replace(",", ".");
+    if (t === "") return null;
+    const n = Number(t);
+    return isFinite(n) ? n : null;
+  };
+  const txt = (v) => { const t = String(v ?? "").trim(); return t === "" ? null : t; };
+
+  const setInsField = (unitId, key, value) =>
+    setIns((prev) => ({ ...prev, [unitId]: { ...(prev[unitId] || {}), [key]: value } }));
+
+  // Per annum and per month are derived, never stored, so a saved total can
+  // never drift from the components it is supposed to be the sum of.
+  const derived = (unitId) => {
+    const r = ins[unitId] || {};
+    const parts = ["premium", "common_property", "sasria", "broker_fee"].map((k) => num(r[k]));
+    if (parts.every((v) => v == null)) return { perAnnum: null, perMonth: null };
+    const perAnnum = round2(parts.reduce((s, v) => s + (v || 0), 0));
+    return { perAnnum, perMonth: round2(perAnnum / 12) };
+  };
+
+  const onFile = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setParsing(true); setParseError(null); setPreview(null); setNotice(null);
+    try {
+      const parsed = await parseInsuranceSchedulePdf(file);
+      if (!parsed.unitItems.length) {
+        throw new Error("No per-unit items found. Check this is the Schedule of Insurance and not the policy wording.");
+      }
+      const nos = units.map((u) => u.no).sort((a, b) => a - b);
+      const alloc = computeInsuranceAllocation(parsed, nos);
+      setPreview({ parsed, alloc, fileName: file.name });
+    } catch (err) {
+      console.error("Parsing the insurance schedule failed:", err);
+      setParseError(err.message || "Could not read this PDF — see browser console.");
+    } finally {
+      setParsing(false);
+    }
+  };
+
+  // Confirm writes the parsed figures into the editable grid only. Saving to
+  // the database is still the explicit Save below, so the trustee gets a last
+  // look with everything in one place.
+  const applyPreview = () => {
+    if (!preview) return;
+    const byNo = Object.fromEntries(preview.alloc.rows.map((r) => [r.no, r]));
+    setIns((prev) => {
+      const next = { ...prev };
+      units.forEach((u) => {
+        const r = byNo[u.no];
+        if (!r || !r.matched) return;
+        next[u.id] = {
+          sum_insured: r.sumInsured == null ? "" : String(r.sumInsured),
+          premium: String(r.premium),
+          common_property: String(r.commonProperty),
+          sasria: String(r.sasria),
+          broker_fee: String(r.brokerFee),
+        };
+      });
+      return next;
+    });
+    const p = preview.parsed;
+    setPolicy({
+      insurance_policy_number: p.policyNumber || "",
+      insurance_insurer: p.insurer || "",
+      insurance_cover_start: p.coverStart || "",
+      insurance_policy_total: p.policyTotal == null ? "" : String(p.policyTotal),
+    });
+    setPreview(null);
+    setNotice(`Figures from ${preview.fileName} loaded into the grid below. Nothing is saved yet — check them, then save.`);
+  };
+
+  const save = async () => {
+    setBusy(true); setNotice(null); setError(null);
+    try {
+      const client = await ensureSupabaseClient();
+      // Floor area is a title-deed fact, so it is written back to the unit
+      // rather than repeated on every year's schedule.
+      for (const u of units) {
+        const { error: e } = await client.from("units").update({ sqm: num(u.sqm) }).eq("id", u.id);
+        if (e) throw e;
+      }
+      const rows = units.map((u) => {
+        const r = ins[u.id] || {};
+        return {
+          financial_year: fy, unit_id: u.id,
+          ...Object.fromEntries(INS_FIELDS.map((f) => [f.key, num(r[f.key])])),
+          updated_at: new Date().toISOString(),
+        };
+      });
+      const { error: ie } = await client.from("insurance_schedule").upsert(rows, { onConflict: "financial_year,unit_id" });
+      if (ie) throw ie;
+      const payload = { financial_year: fy, updated_at: new Date().toISOString() };
+      INS_POLICY_FIELDS.forEach((f) => {
+        payload[f.key] = f.kind === "money" ? num(policy[f.key]) : txt(policy[f.key]);
+      });
+      const { error: se } = await client.from("agm_report_settings").upsert(payload, { onConflict: "financial_year" });
+      if (se) throw se;
+      setNotice(`Saved for FY ${fy}. Section 5 of the AGM report and the Insurance levy line both read from this.`);
+    } catch (err) {
+      console.error("Saving the insurance schedule failed:", err);
+      setError(err.message || "Save failed — see browser console.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cellInput = { ...inputStyle, width: 104 };
+  const th = { padding: "6px 8px", color: "#64748B", fontSize: 10.5, textTransform: "uppercase", textAlign: "right", whiteSpace: "nowrap" };
+
+  const totals = INS_FIELDS.reduce((acc, f) => {
+    acc[f.key] = round2(units.reduce((s, u) => s + (num((ins[u.id] || {})[f.key]) || 0), 0));
+    return acc;
+  }, {});
+  const totalPerAnnum = round2(units.reduce((s, u) => s + (derived(u.id).perAnnum || 0), 0));
+  const totalPerMonth = round2(units.reduce((s, u) => s + (derived(u.id).perMonth || 0), 0));
+  const savedPolicyTotal = num(policy.insurance_policy_total);
+  const savedVariance = savedPolicyTotal == null || !totalPerAnnum ? null : round2(totalPerAnnum - savedPolicyTotal);
+
+  return (
+    <>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Insurance</h1>
+      <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 14 }}>
+        Upload the broker's annual Schedule of Insurance and it becomes the per-unit insurance figure — section 5 of the AGM report, and the Insurance line on every statement.
+        The policy year runs 1 September; the body corp financial year runs 1 August to 31 July, so capture a renewal against the year it will be billed in.
+      </p>
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+        <label style={{ fontSize: 12.5, color: "#64748B" }}>
+          Financial year{" "}
+          <select value={fy} onChange={(e) => setFy(e.target.value)}
+                  style={{ ...inputStyle, width: 130, textAlign: "left", fontFamily: "inherit" }}>
+            {years.map((y) => <option key={y} value={y}>{y}</option>)}
+          </select>
+        </label>
+      </div>
+
+      {status === "loading" && <Card><div style={{ color: "#94A0AC", fontSize: 13 }}>Loading…</div></Card>}
+      {status === "error" && <Card><div style={{ color: "#B5651D", fontWeight: 600, fontSize: 13 }}>Couldn’t load the insurance schedule — see browser console.</div></Card>}
+
+      {status === "ready" && (
+        <>
+          {/* ---- Upload ---- */}
+          <Card style={{ marginBottom: 16 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 6 }}>Upload the schedule</div>
+            <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 0, marginBottom: 12, lineHeight: 1.6 }}>
+              PDF from the broker (GWK Welvaart / Renasa format). It is read in your browser — nothing is uploaded anywhere, and nothing is written until you confirm the preview.
+            </p>
+            <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+              <label style={{ ...secondaryBtn, display: "inline-block" }}>
+                {parsing ? "Reading…" : "Choose PDF…"}
+                <input type="file" accept="application/pdf,.pdf" onChange={onFile} disabled={parsing}
+                       style={{ display: "none" }} />
+              </label>
+              {parseError && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{parseError}</span>}
+            </div>
+          </Card>
+
+          {preview && <InsurancePreview preview={preview} onApply={applyPreview} onDiscard={() => setPreview(null)} />}
+
+          {/* ---- Section 5 table ---- */}
+          <Card style={{ marginBottom: 16 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Insurance schedule (per unit) — section 5 of the AGM report</div>
+            <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 0, marginBottom: 14, lineHeight: 1.6 }}>
+              Per annum is premium plus common property, Sasria and broker fee; per month is a twelfth of it. Both are derived, never stored, so they cannot disagree with their own components.
+              Every cell stays editable — the upload fills them, it doesn’t lock them.
+            </p>
+            <div className="scroll-x">
+              <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", minWidth: 820 }}>
+                <thead>
+                  <tr>
+                    <th style={{ ...th, textAlign: "left" }}>Unit</th>
+                    <th style={th}>Sqm</th>
+                    {INS_FIELDS.map((f) => <th key={f.key} style={th}>{f.label}</th>)}
+                    <th style={th}>Per annum</th>
+                    <th style={th}>Per month</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {units.map((u) => {
+                    const d = derived(u.id);
+                    return (
+                      <tr key={u.id} style={{ borderTop: "1px solid #EEE7D6" }}>
+                        <td style={{ padding: "6px 8px", fontWeight: 600 }}>Unit {u.no}</td>
+                        <td style={{ padding: "6px 8px", textAlign: "right" }}>
+                          <input type="text" inputMode="decimal" value={u.sqm}
+                                 onChange={(e) => setUnits((prev) => prev.map((x) => (x.id === u.id ? { ...x, sqm: e.target.value } : x)))}
+                                 style={{ ...cellInput, width: 70 }} />
+                        </td>
+                        {INS_FIELDS.map((f) => (
+                          <td key={f.key} style={{ padding: "6px 8px", textAlign: "right" }}>
+                            <input type="text" inputMode="decimal" value={(ins[u.id] || {})[f.key] ?? ""}
+                                   onChange={(e) => setInsField(u.id, f.key, e.target.value)}
+                                   style={cellInput} />
+                          </td>
+                        ))}
+                        <td className="f-mono" style={{ padding: "6px 8px", textAlign: "right", color: "#64748B" }}>{d.perAnnum == null ? "—" : rand(d.perAnnum)}</td>
+                        <td className="f-mono" style={{ padding: "6px 8px", textAlign: "right", fontWeight: 700 }}>{d.perMonth == null ? "—" : rand(d.perMonth)}</td>
+                      </tr>
+                    );
+                  })}
+                  <tr style={{ borderTop: "2px solid #D8D0BE", background: "#F6F1E7" }}>
+                    <td style={{ padding: "8px", fontWeight: 700 }}>Total</td>
+                    <td />
+                    {INS_FIELDS.map((f) => (
+                      <td key={f.key} className="f-mono" style={{ padding: "8px", textAlign: "right", fontWeight: 700 }}>
+                        {totals[f.key] ? rand(totals[f.key]) : "—"}
+                      </td>
+                    ))}
+                    <td className="f-mono" style={{ padding: "8px", textAlign: "right", fontWeight: 700 }}>{totalPerAnnum ? rand(totalPerAnnum) : "—"}</td>
+                    <td className="f-mono" style={{ padding: "8px", textAlign: "right", fontWeight: 700 }}>{totalPerMonth ? rand(totalPerMonth) : "—"}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            {savedVariance != null && <TieOut allocated={totalPerAnnum} policyTotal={savedPolicyTotal} variance={savedVariance} />}
+          </Card>
+
+          {/* ---- Policy details ---- */}
+          <Card style={{ marginBottom: 16 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 12 }}>Policy details</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "10px 24px" }}>
+              {INS_POLICY_FIELDS.map((f) => (
+                <label key={f.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, fontSize: 12.5 }}>
+                  <span style={{ color: "#1B2A38" }}>{f.label}</span>
+                  <input
+                    type="text"
+                    inputMode={f.kind === "money" ? "decimal" : undefined}
+                    value={policy[f.key] ?? ""}
+                    onChange={(e) => setPolicy((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                    style={{ ...inputStyle, width: f.kind === "money" ? 120 : 180, textAlign: f.kind === "money" ? "right" : "left", fontFamily: f.kind === "money" ? inputStyle.fontFamily : "inherit" }}
+                  />
+                </label>
+              ))}
+            </div>
+          </Card>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+            <button style={primaryBtn} onClick={save} disabled={busy}>
+              {busy ? "Saving…" : `Save insurance schedule for FY ${fy}`}
+            </button>
+            {notice && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>{notice}</span>}
+            {error && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{error}</span>}
+          </div>
+          <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 12, lineHeight: 1.6 }}>
+            The Insurance line on the Levy breakdown page fills from the per-month column above. Leaving a cell blank renders that row of the report as an empty cell to complete in Word, which is how the section used to work.
+          </p>
+        </>
+      )}
+    </>
+  );
+}
+
+// Rounding seven ways almost never lands exactly on the insurer's total. The
+// difference is shown rather than absorbed into a unit — a few cents is fine
+// and expected, rands mean an item was missed.
+function TieOut({ allocated, policyTotal, variance }) {
+  const material = Math.abs(variance) >= 1;
+  return (
+    <div style={{
+      marginTop: 12, padding: "9px 12px", borderRadius: 7, fontSize: 12,
+      background: material ? "#FBF3E9" : "#F1F5F2",
+      border: `1px solid ${material ? "#E3C9A8" : "#D5E2D9"}`,
+      color: material ? "#8A5A1E" : "#2F5D50", lineHeight: 1.6,
+    }}>
+      <b>Tie-out:</b> allocated <span className="f-mono">{rand(allocated)}</span> against a policy total of{" "}
+      <span className="f-mono">{rand(policyTotal)}</span> —{" "}
+      {variance === 0 ? "exact." : (
+        <>
+          <span className="f-mono">{variance > 0 ? "+" : ""}{rand(variance)}</span>{" "}
+          {material
+            ? "difference. That is more than rounding: check every item on the schedule has been captured."
+            : "from rounding each unit to the cent. Expected, and how the insurer's own schedule adds up."}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Preview of a parsed schedule: what was read off the PDF, and what it works out
+// to per unit, before anything is written.
+function InsurancePreview({ preview, onApply, onDiscard }) {
+  const { parsed, alloc, fileName } = preview;
+  const th = { padding: "6px 8px", color: "#64748B", fontSize: 10.5, textTransform: "uppercase", textAlign: "right", whiteSpace: "nowrap" };
+  const td = { padding: "6px 8px", textAlign: "right" };
+  return (
+    <Card style={{ marginBottom: 16, background: "#FBFAF6", border: "1px solid #D8D0BE" }}>
+      <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Preview — {fileName}</div>
+      <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 0, marginBottom: 12, lineHeight: 1.6 }}>
+        Policy <b>{parsed.policyNumber || "—"}</b>{parsed.insurer ? ` · ${parsed.insurer}` : ""}{parsed.coverStart ? ` · cover from ${parsed.coverStart}` : ""}.
+        {" "}Nothing has been changed yet.
+      </p>
+
+      <div style={{ display: "flex", gap: 24, flexWrap: "wrap", fontSize: 12, marginBottom: 14, color: "#1B2A38" }}>
+        <span>Section premium <b className="f-mono">{parsed.coverSubTotal == null ? "—" : rand(parsed.coverSubTotal)}</b></span>
+        <span>Common property <b className="f-mono">{rand(parsed.commonPropertyPremium)}</b> ÷ {alloc.rows.length} = <b className="f-mono">{rand(alloc.commonEach)}</b></span>
+        <span>Geysers <b className="f-mono">{rand(parsed.geyserPremium)}</b> ÷ {alloc.geyserUnits.length || 0} = <b className="f-mono">{rand(alloc.geyserEach)}</b> (units {alloc.geyserUnits.join(", ") || "none"})</span>
+        <span>Sasria <b className="f-mono">{parsed.sasriaTotal == null ? "—" : rand(parsed.sasriaTotal)}</b> ÷ {alloc.rows.length} = <b className="f-mono">{rand(alloc.sasriaEach)}</b></span>
+        <span>Broker <b className="f-mono">{parsed.brokerFee == null ? "—" : rand(parsed.brokerFee)}</b> ÷ {alloc.rows.length} = <b className="f-mono">{rand(alloc.brokerEach)}</b></span>
+      </div>
+
+      {!!alloc.missingUnits.length && (
+        <div style={{ marginBottom: 12, padding: "9px 12px", borderRadius: 7, background: "#FBF3E9", border: "1px solid #E3C9A8", color: "#8A5A1E", fontSize: 12, lineHeight: 1.6 }}>
+          <b>No schedule item found for unit {alloc.missingUnits.join(", ")}.</b> Those rows will be left as they are — check the PDF describes each unit as “Unit N …”.
+        </div>
+      )}
+
+      <div className="scroll-x">
+        <table style={{ width: "100%", fontSize: 12.5, borderCollapse: "collapse", minWidth: 820 }}>
+          <thead>
+            <tr>
+              <th style={{ ...th, textAlign: "left" }}>Unit</th>
+              <th style={th}>Sum insured</th>
+              <th style={th}>Item premium</th>
+              <th style={th}>Geyser</th>
+              <th style={th}>Premium</th>
+              <th style={th}>Com prop</th>
+              <th style={th}>Sasria</th>
+              <th style={th}>Broker</th>
+              <th style={th}>Per annum</th>
+              <th style={th}>Per month</th>
+            </tr>
+          </thead>
+          <tbody>
+            {alloc.rows.map((r) => (
+              <tr key={r.no} style={{ borderTop: "1px solid #EEE7D6", opacity: r.matched ? 1 : 0.45 }}>
+                <td style={{ padding: "6px 8px", fontWeight: 600 }}>Unit {r.no}</td>
+                <td className="f-mono" style={td}>{r.sumInsured == null ? "—" : rand(r.sumInsured)}</td>
+                <td className="f-mono" style={td}>{r.ownPremium == null ? "—" : rand(r.ownPremium)}</td>
+                <td className="f-mono" style={{ ...td, color: r.geyserShare ? "#1B2A38" : "#B9C4CE" }}>{r.geyserShare ? rand(r.geyserShare) : "—"}</td>
+                <td className="f-mono" style={{ ...td, fontWeight: 600 }}>{r.premium == null ? "—" : rand(r.premium)}</td>
+                <td className="f-mono" style={td}>{rand(r.commonProperty)}</td>
+                <td className="f-mono" style={td}>{rand(r.sasria)}</td>
+                <td className="f-mono" style={td}>{rand(r.brokerFee)}</td>
+                <td className="f-mono" style={td}>{r.perAnnum == null ? "—" : rand(r.perAnnum)}</td>
+                <td className="f-mono" style={{ ...td, fontWeight: 700 }}>{r.perMonth == null ? "—" : rand(r.perMonth)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {alloc.policyTotal != null && <TieOut allocated={alloc.allocated} policyTotal={alloc.policyTotal} variance={alloc.variance} />}
+
+      <div style={{ marginTop: 16, display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <button style={primaryBtn} onClick={onApply}>Use these figures</button>
+        <button style={secondaryBtn} onClick={onDiscard}>Discard</button>
+      </div>
+    </Card>
+  );
+}
+
 // ---------- Config: AGM report figures ----------
 // The insurance schedule and the garden/blockwatch figures the AGM approves are
 // the two parts of the annual report with no other home in the schema — they
@@ -5304,13 +5986,6 @@ const AGM_FIELDS = [
   { key: "prepared_by", label: "Report prepared by", kind: "text" },
   { key: "checked_by", label: "Report checked by", kind: "text" },
 ];
-const INS_FIELDS = [
-  { key: "sum_insured", label: "Sum insured" },
-  { key: "premium", label: "Premium" },
-  { key: "common_property", label: "Com prop" },
-  { key: "sasria", label: "Sasria" },
-  { key: "broker_fee", label: "Broker" },
-];
 
 function AgmReportSettings() {
   // Which years to offer: the current body-corp FY and the three before it. The
@@ -5321,8 +5996,6 @@ function AgmReportSettings() {
     return [0, 1, 2, 3].map((n) => `${start - n}/${start - n + 1}`);
   }, []);
   const [fy, setFy] = useState(years[0]);
-  const [units, setUnits] = useState([]);
-  const [ins, setIns] = useState({});       // unitId -> { field: string }
   const [settings, setSettings] = useState({});
   const [status, setStatus] = useState("loading"); // loading | ready | error
   const [busy, setBusy] = useState(false);
@@ -5338,20 +6011,9 @@ function AgmReportSettings() {
     (async () => {
       try {
         const client = await ensureSupabaseClient();
-        const [u, i, s] = await Promise.all([
-          client.from("units").select("id, unit_number, sqm").order("unit_number"),
-          client.from("insurance_schedule").select("*").eq("financial_year", fy),
-          client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1),
-        ]);
-        const bad = [u, i, s].find((r) => r.error);
-        if (bad) throw bad.error;
+        const s = await client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1);
+        if (s.error) throw s.error;
         if (!alive) return;
-        setUnits((u.data || []).map((r) => ({ id: r.id, no: r.unit_number, sqm: r.sqm == null ? "" : String(r.sqm) })));
-        const byUnit = {};
-        (i.data || []).forEach((r) => {
-          byUnit[r.unit_id] = Object.fromEntries(INS_FIELDS.map((f) => [f.key, r[f.key] == null ? "" : String(r[f.key])]));
-        });
-        setIns(byUnit);
         const row = (s.data || [])[0] || {};
         setSettings(Object.fromEntries(AGM_FIELDS.map((f) => [f.key, row[f.key] == null ? "" : String(row[f.key])])));
         setStatus("ready");
@@ -5373,40 +6035,10 @@ function AgmReportSettings() {
   };
   const txt = (v) => { const t = String(v ?? "").trim(); return t === "" ? null : t; };
 
-  const setInsField = (unitId, key, value) =>
-    setIns((prev) => ({ ...prev, [unitId]: { ...(prev[unitId] || {}), [key]: value } }));
-
-  // Per annum and per month are shown live so a typo is obvious before saving —
-  // and they are computed by exactly the arithmetic the report uses.
-  const derived = (unitId) => {
-    const r = ins[unitId] || {};
-    const parts = ["premium", "common_property", "sasria", "broker_fee"].map((k) => num(r[k]));
-    if (parts.every((v) => v == null)) return { perAnnum: null, perMonth: null };
-    const perAnnum = round2(parts.reduce((s, v) => s + (v || 0), 0));
-    return { perAnnum, perMonth: round2(perAnnum / 12) };
-  };
-
   const save = async () => {
     setBusy(true); setNotice(null); setError(null);
     try {
       const client = await ensureSupabaseClient();
-      // Floor area lives on the unit, not on the year's schedule — it is a
-      // title-deed fact, so it is written back to units rather than repeated.
-      for (const u of units) {
-        const sqm = num(u.sqm);
-        const { error: e } = await client.from("units").update({ sqm }).eq("id", u.id);
-        if (e) throw e;
-      }
-      const rows = units.map((u) => {
-        const r = ins[u.id] || {};
-        return {
-          financial_year: fy, unit_id: u.id,
-          ...Object.fromEntries(INS_FIELDS.map((f) => [f.key, num(r[f.key])])),
-          updated_at: new Date().toISOString(),
-        };
-      });
-      const { error: ie } = await client.from("insurance_schedule").upsert(rows, { onConflict: "financial_year,unit_id" });
-      if (ie) throw ie;
       const payload = { financial_year: fy, updated_at: new Date().toISOString() };
       AGM_FIELDS.forEach((f) => { payload[f.key] = f.kind === "money" || f.kind === "number" ? num(settings[f.key]) : txt(settings[f.key]); });
       const { error: se } = await client.from("agm_report_settings").upsert(payload, { onConflict: "financial_year" });
@@ -5419,16 +6051,6 @@ function AgmReportSettings() {
       setBusy(false);
     }
   };
-
-  const cellInput = { ...inputStyle, width: 104 };
-  const th = { padding: "6px 8px", color: "#64748B", fontSize: 10.5, textTransform: "uppercase", textAlign: "right", whiteSpace: "nowrap" };
-
-  const totals = INS_FIELDS.reduce((acc, f) => {
-    acc[f.key] = round2(units.reduce((s, u) => s + (num((ins[u.id] || {})[f.key]) || 0), 0));
-    return acc;
-  }, {});
-  const totalPerAnnum = round2(units.reduce((s, u) => s + (derived(u.id).perAnnum || 0), 0));
-  const totalPerMonth = round2(units.reduce((s, u) => s + (derived(u.id).perMonth || 0), 0));
 
   return (
     <Card style={{ marginTop: 16 }}>
@@ -5443,8 +6065,8 @@ function AgmReportSettings() {
         </label>
       </div>
       <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 0, marginBottom: 14, lineHeight: 1.6 }}>
-        The insurance schedule and the garden, blockwatch and sign-off figures used by the annual report.
-        Per annum and per month are derived — premium plus common property, Sasria and broker fee, then a twelfth of it — so they can never disagree with their own components.
+        The garden, blockwatch, sewerage and sign-off figures used by the annual report.
+        The insurance schedule moved to its own <b>Insurance</b> page, where the broker's schedule is uploaded and the per-unit figure is worked out — one editable grid over that table rather than two.
       </p>
 
       {status === "loading" && <div style={{ color: "#94A0AC", fontSize: 13 }}>Loading…</div>}
@@ -5452,56 +6074,7 @@ function AgmReportSettings() {
 
       {status === "ready" && (
         <>
-          <div className="scroll-x">
-            <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", minWidth: 780 }}>
-              <thead>
-                <tr>
-                  <th style={{ ...th, textAlign: "left" }}>Unit</th>
-                  <th style={th}>Sqm</th>
-                  {INS_FIELDS.map((f) => <th key={f.key} style={th}>{f.label}</th>)}
-                  <th style={th}>Per annum</th>
-                  <th style={th}>Per month</th>
-                </tr>
-              </thead>
-              <tbody>
-                {units.map((u) => {
-                  const d = derived(u.id);
-                  return (
-                    <tr key={u.id} style={{ borderTop: "1px solid #EEE7D6" }}>
-                      <td style={{ padding: "6px 8px", fontWeight: 600 }}>Unit {u.no}</td>
-                      <td style={{ padding: "6px 8px", textAlign: "right" }}>
-                        <input type="text" inputMode="decimal" value={u.sqm}
-                               onChange={(e) => setUnits((prev) => prev.map((x) => (x.id === u.id ? { ...x, sqm: e.target.value } : x)))}
-                               style={{ ...cellInput, width: 70 }} />
-                      </td>
-                      {INS_FIELDS.map((f) => (
-                        <td key={f.key} style={{ padding: "6px 8px", textAlign: "right" }}>
-                          <input type="text" inputMode="decimal" value={(ins[u.id] || {})[f.key] ?? ""}
-                                 onChange={(e) => setInsField(u.id, f.key, e.target.value)}
-                                 style={cellInput} />
-                        </td>
-                      ))}
-                      <td className="f-mono" style={{ padding: "6px 8px", textAlign: "right", color: "#64748B" }}>{d.perAnnum == null ? "—" : rand(d.perAnnum)}</td>
-                      <td className="f-mono" style={{ padding: "6px 8px", textAlign: "right", fontWeight: 700 }}>{d.perMonth == null ? "—" : rand(d.perMonth)}</td>
-                    </tr>
-                  );
-                })}
-                <tr style={{ borderTop: "2px solid #D8D0BE", background: "#F6F1E7" }}>
-                  <td style={{ padding: "8px", fontWeight: 700 }}>Total</td>
-                  <td />
-                  {INS_FIELDS.map((f) => (
-                    <td key={f.key} className="f-mono" style={{ padding: "8px", textAlign: "right", fontWeight: 700 }}>
-                      {totals[f.key] ? rand(totals[f.key]) : "—"}
-                    </td>
-                  ))}
-                  <td className="f-mono" style={{ padding: "8px", textAlign: "right", fontWeight: 700 }}>{totalPerAnnum ? rand(totalPerAnnum) : "—"}</td>
-                  <td className="f-mono" style={{ padding: "8px", textAlign: "right", fontWeight: 700 }}>{totalPerMonth ? rand(totalPerMonth) : "—"}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "10px 24px", marginTop: 20 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "10px 24px" }}>
             {AGM_FIELDS.map((f) => (
               <label key={f.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, fontSize: 12.5 }}>
                 <span style={{ color: "#1B2A38" }}>{f.label}</span>

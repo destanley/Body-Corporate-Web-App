@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 6 August 2026, session 3 (supersedes the 6 August 2026 session 2 summary)
+Last updated: 7 August 2026, session 4 (supersedes the 6 August 2026 session 3 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -58,7 +58,7 @@ Consequence: the last month of a financial year always looks uncollected until t
 
 ## Trustee screens (SideNav order)
 
-Dashboard · Meter readings · Levy breakdown (AGM) · Additional charges · Body corp expenses · Invoice allocation · Bank reconciliation · Statement preview · **Financial dashboard** · Tariffs & rates · Rate history · **Config**
+Dashboard · Meter readings · Levy breakdown (AGM) · **Insurance** · Additional charges · Body corp expenses · Invoice allocation · Bank reconciliation · Statement preview · **Financial dashboard** · Tariffs & rates · Rate history · **Config**
 
 ---
 
@@ -70,6 +70,59 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 7 August 2026, session 4
+
+### Insurance page (new SideNav item, between Levy breakdown and Additional charges)
+The insurance schedule arrives once a year as a PDF from the broker and has to become a per-unit number that bills every month. That was a manual re-key into Config. It is now `InsurancePage` in `src/App.jsx`: upload the schedule, check a preview, save.
+
+- **Upload → review → confirm.** `parseInsuranceSchedulePdf` reads the GWK Welvaart / Renasa "Schedule of Insurance" client-side via the pdf.js already loaded for bank statements — no backend, nothing uploaded anywhere. **Nothing is written until the trustee confirms the preview**, and confirming only fills the editable grid; saving is still a separate explicit action. A parser that mis-reads the schedule must not be able to overwrite a year silently.
+- **Unit mapping** is off the item header (`Item 1 - Unit 1 in extent 193 square meters …`). Items that aren't a unit are split by description into the geyser item and common property. Any unit with no matching item is listed in the preview and left untouched rather than zeroed.
+- **Geyser cover is read from each item's own `Geysers - Cover as Defined: Yes/No` extension flag**, not from the free text on the geyser item. The flag is structured; the description ("4 X Geysers @ R15000 (Units 2,4,5 and 6 only)") is not.
+
+### The allocation (trustee-confirmed, 7 August 2026)
+Reproduces exactly how FY 2025/2026 was built by hand — verified against that seed, premium for premium.
+
+| Component | Rule |
+|---|---|
+| Premium | The unit's own item premium **plus** an equal share of the geyser item across only the units flagged for geyser cover. **Folded into premium**, not a new column — keeps the report at nine columns and keeps last year's figures reconcilable. |
+| Com prop | Common-property item premium ÷ 7, equally. |
+| Sasria | Policy Sasria total ÷ 7, equally. |
+| Broker | Broker fee ÷ 7, equally. (It is exactly 1% of the section premium.) |
+| Per annum / per month | Derived, never stored — premium + the three charges, then ÷ 12. |
+
+- **Rounding is shown, not absorbed.** Each per-unit figure rounds to the cent, which is how the insurer's own schedule adds up; seven of those rarely land exactly on the policy total. The `TieOut` component prints allocated vs policy total and the difference — styled calm under R1 ("expected, rounding"), amber at R1 or more ("that is more than rounding: check every item was captured"). Absorbing the remainder into one unit was considered and rejected: it hides a missed item.
+- Alternatives considered and declined: splitting common property / Sasria / broker by participation quota or pro-rata to premium, and spreading the geyser item over all seven units. All would have changed every FY 2025/2026 figure.
+
+### FY 2026/2027 loaded from `2026 Renewal.pdf`
+Policy `GWK-REN-ELCOR00006 - Renewal(1)`, Renasa, cover from 1 September. Section premium R23,390.81 · common property (item 8) R471.68 · geysers (item 9) R3,600.00 across units 2, 4, 5, 6 at R900.00 each · Sasria R740.44 · broker R233.91 · **policy total R24,365.16**. Allocated R24,365.19 — **+R0.03, rounding**.
+
+Per unit, per month: 1 R201.13 · 2 R365.60 · 3 R261.60 · 4 R306.42 · 5 R294.37 · 6 R336.85 · 7 R264.48 (**R2,030.45/month total**).
+
+> **Unresolved:** the renewal's unit premiums are *identical* to FY 2025/2026 and it still prints "Cover Starts From 01 September 2025" despite being printed 6 August 2026 and marked Renewal(1). Filed against FY 2026/2027 on Devon's instruction. **Worth querying with GWK before the AGM** — a renewal with no movement at all in seven unit premiums is unusual.
+
+### Insurance levy line now feeds from the schedule
+`LEVY_ITEMS` "Insurance" was `null` in `computeSuggestedLevyItems` and typed in by hand. `LevySetup` now loads `insurance_schedule` for the grid's financial year itself and applies **per annum ÷ 12 per unit** — it is the one levy line that differs per unit, so it can't come from the flat suggestions object. It pre-fills via "Fill grid with calculated values" and **stays editable**, consistent with the 12 July 2026 rule that nothing in that grid is locked. With no schedule captured the strip says so and points at the Insurance page; the cell keeps whatever is in it.
+
+### The insurance grid moved off Config rather than being duplicated
+Two editable grids over one table is how the two drift apart. `AgmReportSettings` keeps the garden, Blockwatch, sewerage and sign-off fields; `INS_FIELDS` and the grid now live only on the Insurance page. AGM report section 5 is unchanged and still reads the same table.
+
+### Migration `insurance_policy_metadata.sql`
+Additive. Four columns on `agm_report_settings` (already one row per FY, which is the grain of an annual renewal): `insurance_policy_number`, `insurance_insurer`, `insurance_cover_start` (**text** — the broker's date format is not ours to depend on; displayed, never computed with), `insurance_policy_total`. Without a stored policy total there is nothing to tie the seven allocations back to. Seeds FY 2026/2027 and backfills the FY 2025/2026 policy total.
+
+> The FY 2025/2026 seed used **R67.39** common property where the arithmetic gives **R67.38** (R471.68 ÷ 7 = R67.3829). It now ties out at R0.10 rather than R0.03 — visible, which is the point. Left as-is: that year's report is signed off.
+
+### Section numbering
+The trustee's template calls the insurance schedule section 4; the generator prints it as **5** because maintenance expenses was inserted at 4 in session 3. Confirmed 7 August 2026 to **leave the code as the source of truth** — page and report both say 5.
+
+### Verified
+- `esbuild` bundle clean (the Windows-built `rollup` native binary can't run under WSL/Linux — use esbuild to syntax-check there, or `npm run build` on Windows).
+- Parser run against the real `2026 Renewal.pdf`: all 9 items, both sub-totals, policy number, insurer, cover start and total sum insured extracted correctly.
+- Derived premiums match the FY 2025/2026 seed exactly: 2206.95 / 4180.62 / 2932.57 / 3470.40 / 3325.81 / 3835.61 / 2967.17.
+- No stale references left in `AgmReportSettings` after the grid was removed.
+- **Not yet run against the live database, and the migration has not been applied.**
 
 ---
 
@@ -112,7 +165,7 @@ Mirrored in `migrations/agm_report_insurance_and_settings.sql`. Additive; nothin
 - `sewerage_per_unit_new` exists because the New column had **no source at all**: `council_invoices` only carries the rate being billed now, and next year's isn't published yet. It was a permanent blank.
 
 ### Config screen: "AGM report figures" card
-New `AgmReportSettings` component under the categories card. FY selector (current body-corp FY plus the three before it), the insurance grid with live derived per-annum/per-month, and the settings fields. Text inputs with `inputMode="decimal"` and a comma-tolerant parser — **not `type="number"`**, for the reasons already recorded under session 2 (en-ZA renders `33.57` as `33,57` and strips trailing zeros). A blank field still renders that report row as an empty cell to complete in Word, which is how the whole section used to work.
+New `AgmReportSettings` component under the categories card. FY selector (current body-corp FY plus the three before it), the insurance grid with live derived per-annum/per-month, and the settings fields. *(Session 4: the insurance grid moved off this card to the Insurance page — see below. The garden/Blockwatch/sewerage/sign-off fields stay here.)* Text inputs with `inputMode="decimal"` and a comma-tolerant parser — **not `type="number"`**, for the reasons already recorded under session 2 (en-ZA renders `33.57` as `33,57` and strips trailing zeros). A blank field still renders that report row as an empty cell to complete in Word, which is how the whole section used to work.
 
 ### Usage trend charts embedded as PNGs (§8.4)
 - `TrendChart`'s JSX was replaced by **`buildTrendChartSvg()`, a pure SVG-string builder**, with the component now a thin wrapper around it. The report rasterises the same string, so **a chart in the document cannot drift from the chart on screen**. `usageTrendSeries()` likewise defines the three series once for both.
@@ -298,7 +351,6 @@ Reconciliation moved onto `applied_period`; `manual_payments` table and UI added
 - Annual report generator — **built 6 Aug** (editable .docx, ten sections). Still to confirm STSMA audit / independent-review sign-off with the scheme's accountant, and whether a balance sheet is required.
 - **Capture FY2026/2027 rates so the AGM report's "proposed" columns fill themselves.** Present: water bands (all 8). Missing: a `levy_rates` row for 2026/2027 (common-property provisions, water demand levy, electricity service and network charges) and a `levy_manual_entries` grid — section 10 carries this year's figures forward and labels itself as doing so.
 - Backfill `electricity_rates.financial_year = '2026/2027'` on the R2.81 row (currently null; resolved by `effective_from` instead).
-- Insurance schedule, garden salary/bonus and the Blockwatch fee have **no tables** — they are typed into Word each year. Worth a capture UI if that becomes annoying.
 - **Wire up "Confirm allocation & generate statements."** It has been a no-op stub since it was written; moving it to Meter readings hasn't changed that. Decide what it should actually do — most likely persist the computed statement rows for the period so a statement can't drift after it's issued.
 - **Add monitoring for the Gmail import** so a silent failure surfaces in days, not weeks. Runbook §7 has the two queries; a scheduled task on the 10th of each month would do it.
 - Real owner names in `units` (pending the public-GitHub-exposure decision).
