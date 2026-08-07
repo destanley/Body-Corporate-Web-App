@@ -299,6 +299,35 @@ const INS_ITEM_RE = /^Item\s+(\d+)\s*[-–]\s*(.*?)\s*Sum Insured\s*R\s?([\d,]+(
 // Geyser cover is read from each item's own "Geysers - Cover as Defined"
 // extension flag rather than from the free-text description on the geyser
 // item, because the flag is structured and the description is not.
+// A line carrying nothing but amounts — the remainder of a table row whose
+// label landed on its own line during reconstruction.
+const INS_AMOUNTS_ONLY_RE = /^[R\d.,\s]+$/;
+
+// Finds the annual amount for a labelled row of the premium summary.
+//
+// pdf.js rebuilds a table row by grouping text items on a rounded y-position,
+// and the summary's labels are right-aligned in a middle column: "Sasria
+// Sub-Total" and its "R0.00 R740.44" can end up a pixel apart and land on two
+// separate lines. So the amount is looked for on the label's own line first,
+// and only then on the next couple of lines — and only if those carry amounts
+// and nothing else, so a label can never absorb an unrelated figure.
+//
+// The annual premium is always the LAST amount on the row: the pro-rata
+// adjustment column sits before it.
+function findInsSummaryAmount(lines, labelRe) {
+  for (let i = 0; i < lines.length; i++) {
+    if (!labelRe.test(lines[i])) continue;
+    const own = lastRandOnLine(lines[i]);
+    if (own != null) return own;
+    for (let j = i + 1; j <= i + 2 && j < lines.length; j++) {
+      if (!INS_AMOUNTS_ONLY_RE.test(lines[j])) break;
+      const v = lastRandOnLine(lines[j]);
+      if (v != null) return v;
+    }
+  }
+  return null;
+}
+
 function parseInsuranceScheduleLines(lines) {
   const items = [];
   let current = null;
@@ -307,9 +336,9 @@ function parseInsuranceScheduleLines(lines) {
     coverSubTotal: null, brokerFee: null, sasriaTotal: null,
     policyTotal: null, totalSumInsured: null,
   };
+  const norm = lines.map((l) => String(l).replace(/\s+/g, " ").trim()).filter(Boolean);
 
-  lines.forEach((raw) => {
-    const line = String(raw).replace(/\s+/g, " ").trim();
+  norm.forEach((line) => {
 
     const m = line.match(INS_ITEM_RE);
     if (m) {
@@ -352,21 +381,67 @@ function parseInsuranceScheduleLines(lines) {
       const si = line.match(/R\s?([\d,]+)(?:\s|$)/);
       if (si) policy.totalSumInsured = parseInsMoney(si[1]);
     }
-    if (/^Cover Sub-Total\b/i.test(line)) { policy.coverSubTotal = lastRandOnLine(line); return; }
-    if (/^Fee Sub-Total\b/i.test(line)) { policy.brokerFee = lastRandOnLine(line); return; }
-    if (/^Sasria Sub-Total\b/i.test(line)) { policy.sasriaTotal = lastRandOnLine(line); return; }
-    if (/^Total Annual Payment\b/i.test(line)) { policy.policyTotal = lastRandOnLine(line); return; }
-    // Fallbacks for the same figures where the sub-total rows don't survive
-    // line reconstruction.
-    if (policy.brokerFee == null && /^Broker Fee\b/i.test(line)) policy.brokerFee = lastRandOnLine(line);
-    if (policy.sasriaTotal == null && /^SASRIA\b/i.test(line)) policy.sasriaTotal = lastRandOnLine(line);
-    if (policy.coverSubTotal == null && /^TOTAL SECTION PREMIUM\b/i.test(line)) policy.coverSubTotal = lastRandOnLine(line);
   });
+
+  // The premium summary is read in its own pass rather than inside the loop.
+  // Doing it inline meant the sub-total branch overwrote whatever the detail
+  // line had already found — including overwriting a good figure with null when
+  // the sub-total row got split across two lines, which is exactly how the
+  // Sasria premium silently went missing. Each figure is now resolved once,
+  // sub-total first and detail line as the fallback, and a null result never
+  // displaces a value that was found.
+  const firstOf = (...candidates) => {
+    for (const v of candidates) if (v != null) return v;
+    return null;
+  };
+  // Everything here is scoped to the premium summary at the front of the
+  // schedule, which ends at "Total Annual Payment". The same words appear
+  // later in the document meaning something else entirely — "SASRIA: Security
+  // Costs …" is a per-item extension, and "SASRIA Commission: R88.85" on the
+  // disclosure pages is the broker's commission ON the Sasria premium, not a
+  // premium. Summing those in overstated Sasria by R88.85.
+  const summaryEnd = norm.findIndex((l) => /Total Annual Payment/i.test(l));
+  const summary = summaryEnd === -1 ? norm : norm.slice(0, summaryEnd + 1);
+
+  // Sasria can be itemised over more than one section, so the detail fallback
+  // sums them rather than taking the first. A premium row carries no colon;
+  // both of the impostors above do.
+  const sasriaDetail = summary
+    .filter((l) => /^SASRIA\b/i.test(l) && !/Sub-?Total/i.test(l)
+      && !l.includes(":") && !/commission/i.test(l))
+    .map((l) => lastRandOnLine(l))
+    .filter((v) => v != null);
+
+  policy.coverSubTotal = firstOf(
+    findInsSummaryAmount(summary, /Cover Sub-?Total/i),
+    findInsSummaryAmount(norm, /TOTAL SECTION PREMIUM/i),
+  );
+  policy.brokerFee = firstOf(
+    findInsSummaryAmount(summary, /Fee Sub-?Total/i),
+    findInsSummaryAmount(summary, /^Broker Fee\b/i),
+  );
+  policy.sasriaTotal = firstOf(
+    findInsSummaryAmount(summary, /Sasria Sub-?Total/i),
+    sasriaDetail.length ? round2(sasriaDetail.reduce((s, v) => s + v, 0)) : null,
+  );
+  policy.policyTotal = findInsSummaryAmount(norm, /Total Annual Payment/i);
 
   // Items that aren't a unit are either the geyser cover or common property.
   const geyserItems = items.filter((i) => i.unitNo == null && i.isGeyserItem);
   const commonItems = items.filter((i) => i.unitNo == null && !i.isGeyserItem);
   const sum = (arr, k) => (arr.length ? round2(arr.reduce((s, x) => s + (x[k] || 0), 0)) : 0);
+
+  // A component that failed to parse allocates as R0.00 and every unit is
+  // quietly under-charged for the year. That has happened once (the Sasria
+  // premium), so anything missing is named here and shown in the preview
+  // rather than left to be inferred from a tie-out that may itself be missing.
+  const warnings = [
+    policy.sasriaTotal == null && "Sasria premium",
+    policy.brokerFee == null && "broker fee",
+    policy.coverSubTotal == null && "section premium",
+    policy.policyTotal == null && "total annual payment",
+    !commonItems.length && "common property item",
+  ].filter(Boolean);
 
   return {
     items,
@@ -377,6 +452,7 @@ function parseInsuranceScheduleLines(lines) {
     geyserSumInsured: sum(geyserItems, "sumInsured"),
     commonPropertyPremium: sum(commonItems, "premium"),
     commonPropertySumInsured: sum(commonItems, "sumInsured"),
+    warnings,
     ...policy,
   };
 }
@@ -5914,6 +5990,13 @@ function InsurancePreview({ preview, onApply, onDiscard }) {
         <span>Broker <b className="f-mono">{parsed.brokerFee == null ? "—" : rand(parsed.brokerFee)}</b> ÷ {alloc.rows.length} = <b className="f-mono">{rand(alloc.brokerEach)}</b></span>
       </div>
 
+      {!!parsed.warnings.length && (
+        <div style={{ marginBottom: 12, padding: "9px 12px", borderRadius: 7, background: "#F8E4DA", border: "1px solid #DDA98A", color: "#8A3A1E", fontSize: 12, lineHeight: 1.6 }}>
+          <b>Couldn’t read the {parsed.warnings.join(", ")} off this PDF.</b>{" "}
+          Anything missing allocates as R0.00 and would under-charge every unit for the year — type it into the grid below before saving, or check the premium summary page of the schedule.
+        </div>
+      )}
+
       {!!alloc.missingUnits.length && (
         <div style={{ marginBottom: 12, padding: "9px 12px", borderRadius: 7, background: "#FBF3E9", border: "1px solid #E3C9A8", color: "#8A5A1E", fontSize: 12, lineHeight: 1.6 }}>
           <b>No schedule item found for unit {alloc.missingUnits.join(", ")}.</b> Those rows will be left as they are — check the PDF describes each unit as “Unit N …”.
@@ -5955,7 +6038,14 @@ function InsurancePreview({ preview, onApply, onDiscard }) {
         </table>
       </div>
 
-      {alloc.policyTotal != null && <TieOut allocated={alloc.allocated} policyTotal={alloc.policyTotal} variance={alloc.variance} />}
+      {alloc.policyTotal != null
+        ? <TieOut allocated={alloc.allocated} policyTotal={alloc.policyTotal} variance={alloc.variance} />
+        : (
+          <div style={{ marginTop: 12, padding: "9px 12px", borderRadius: 7, background: "#FBF3E9", border: "1px solid #E3C9A8", color: "#8A5A1E", fontSize: 12, lineHeight: 1.6 }}>
+            <b>No policy total found, so there is nothing to tie the allocation back to.</b>{" "}
+            Allocated <span className="f-mono">{rand(alloc.allocated)}</span> — check it against the “Total Annual Payment” on the schedule and enter it under Policy details.
+          </div>
+        )}
 
       <div style={{ marginTop: 16, display: "flex", gap: 12, flexWrap: "wrap" }}>
         <button style={primaryBtn} onClick={onApply}>Use these figures</button>
