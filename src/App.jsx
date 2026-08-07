@@ -885,6 +885,15 @@ let ACTIVE_PAYMENT_PERIOD = nextPeriod(CURRENT_PERIOD);
 // "2026-06-01" -> "June 2026". Used for every period label in the UI so they
 // track the selected month instead of a hardcoded "June 2026".
 const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+// "2026-08-06" -> "6 August 2026". Module level because the statement screen
+// needs it too; the AGM report builder keeps its own local copy.
+function fmtLongDate(iso) {
+  if (!iso) return "";
+  const [y, m, d] = String(iso).split("-").map(Number);
+  if (!y || !m || !d) return String(iso);
+  return `${d} ${MONTH_NAMES[m - 1] || m} ${y}`;
+}
+
 function periodLabel(period) {
   if (!period) return "";
   const [y, m] = String(period).split("-");
@@ -925,7 +934,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   // Statement inputs (readings, levy, charges, council, remittances) are for the
   // statement `period`; the bank statement + transactions are for the following
   // month (`paymentPeriod`), because that's when this period's levies are paid.
-  const [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats] = await Promise.all([
+  const [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats, ownerChanges] = await Promise.all([
     client.from("water_tariff_bands").select("*"),
     // Electricity: most recent effective_from ≤ this period (top 2 for YoY comparison)
     client.from("electricity_rates").select("*").lte("effective_from", period).order("effective_from", { ascending: false }).limit(2),
@@ -954,8 +963,11 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     // Trustee-managed expense category list (Config module) — the single
     // vocabulary every tagging dropdown and the analytics dashboard use.
     client.from("expense_categories").select("*").order("sort_order").order("name"),
+    // A unit that changed hands this month: its presence is what makes the
+    // statement screen produce two statements instead of one.
+    client.from("ownership_changes").select("*").eq("period", period),
   ]);
-  const failed = [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats].find((r) => r.error);
+  const failed = [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats, ownerChanges].find((r) => r.error);
   if (failed) throw failed.error;
 
   const expenseCategories = (expCats.data || []).map((c) => ({
@@ -1156,8 +1168,26 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     };
   });
 
+  // Keyed by app unit id, like statementOverrides. At most one per unit per
+  // month — the table's unique constraint guarantees it.
+  const ownershipChanges = {};
+  (ownerChanges.data || []).forEach((o) => {
+    const uid = unitByDbId[o.unit_id];
+    if (!uid) return;
+    ownershipChanges[uid] = {
+      id: o.id,
+      changeoverDate: o.changeover_date,
+      waterReading: o.water_reading == null ? null : Number(o.water_reading),
+      electricityReading: o.electricity_reading == null ? null : Number(o.electricity_reading),
+      outgoingOwner: o.outgoing_owner || "",
+      incomingOwner: o.incoming_owner || "",
+      note: o.note || "",
+    };
+  });
+
   const inv = invoice.data[0];
   return {
+    ownershipChanges,
     bankTxns,
     bankStatementMeta,
     manualPayments,
@@ -1718,6 +1748,98 @@ function deriveIndividualWaterBands(bands) {
   return [merged, ...rest.slice(1)];
 }
 
+// ---------- Ownership change: pro-rata split on transfer ----------
+// Turns one unit's statement row into two, for the month a unit changes hands.
+//
+// The two halves obey different rules, and treating them the same is the usual
+// mistake:
+//   * Water and electricity are NOT pro-rated. A reading is taken on the
+//     changeover date, so each owner is billed their ACTUAL consumption —
+//     that is what the reading is for. Pro-rating metered usage by days would
+//     charge a seller for water the buyer ran.
+//   * The fixed levy lines ARE pro-rated, by days of the month.
+//
+// Each levy line is apportioned individually and the incoming owner gets the
+// REMAINDER rather than its own rounded share, so every line — and therefore
+// the total — reconciles to the full month exactly, with no stray cent.
+function splitStatementForChangeover(r, change, waterBands, period) {
+  if (!r || !change || !change.changeoverDate) return null;
+  const [y, m] = String(period).split("-").map(Number);
+  const daysInMonth = new Date(y, m, 0).getDate();
+  // The changeover date is the last day the outgoing owner is liable for,
+  // inclusive: the 6th means they carry 6 of the month's days.
+  const outDays = Number(String(change.changeoverDate).slice(8, 10));
+  if (!(outDays > 0 && outDays < daysInMonth)) return null; // not a mid-month change
+  const inDays = daysInMonth - outDays;
+
+  const wMid = change.waterReading == null ? r.wCurr : Number(change.waterReading);
+  const eMid = change.electricityReading == null ? r.eCurr : Number(change.electricityReading);
+
+  // Same two-rule water calculation the engine uses: the free first tier only
+  // applies above the free-band limit, otherwise the merged individual bands do.
+  const sortedByFrom = [...waterBands].sort((a, b) => a.from - b.from);
+  const individualBands = deriveIndividualWaterBands(waterBands);
+  const freeBandLimit = sortedByFrom[0] && (sortedByFrom[0].rate2025 || 0) === 0 ? (sortedByFrom[0].to || 0) : 0;
+  const waterCostOf = (use) => (use > freeBandLimit
+    ? calcWaterCost(use, waterBands)
+    : calcWaterCost(use, individualBands));
+
+  const half = ({ wPrev, wCurr, ePrev, eCurr, days, levyShare, owner, label, from, to, extras }) => {
+    const wUse = round2(wCurr - wPrev);
+    const eUse = round2(eCurr - ePrev);
+    const waterCost = round2(waterCostOf(wUse));
+    const elecCost = round2(eUse * r.electricityRate);
+    const subTotal = round2(waterCost + elecCost);
+    const vat = round2(subTotal * r.vatRate);
+    const utilitiesDue = round2(subTotal + vat);
+    const levy = round2(Object.values(levyShare).reduce((a, b) => a + b, 0));
+    const additionalTotal = round2((extras || []).reduce((a, e) => a + (e.amount || 0), 0));
+    return {
+      ...r,
+      owner: owner || r.owner,
+      wPrev, wCurr, ePrev, eCurr, wUse, eUse,
+      // A split statement is computed from readings, so a whole-month override
+      // no longer describes it and must not be carried onto either half.
+      waterOverridden: false, elecOverridden: false, overrideNote: "",
+      waterCostComputed: waterCost, elecCostComputed: elecCost,
+      waterCost, elecCost, subTotal, vat, utilitiesDue,
+      levyItems: levyShare, levy,
+      extras: extras || [], additionalTotal,
+      total: round2(levy + utilitiesDue + additionalTotal),
+      proRata: { label, from, to, days, daysInMonth },
+    };
+  };
+
+  const outShare = {};
+  const inShare = {};
+  LEVY_ITEMS.forEach((item) => {
+    const full = round2(r.levyItems[item] || 0);
+    const out = round2(full * outDays / daysInMonth);
+    outShare[item] = out;
+    inShare[item] = round2(full - out); // remainder, so the line always reconciles
+  });
+
+  const iso = (d) => `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  return {
+    daysInMonth, outDays, inDays,
+    outgoing: half({
+      wPrev: r.wPrev, wCurr: wMid, ePrev: r.ePrev, eCurr: eMid,
+      days: outDays, levyShare: outShare, owner: change.outgoingOwner,
+      label: "Outgoing owner", from: iso(1), to: iso(outDays),
+      // Ad-hoc charges stay with the outgoing owner: they were raised against
+      // the unit before the transfer. Move them on Additional charges if one
+      // actually belongs to the incoming owner.
+      extras: r.extras,
+    }),
+    incoming: half({
+      wPrev: wMid, wCurr: r.wCurr, ePrev: eMid, eCurr: r.eCurr,
+      days: inDays, levyShare: inShare, owner: change.incomingOwner,
+      label: "Incoming owner", from: iso(outDays + 1), to: iso(daysInMonth),
+      extras: [],
+    }),
+  };
+}
+
 // ---------- Allocation engine ----------
 // unitsSource ("mock" | "database" | "error") is only used as a memo dependency:
 // when the DB units replace the mock UNITS binding, the source flips and this
@@ -1898,6 +2020,7 @@ export default function App() {
   // Manual overrides of the computed utility due lines, per unit, for the
   // selected period — used to align a past statement to what was physically sent.
   const [statementOverrides, setStatementOverrides] = useState({});
+  const [ownershipChanges, setOwnershipChanges] = useState({});
   const [bankTxns, setBankTxns] = useState(() =>
     BANK_TXNS.map((t) => ({
       ...t,
@@ -2009,6 +2132,7 @@ export default function App() {
         setCouncilInvoice(data.councilInvoice);
         setCouncilInvoiceMissing(!!data.councilInvoiceMissing);
         setStatementOverrides(data.statementOverrides || {});
+        setOwnershipChanges(data.ownershipChanges || {});
         // Reset the statement view for the selected month: show its data if
         // present, otherwise clear last month's so nothing stale lingers.
         if (data.bankTxns) {
@@ -2060,6 +2184,36 @@ export default function App() {
   // Saves (or clears) the manual utility-line overrides for a unit's statement
   // in the selected period. `patch` carries the full desired state: waterDue /
   // electricityDue are numbers to override or null to fall back to computed.
+  // Record or clear a mid-month ownership change. Clearing removes the row,
+  // which puts the month straight back to a single statement.
+  const saveOwnershipChange = async (unitId, patch) => {
+    const client = await ensureSupabaseClient();
+    const dbId = (UNITS.find((u) => u.id === unitId) || {}).dbId;
+    if (!dbId) throw new Error("Unit hasn't loaded from the database yet");
+    if (patch === null) {
+      const { error } = await client.from("ownership_changes")
+        .delete().eq("unit_id", dbId).eq("period", ACTIVE_PERIOD);
+      if (error) throw error;
+      setOwnershipChanges((prev) => {
+        const next = { ...prev }; delete next[unitId]; return next;
+      });
+      return;
+    }
+    const row = {
+      unit_id: dbId, period: ACTIVE_PERIOD,
+      changeover_date: patch.changeoverDate,
+      water_reading: patch.waterReading,
+      electricity_reading: patch.electricityReading,
+      outgoing_owner: patch.outgoingOwner || null,
+      incoming_owner: patch.incomingOwner || null,
+      note: patch.note || null,
+      updated_at: new Date().toISOString(),
+    };
+    const { error } = await client.from("ownership_changes").upsert(row, { onConflict: "unit_id,period" });
+    if (error) throw error;
+    setOwnershipChanges((prev) => ({ ...prev, [unitId]: { ...patch } }));
+  };
+
   const saveStatementOverride = async (unitId, patch) => {
     const clean = {
       waterDue: patch.waterDue == null ? null : Number(patch.waterDue),
@@ -2248,7 +2402,12 @@ export default function App() {
               />
             )}
             {tab === "statement-preview" && (
-              <StatementPreview alloc={alloc} period={selectedPeriod} selectedUnit={selectedUnit} setSelectedUnit={setSelectedUnit} onSaveOverride={saveStatementOverride} />
+              <StatementPreview
+                alloc={alloc} period={selectedPeriod} selectedUnit={selectedUnit} setSelectedUnit={setSelectedUnit}
+                onSaveOverride={saveStatementOverride}
+                ownershipChanges={ownershipChanges} onSaveOwnershipChange={saveOwnershipChange}
+                waterBands={waterBands}
+              />
             )}
             {tab === "tariffs" && (
               <RateSettings
@@ -7055,8 +7214,25 @@ function Reconciliation({
 }
 
 // ---------- Statement preview (paper look) ----------
-function StatementPreview({ alloc, period, selectedUnit, setSelectedUnit, onSaveOverride }) {
+function StatementPreview({
+  alloc, period, selectedUnit, setSelectedUnit, onSaveOverride,
+  ownershipChanges = {}, onSaveOwnershipChange, waterBands = [],
+}) {
   const r = alloc.rows.find((x) => x.id === selectedUnit);
+  const change = ownershipChanges[selectedUnit] || null;
+  const split = useMemo(
+    () => splitStatementForChangeover(r, change, waterBands, period),
+    [r, change, waterBands, period]
+  );
+  // Only one half prints at a time — a statement is a document sent to one
+  // person, and printing both onto one page would send each owner the other's.
+  const [printing, setPrinting] = useState(null); // null | "outgoing" | "incoming"
+  const printHalf = (which) => {
+    setPrinting(which);
+    // Let the class land before the print dialog reads the DOM.
+    setTimeout(() => { printStatement(); setTimeout(() => setPrinting(null), 0); }, 50);
+  };
+
   return (
     <>
       <div className="no-print" style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
@@ -7065,13 +7241,162 @@ function StatementPreview({ alloc, period, selectedUnit, setSelectedUnit, onSave
           {UNITS.map((u) => <option key={u.id} value={u.id}>{u.id} — {u.owner}</option>)}
         </select>
       </div>
-      <StatementPaper r={r} period={period} />
-      <div className="no-print" style={{ marginTop: 16, display: "flex", gap: 10 }}>
-        <button style={primaryBtn}>Send to {r.owner}</button>
-        <button style={secondaryBtn} onClick={printStatement}>Download PDF</button>
-      </div>
-      {onSaveOverride && <StatementAdjustments r={r} period={period} onSaveOverride={onSaveOverride} />}
+
+      {split ? (
+        <>
+          <Card className="no-print" style={{ marginBottom: 16, background: "#F1F5F2", border: "1px solid #D5E2D9" }}>
+            <div style={{ fontSize: 12.5, color: "#2F5D50", lineHeight: 1.7 }}>
+              <b>Unit {selectedUnit.slice(1)} changed hands on {fmtLongDate(change.changeoverDate)}.</b> Two statements for {periodLabel(period)}:
+              the outgoing owner carries {split.outDays} of {split.daysInMonth} days, the incoming owner {split.inDays}.
+              <br />
+              Water and electricity are <b>not</b> pro-rated — each owner is billed the actual consumption either side of the changeover reading.
+              The fixed levy lines are split by days, and each line reconciles to the full month exactly.
+            </div>
+          </Card>
+
+          {[["outgoing", split.outgoing], ["incoming", split.incoming]].map(([key, half]) => (
+            <div key={key} style={{ marginBottom: 28 }} className={printing && printing !== key ? "no-print" : undefined}>
+              <div className="no-print" style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+                <span style={{ fontWeight: 700, fontSize: 14 }}>{half.proRata.label}</span>
+                <span style={{ fontSize: 12.5, color: "#64748B" }}>
+                  {fmtLongDate(half.proRata.from)} – {fmtLongDate(half.proRata.to)} · {half.proRata.days}/{half.proRata.daysInMonth} days
+                  {half.owner ? ` · ${half.owner}` : ""}
+                </span>
+              </div>
+              <StatementPaper r={half} period={period} />
+              <div className="no-print" style={{ marginTop: 12, display: "flex", gap: 10 }}>
+                <button style={secondaryBtn} onClick={() => printHalf(key)}>Download {half.proRata.label.toLowerCase()} PDF</button>
+              </div>
+            </div>
+          ))}
+        </>
+      ) : (
+        <>
+          <StatementPaper r={r} period={period} />
+          <div className="no-print" style={{ marginTop: 16, display: "flex", gap: 10 }}>
+            <button style={primaryBtn}>Send to {r.owner}</button>
+            <button style={secondaryBtn} onClick={printStatement}>Download PDF</button>
+          </div>
+        </>
+      )}
+
+      {onSaveOwnershipChange && (
+        <OwnershipChangeCard
+          r={r} period={period} change={change} split={split} onSave={onSaveOwnershipChange}
+        />
+      )}
+      {onSaveOverride && !split && <StatementAdjustments r={r} period={period} onSaveOverride={onSaveOverride} />}
     </>
+  );
+}
+
+// Records a mid-month transfer for the selected unit and month. Removing the
+// record puts the month straight back to a single statement, so it is safe to
+// experiment with.
+function OwnershipChangeCard({ r, period, change, split, onSave }) {
+  const [date, setDate] = useState(change?.changeoverDate || "");
+  const [water, setWater] = useState(change?.waterReading != null ? String(change.waterReading) : "");
+  const [elec, setElec] = useState(change?.electricityReading != null ? String(change.electricityReading) : "");
+  const [outName, setOutName] = useState(change?.outgoingOwner || "");
+  const [inName, setInName] = useState(change?.incomingOwner || "");
+  const [note, setNote] = useState(change?.note || "");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    setDate(change?.changeoverDate || "");
+    setWater(change?.waterReading != null ? String(change.waterReading) : "");
+    setElec(change?.electricityReading != null ? String(change.electricityReading) : "");
+    setOutName(change?.outgoingOwner || "");
+    setInName(change?.incomingOwner || "");
+    setNote(change?.note || "");
+    setStatus(null); setError(null);
+  }, [r.id, period, change]);
+
+  const num = (v) => {
+    const t = String(v ?? "").trim().replace(/\s/g, "").replace(",", ".");
+    if (t === "") return null;
+    const n = Number(t);
+    return isFinite(n) ? n : null;
+  };
+  const run = async (fn, msg) => {
+    setBusy(true); setStatus(null); setError(null);
+    try { await fn(); setStatus(msg); }
+    catch (err) { console.error("Saving the ownership change failed:", err); setError(err.message || "Save failed — see browser console."); }
+    finally { setBusy(false); }
+  };
+  const save = () => run(() => onSave(r.id, {
+    changeoverDate: date, waterReading: num(water), electricityReading: num(elec),
+    outgoingOwner: outName.trim(), incomingOwner: inName.trim(), note: note.trim(),
+  }), "Saved — the statement above is now split.");
+  const clear = () => run(() => onSave(r.id, null), "Removed — back to one statement for the month.");
+
+  const fieldStyle = { width: 170, padding: "7px 10px", borderRadius: 6, border: "1px solid #D8D0BE", fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 };
+  const labelStyle = { display: "block", fontSize: 11.5, fontWeight: 600, color: "#1B2A38", marginBottom: 4 };
+  const [y, m] = String(period).split("-").map(Number);
+  const monthEnd = `${y}-${String(m).padStart(2, "0")}-${String(new Date(y, m, 0).getDate()).padStart(2, "0")}`;
+
+  return (
+    <Card className="no-print" style={{ marginTop: 20, background: "#FBF8F1", border: "1px solid #E4DCC8" }}>
+      <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Ownership change — Unit {r.id.slice(1)}, {periodLabel(period)}</div>
+      <p style={{ fontSize: 12.5, color: "#64748B", marginBottom: 14 }}>
+        For a unit that transferred mid-month. Enter the date the outgoing owner's liability <b>ends</b> (inclusive) and the meter readings taken that day.
+        The month then produces two statements: metered usage split at the reading, fixed levy lines split by days.
+      </p>
+      <div style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div>
+          <label style={labelStyle}>Changeover date</label>
+          <input type="date" value={date} min={`${y}-${String(m).padStart(2, "0")}-01`} max={monthEnd}
+                 onChange={(e) => { setDate(e.target.value); setStatus(null); }} style={{ ...fieldStyle, fontFamily: "inherit" }} />
+        </div>
+        <div>
+          <label style={labelStyle}>Water reading that day (kL)</label>
+          <input value={water} inputMode="decimal" onChange={(e) => { setWater(e.target.value); setStatus(null); }}
+                 placeholder={`opening ${r.wPrev}`} style={fieldStyle} />
+        </div>
+        <div>
+          <label style={labelStyle}>Electricity reading that day (kWh)</label>
+          <input value={elec} inputMode="decimal" onChange={(e) => { setElec(e.target.value); setStatus(null); }}
+                 placeholder={`opening ${r.ePrev}`} style={fieldStyle} />
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "flex-end", marginTop: 14 }}>
+        <div>
+          <label style={labelStyle}>Outgoing owner</label>
+          <input value={outName} onChange={(e) => { setOutName(e.target.value); setStatus(null); }}
+                 placeholder={r.owner} style={{ ...fieldStyle, fontFamily: "inherit" }} />
+        </div>
+        <div>
+          <label style={labelStyle}>Incoming owner</label>
+          <input value={inName} onChange={(e) => { setInName(e.target.value); setStatus(null); }}
+                 placeholder="new owner" style={{ ...fieldStyle, fontFamily: "inherit" }} />
+        </div>
+        <div style={{ flex: 1, minWidth: 220 }}>
+          <label style={labelStyle}>Note</label>
+          <input value={note} onChange={(e) => { setNote(e.target.value); setStatus(null); }}
+                 placeholder="e.g. transfer registered 6 August 2026"
+                 style={{ ...fieldStyle, width: "100%", fontFamily: "inherit" }} />
+        </div>
+      </div>
+
+      {split && (
+        <div className="f-mono" style={{ marginTop: 14, fontSize: 12, color: "#2F5D50", lineHeight: 1.7 }}>
+          Outgoing {split.outDays}/{split.daysInMonth} days · levy {rand(split.outgoing.levy)} · utilities {rand(split.outgoing.utilitiesDue)} · total <b>{rand(split.outgoing.total)}</b>
+          <br />
+          Incoming {split.inDays}/{split.daysInMonth} days · levy {rand(split.incoming.levy)} · utilities {rand(split.incoming.utilitiesDue)} · total <b>{rand(split.incoming.total)}</b>
+          <br />
+          Levy halves sum to {rand(round2(split.outgoing.levy + split.incoming.levy))} against a full month of {rand(r.levy)}.
+        </div>
+      )}
+
+      <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <button style={primaryBtn} onClick={save} disabled={busy || !date}>{busy ? "Saving…" : "Save ownership change"}</button>
+        {change && <button style={secondaryBtn} onClick={clear} disabled={busy}>Remove</button>}
+        {status && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>{status}</span>}
+        {error && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{error}</span>}
+      </div>
+    </Card>
   );
 }
 

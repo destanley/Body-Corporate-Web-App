@@ -159,6 +159,37 @@ An expenditure line has **three** sources — operating expenses, bank debits, a
 
 > **Worth auditing:** any other figure derived from a single source. The three-source rule applies to every expenditure line, and Blockwatch was the one place it was forgotten.
 
+### Ownership changes: pro-rata statements when a unit transfers mid-month
+Unit 4 sold with transfer on 6 August 2026 and both owners needed an August statement. The app could only ever hold **one statement per unit per period**, so the split had no home.
+
+**Two rules, and conflating them is the mistake to avoid:**
+- **Metered water and electricity are NOT pro-rated.** A reading is taken on the changeover date and each owner is billed their actual consumption. Pro-rating metered usage by days would charge a seller for water the buyer ran.
+- **The fixed levy lines ARE pro-rated**, by days of the month.
+
+**New table `ownership_changes`** (migration `ownership_changes.sql`, applied): one row per unit per statement month — changeover date, the readings taken that day, optional owner names and a note. `changeover_date` is the last day the **outgoing** owner is liable for, *inclusive*: 2026-08-06 means 6 days out of 31. **The row's existence is what makes the statement screen render two statements instead of one**, so removing it puts the month straight back to normal — safe to experiment with.
+
+**`splitStatementForChangeover`** builds two statement rows from one. Each levy line is apportioned individually and **the incoming owner receives the remainder rather than its own rounded share**, so every line — and therefore the total — reconciles to the full month exactly. The water calculation reuses the engine's two-rule logic (free first tier above the free-band limit, merged individual bands below it) rather than a second copy that could drift. A whole-month `statement_overrides` entry is deliberately **not** carried onto either half — it describes a month that is no longer being billed as one — and the override card is hidden while a month is split.
+
+**On the statement screen:** a capture card under the preview, and when a change exists the page renders both statements, each headed with its date range, day count and owner. **Each half prints on its own** — printing both to one page would send each owner the other's statement.
+
+**Unit 4, August 2026 — outgoing owner, 1–6 Aug (6/31 days):**
+
+| Line | | |
+|---|---|---|
+| Water | 0.44 kL (5164.56 → 5165) | R14.77 |
+| Electricity | 19.3 kWh (134744.00 → 134763.3) | R54.23 |
+| VAT @ 15% | | R10.35 |
+| Levy — 6/31 | | R348.83 |
+| **Total** | | **R428.18** |
+
+Incoming owner takes **R1,453.43** of levy plus consumption measured from 5165 / 134763.3 against the 31 August reading.
+
+> The levy share is **R348.83, not the R348.82** quoted in conversation before the code existed. Apportioning the R1,802.26 total once gives 348.82; apportioning each of the nine lines and summing gives 348.83. **Per line is correct** — it is what makes every individual line reconcile — so the total is R428.18.
+
+**Verified:** all nine levy lines reconcile to the full month exactly, water and electricity consumption sum back to the full month's, and the outgoing figures match the hand calculation.
+
+> **Ad-hoc charges stay with the outgoing owner**, on the reasoning that they were raised against the unit before transfer. Unit 4 had none in August so nothing was at stake, but a charge that actually belongs to the incoming owner has to be moved on the Additional charges page. Worth revisiting if that turns out to be the common case.
+
 ### Electricity service and network charges reported R 0,00 — two causes
 Reported as R 0,00 for FY 2026/2027 despite the August 2026 council bill being uploaded. `council_invoices` had it correctly (service **R304.12**, network **R1,227.18**); the report was reading somewhere else entirely.
 
