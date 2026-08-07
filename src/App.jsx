@@ -420,11 +420,41 @@ function parseInsuranceScheduleLines(lines) {
     findInsSummaryAmount(summary, /Fee Sub-?Total/i),
     findInsSummaryAmount(summary, /^Broker Fee\b/i),
   );
-  policy.sasriaTotal = firstOf(
-    findInsSummaryAmount(summary, /Sasria Sub-?Total/i),
-    sasriaDetail.length ? round2(sasriaDetail.reduce((s, v) => s + v, 0)) : null,
-  );
   policy.policyTotal = findInsSummaryAmount(norm, /Total Annual Payment/i);
+
+  // Sasria is read from the detail rows FIRST, not from its sub-total row.
+  //
+  // pdf.js reconstructs that row as three separate lines, with the annual
+  // amount orphaned ABOVE its own label:
+  //     "SASRIA Fire - Domestic R740.44"
+  //     "R740.44"                  <- the sub-total's annual premium column
+  //     "Sasria Sub-Total R0.00"   <- label plus the pro-rata column only
+  // Reading the label row therefore returns a confident, wrong R0.00 rather
+  // than a null — which is exactly how the Sasria premium went missing with no
+  // warning to show for it. The detail rows carry one unambiguous amount each.
+  const sasriaFromDetail = sasriaDetail.length
+    ? round2(sasriaDetail.reduce((s, v) => s + v, 0)) : null;
+  const sasriaFromSubTotal = findInsSummaryAmount(summary, /Sasria Sub-?Total/i);
+
+  // The summary is: section premium + fees + Sasria = total annual payment. So
+  // Sasria can be derived from the other three, and that residual is what every
+  // other route gets measured against — an allocation that doesn't tie to the
+  // total the body corporate actually pays is wrong by definition.
+  const sasriaResidual =
+    (policy.policyTotal != null && policy.coverSubTotal != null && policy.brokerFee != null)
+      ? round2(policy.policyTotal - policy.coverSubTotal - policy.brokerFee)
+      : null;
+
+  policy.sasriaTotal = firstOf(sasriaFromDetail, sasriaResidual, sasriaFromSubTotal);
+
+  // Where what was read off the page disagrees with what the policy total
+  // implies, the policy total wins and the disagreement is recorded. A silent
+  // preference either way is how this went wrong the first time.
+  if (sasriaResidual != null && policy.sasriaTotal != null
+      && Math.abs(policy.sasriaTotal - sasriaResidual) > 0.01) {
+    policy.sasriaNote = `Read a Sasria premium of R${policy.sasriaTotal.toFixed(2)} off the schedule, but the policy total implies R${sasriaResidual.toFixed(2)}. Used the policy total — check the Sasria rows on the premium summary.`;
+    policy.sasriaTotal = sasriaResidual;
+  }
 
   // Items that aren't a unit are either the geyser cover or common property.
   const geyserItems = items.filter((i) => i.unitNo == null && i.isGeyserItem);
@@ -443,6 +473,26 @@ function parseInsuranceScheduleLines(lines) {
     !commonItems.length && "common property item",
   ].filter(Boolean);
 
+  // The summary must add up: section premium + fees + Sasria = total annual
+  // payment. Checking it here catches a component that parsed to a plausible
+  // but wrong number — which a null-check cannot, and which is the failure
+  // mode that actually occurred.
+  const notes = [];
+  if (policy.sasriaNote) notes.push(policy.sasriaNote);
+  if (policy.policyTotal != null && policy.coverSubTotal != null
+      && policy.brokerFee != null && policy.sasriaTotal != null) {
+    const parts = round2(policy.coverSubTotal + policy.brokerFee + policy.sasriaTotal);
+    if (Math.abs(parts - policy.policyTotal) > 0.01) {
+      warnings.push(`premium summary that doesn't add up (section ${rand(policy.coverSubTotal)} + broker ${rand(policy.brokerFee)} + Sasria ${rand(policy.sasriaTotal)} = ${rand(parts)}, but the total annual payment reads ${rand(policy.policyTotal)})`);
+    }
+  }
+  // The section premium should equal the sum of the items beneath it.
+  const itemSum = round2(items.reduce((s, i) => s + (i.premium || 0), 0));
+  if (policy.coverSubTotal != null && items.length
+      && Math.abs(itemSum - policy.coverSubTotal) > 0.01) {
+    warnings.push(`${items.length} items totalling ${rand(itemSum)} against a section premium of ${rand(policy.coverSubTotal)} — an item was missed or double-counted`);
+  }
+
   return {
     items,
     unitItems: items.filter((i) => i.unitNo != null).sort((a, b) => a.unitNo - b.unitNo),
@@ -453,6 +503,7 @@ function parseInsuranceScheduleLines(lines) {
     commonPropertyPremium: sum(commonItems, "premium"),
     commonPropertySumInsured: sum(commonItems, "sumInsured"),
     warnings,
+    notes,
     ...policy,
   };
 }
@@ -5994,6 +6045,12 @@ function InsurancePreview({ preview, onApply, onDiscard }) {
         <div style={{ marginBottom: 12, padding: "9px 12px", borderRadius: 7, background: "#F8E4DA", border: "1px solid #DDA98A", color: "#8A3A1E", fontSize: 12, lineHeight: 1.6 }}>
           <b>Couldn’t read the {parsed.warnings.join(", ")} off this PDF.</b>{" "}
           Anything missing allocates as R0.00 and would under-charge every unit for the year — type it into the grid below before saving, or check the premium summary page of the schedule.
+        </div>
+      )}
+
+      {!!parsed.notes.length && (
+        <div style={{ marginBottom: 12, padding: "9px 12px", borderRadius: 7, background: "#F4F1E9", border: "1px solid #D8D0BE", color: "#5A6672", fontSize: 12, lineHeight: 1.6 }}>
+          {parsed.notes.map((n, i) => <div key={i}>{n}</div>)}
         </div>
       )}
 

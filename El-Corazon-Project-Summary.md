@@ -117,22 +117,43 @@ Additive. Four columns on `agm_report_settings` (already one row per FY, which i
 ### Section numbering
 The trustee's template calls the insurance schedule section 4; the generator prints it as **5** because maintenance expenses was inserted at 4 in session 3. Confirmed 7 August 2026 to **leave the code as the source of truth** — page and report both say 5.
 
-### Sasria parsing bug — found on first real run, fixed same session
-The first import allocated **R0.00 Sasria**. Two causes, both worth remembering:
+### Sasria parsing bug — two rounds to fix, and the lesson is the testing
+The first import allocated **R0.00 Sasria**. The first fix didn't work either, and *why* is the part worth keeping.
 
-1. **A null overwrote a good value.** The premium summary was read inside the main line loop, and the `Sasria Sub-Total` branch assigned unconditionally. pdf.js rebuilds a table row by grouping text on a *rounded* y-position, and the summary's labels are right-aligned in a middle column — so "Sasria Sub-Total" and its "R0.00 R740.44" can sit a pixel apart and land on **two separate lines**. The label line then parsed to null and wiped the R740.44 the detail row had already found. **The summary is now read in its own pass, sub-total first and detail line as fallback, and a null never displaces a value that was found.**
-2. **The detail fallback was matching the wrong lines.** `/^SASRIA/` also hits the per-item extension `SASRIA: Security Costs …` and, on the disclosure pages, **`SASRIA Commission: R88.85`** — the broker's commission *on* the Sasria premium, not a premium. Summing those overstated Sasria by R88.85. The fallback is now scoped to the premium summary (everything up to "Total Annual Payment") and skips lines carrying a colon.
+**Round 1 (wrong diagnosis).** I tested the parser against `pdfplumber`'s text extraction, not pdf.js. They reconstruct lines differently, so my tests passed while the browser failed. Two real bugs were found and fixed — a null overwriting a good value, and `SASRIA Commission: R88.85` on the disclosure pages being summed in as a premium — but neither was *the* bug.
 
-`findInsSummaryAmount` looks for a label's amount on its own line first, then on the next couple of lines — but only if those carry amounts and nothing else, so a label can never absorb an unrelated figure.
+**Round 2 (actual cause).** Running the app's own `extractPdfLines` over the real pdf.js output shows the Sasria sub-total row reconstructs as **three lines, with the annual amount orphaned ABOVE its own label**:
 
-**Silent zeros are now loud.** A component that fails to parse would allocate R0.00 and under-charge every unit for the year. `parsed.warnings` names anything missing and the preview shows it in red above the table; if the policy total itself is missing there is no tie-out to catch it, so that case gets its own notice too.
+```
+"SASRIA Fire - Domestic R740.44"
+"R740.44"                   <- the sub-total's annual premium column
+"Sasria Sub-Total R0.00"    <- label plus the pro-rata column only
+```
+
+So the label row parses to a **confident, wrong R0.00** — not a null. Every null-guard added in round 1 was therefore useless, and no warning fired. Everything else (all 9 items, geyser flags, broker, cover, policy total, policy number, insurer) parsed correctly off the real output; Sasria was the only casualty.
+
+**The fix, in priority order:** Sasria detail rows (one unambiguous amount each) → **the residual `policy total − section premium − broker fee`** → the sub-total row last. Where what was read off the page disagrees with what the policy total implies, **the policy total wins and the disagreement is shown as a note.** The summary is arithmetic — section premium + fees + Sasria = total annual payment — so the residual is the authority, and an allocation that doesn't tie to what the body corporate actually pays is wrong by definition.
+
+**Two invariants now checked on every import**, because a null-check cannot catch a plausible-but-wrong number:
+- section premium + broker + Sasria **=** total annual payment
+- the sum of the individual items **=** the section premium
+
+Either failing puts a red block above the preview naming the problem in rands.
+
+### Lesson: test the parser against pdf.js, not a stand-in
+`pdfplumber` (or any other extractor) is **not** a valid proxy for `extractPdfLines`. pdf.js groups text on a *rounded* y-position, so a table row splits in ways no other tool reproduces — and right-aligned columns can land on a line *before* their label. To test parser changes properly:
+
+```
+npm i pdfjs-dist@3.11.174        # matches the CDN version the app loads
+```
+then run the app's `extractPdfLines` verbatim over the PDF and feed those lines to the parser. Anything else gives false confidence, as it did here.
 
 ### Regression tests for the parser
-Six line-reconstruction shapes, all passing, run against the real `2026 Renewal.pdf` text: joined rows · sub-total rows split label/amounts · split *and* the Sasria detail line blank · no Sasria sub-total row (detail fallback) · **no Sasria anywhere (must warn, not silently zero)** · no Fee sub-total (Broker Fee fallback). Worth re-running against next year's schedule before trusting it — the harness is in the session transcript, not the repo.
+Seven cases, all passing, run against **the real pdf.js reconstruction** of `2026 Renewal.pdf`: real pdf.js output (the case that actually failed) · pdfplumber output · no Sasria detail rows (residual) · no Sasria rows at all (residual) · sub-total row intact · **detail row deliberately wrong — policy total must win and a note must appear** · no policy total *and* no detail (genuinely unknown — must warn, not silently zero). Worth re-running against next year's schedule before trusting it; the harness is in the session transcript, not the repo.
 
 ### Verified
 - `esbuild` bundle clean (the Windows-built `rollup` native binary can't run under WSL/Linux — use esbuild to syntax-check there, or `npm run build` on Windows).
-- Parser run against the real `2026 Renewal.pdf`: all 9 items, all three policy-level figures (section premium R23,390.81, Sasria R740.44, broker R233.91), policy total R24,365.16, policy number, insurer, cover start and total sum insured extracted correctly.
+- Parser run against the **real pdf.js output** of `2026 Renewal.pdf`: all 9 items, all three policy-level figures (section premium R23,390.81, Sasria R740.44, broker R233.91), policy total R24,365.16, policy number, insurer, cover start and total sum insured extracted correctly. Sasria allocates R105.78/unit and the schedule ties out at +R0.03.
 - Derived premiums match the FY 2025/2026 seed exactly: 2206.95 / 4180.62 / 2932.57 / 3470.40 / 3325.81 / 3835.61 / 2967.17.
 - No stale references left in `AgmReportSettings` after the grid was removed.
 - **Not yet run against the live database, and the migration has not been applied.**
