@@ -159,6 +159,18 @@ An expenditure line has **three** sources — operating expenses, bank debits, a
 
 > **Worth auditing:** any other figure derived from a single source. The three-source rule applies to every expenditure line, and Blockwatch was the one place it was forgotten.
 
+### Common property standards made editable and FY-scoped
+The **water** standard was a hard-coded `COMMON_PROPERTY_WATER_KL = 20` used in seven places, labelled on screen as *"fixed, not configurable"*. `levy_rates.common_property_water_kl` already existed, with a default of 20 — **the column was dead**: nothing read it or wrote it except the AGM report and the usage-trend chart, both of which fell back to the constant. Changing the standard meant a code change and a deploy.
+
+- **Both standards now read and write `levy_rates`, keyed by financial year.** The constant is renamed `COMMON_PROPERTY_WATER_KL_DEFAULT` and is only the fallback used before the table loads or if the fetch fails — matching how `COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT` already worked.
+- **The water standard is now an editable input** on Tariffs & rates, beside the electricity one. The value threads through `computeSuggestedLevyItems`, `useAllocation` and the dashboard's over-allocation verdicts exactly as the electricity standard already did, so nothing reads a different number from anything else.
+- **The financial year is on screen.** The card names the FY it is editing and states that it follows the period selector in the top bar. There is no separate FY dropdown, deliberately: the rest of that page (water bands, electricity rate) is **date**-scoped via `effective_from`, and two different time controls on one screen is how they get confused. Editing in July 2026 edits FY 2025/2026; switch the period to August 2026 and you are editing FY 2026/2027.
+- **A year with no row carries forward and says so**, in the same amber notice the levy grid uses — last year's figures as a starting point, nothing saved against the new year, last year untouched. Saving writes a fresh row.
+
+**Verified:** esbuild clean; no bare-constant references left; the exact `INSERT` the app performs for a not-yet-set-up FY was dry-run against the live table (satisfies the `NOT NULL` columns) and the test row removed. `levy_rates` still holds exactly one row, FY 2025/2026, 20 kL / 300 kWh.
+
+> **Pre-existing wart, unchanged but now easier to hit:** saving standards for a financial year that has no row inserts `water_demand_levy`, `electricity_service_fee` and `electricity_network_fee` as **0**, so section 8's "New — FY" column prints R 0,00 for those rather than staying blank. It behaved this way before (the electricity standard already created the row); setting the water standard for a new year just makes it more likely. Worth making those columns nullable so an uncaptured figure reads as blank.
+
 ### Source audit of the whole report (prompted by the Blockwatch bug)
 Every figure in the report was traced to the tables it reads. **Sections 1, 2, 3, 4 and 7 were already correct** (all three sources); 5, 10 and the tariff bands are single-source by design. Three further problems found, all now fixed.
 

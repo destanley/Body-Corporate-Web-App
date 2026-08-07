@@ -1171,10 +1171,22 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     electricityRate: elec.data[0] ? Number(elec.data[0].rate_per_kwh) : ELECTRICITY_RATE_DEFAULT,
     electricityEffectiveFrom: elec.data[0]?.effective_from || null,
     vatRate: vat.data[0] ? Number(vat.data[0].rate) : VAT_RATE_DEFAULT,
+    // The common-property standards are set annually at the AGM and stored per
+    // financial year. A year with no row yet shows last year's figures as a
+    // starting point and says so, exactly as the levy grid does — saving then
+    // writes a fresh row for the new year and leaves the old one untouched.
     levyRates: (() => {
-      const row = (levy.data || []).find((r) => r.financial_year === FY_ACTIVE)
-        || (levy.data || []).find((r) => r.financial_year === FY_PREVIOUS);
-      return row ? { commonPropertyElectricityKwh: Number(row.common_property_electricity_kwh) } : null;
+      const own = (levy.data || []).find((r) => r.financial_year === FY_ACTIVE);
+      const row = own || (levy.data || []).find((r) => r.financial_year === FY_PREVIOUS);
+      if (!row) return null;
+      const n = (v, fallback) => (v == null ? fallback : Number(v));
+      return {
+        commonPropertyElectricityKwh: n(row.common_property_electricity_kwh, COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT),
+        commonPropertyWaterKl: n(row.common_property_water_kl, COMMON_PROPERTY_WATER_KL_DEFAULT),
+        financialYear: FY_ACTIVE,
+        carriedForward: !own,
+        carriedFromFY: own ? null : row.financial_year,
+      };
     })(),
     levyBreakdown,
     levyFinancialYear: FY_ACTIVE,
@@ -1224,7 +1236,7 @@ async function saveReadingsToDb(readings) {
   if (error) throw error;
 }
 
-async function saveTariffsToDb({ waterSets, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh }) {
+async function saveTariffsToDb({ waterSets, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh, commonPropertyWaterKl }) {
   const client = await ensureSupabaseClient();
   const updates = [];
   // Water: one or more rate sets, each keyed by its own effective date. Upsert
@@ -1256,11 +1268,13 @@ async function saveTariffsToDb({ waterSets, electricityRate, electricityEffectiv
   if (existingLevy.data?.length > 0) {
     updates.push(client.from("levy_rates").update({
       common_property_electricity_kwh: commonPropertyElectricityKwh,
+      common_property_water_kl: commonPropertyWaterKl,
     }).eq("financial_year", FY_ACTIVE));
   } else {
     updates.push(client.from("levy_rates").insert({
       financial_year: FY_ACTIVE,
       common_property_electricity_kwh: commonPropertyElectricityKwh,
+      common_property_water_kl: commonPropertyWaterKl,
       water_demand_levy: 0, electricity_service_fee: 0, electricity_network_fee: 0,
     }));
   }
@@ -1292,13 +1306,13 @@ async function saveLevyBreakdownToDb(levyBreakdown) {
 // LevySetup loads separately and applies per unit. These drive the suggestions
 // strip and the "fill grid" action on the Levy breakdown page; the grid itself
 // stays fully editable.
-function computeSuggestedLevyItems({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, councilInvoice }) {
+function computeSuggestedLevyItems({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, commonPropertyWaterKl, councilInvoice }) {
   const withVat = (n) => n * (1 + vatRate);
   return {
     "Insurance": null,
     "Blockwatch": 0,
     "Garden Service": 0,
-    "Common Property Water": withVat(calcWaterCost(COMMON_PROPERTY_WATER_KL, waterBands)) / UNITS.length,
+    "Common Property Water": withVat(calcWaterCost(commonPropertyWaterKl, waterBands)) / UNITS.length,
     "Water Demand Levy": withVat(councilInvoice.waterDemandLevyPerUnit || 0),
     "Sewerage": withVat(councilInvoice.sewerChargePerUnit || 0),
     "Common Property Electricity": withVat(commonPropertyElectricityKwh * electricityRate) / UNITS.length,
@@ -1607,12 +1621,13 @@ const VAT_RATE_DEFAULT = 0.15; // charged on metered water & electricity only
 // are captured from the uploaded utility bills (stored per period on the
 // council invoice — see COUNCIL_INVOICE fields above), not configured here.
 
-// Common property (body corp) water — fixed 20kL/month standard, confirmed by the
-// trustee. Billed using the real, unmodified municipal tariff scale (i.e. still
-// including the free first 6kL) since that's genuinely how the municipality bills
-// bulk water — unlike individual units, which don't get that free tier (see
-// deriveIndividualWaterBands below). Not trustee-configurable for now.
-const COMMON_PROPERTY_WATER_KL = 20;
+// Common property (body corp) water — the monthly kL standard. Billed using the
+// real, unmodified municipal tariff scale (i.e. still including the free first
+// 6kL) since that's genuinely how the municipality bills bulk water — unlike
+// individual units, which don't get that free tier (see deriveIndividualWaterBands
+// below). Trustee-configurable per financial year under Tariffs & rates; this is
+// only the fallback used before levy_rates loads, or if the fetch fails.
+const COMMON_PROPERTY_WATER_KL_DEFAULT = 20;
 
 // Common property (body corp) electricity — standard kWh/month assumption, billed
 // at the flat electricity rate. Trustee-configurable under Tariffs & rates.
@@ -1680,7 +1695,7 @@ function deriveIndividualWaterBands(bands) {
 // unitsSource ("mock" | "database" | "error") is only used as a memo dependency:
 // when the DB units replace the mock UNITS binding, the source flips and this
 // recomputes against the fresh rows — nothing inside reads the value itself.
-function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges, commonPropertyElectricityKwh, unitsSource, readings, councilInvoice, statementOverrides = {}) {
+function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges, commonPropertyElectricityKwh, commonPropertyWaterKl, unitsSource, readings, councilInvoice, statementOverrides = {}) {
   return useMemo(() => {
     const totalW = round2(Object.values(readings).reduce((s, r) => s + (r.wCurr - r.wPrev), 0));
     const totalE = round2(Object.values(readings).reduce((s, r) => s + (r.eCurr - r.ePrev), 0));
@@ -1709,7 +1724,7 @@ function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, addi
     // scale) and a configurable kWh of electricity (flat rate), split equally across
     // all 7 units — these are what actually feed the AGM levy lines now, replacing
     // manual entry.
-    const commonPropertyWaterCost = calcWaterCost(COMMON_PROPERTY_WATER_KL, waterBands);
+    const commonPropertyWaterCost = calcWaterCost(commonPropertyWaterKl, waterBands);
     const commonPropertyElecCost = commonPropertyElectricityKwh * electricityRate;
     const commonPropertyWaterPerUnit = commonPropertyWaterCost / UNITS.length;
     const commonPropertyElecPerUnit = commonPropertyElecCost / UNITS.length;
@@ -1762,10 +1777,11 @@ function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, addi
       commonWaterCostTotal, commonElecCostTotal,
       commonPropertyWaterCost, commonPropertyElecCost, commonPropertyWaterPerUnit, commonPropertyElecPerUnit,
       commonPropertyElectricityKwh,
+      commonPropertyWaterKl,
       tariffWaterTotal, tariffElecTotal,
       councilInvoice,
     };
-  }, [waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges, commonPropertyElectricityKwh, unitsSource, readings, councilInvoice, statementOverrides]);
+  }, [waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges, commonPropertyElectricityKwh, commonPropertyWaterKl, unitsSource, readings, councilInvoice, statementOverrides]);
 }
 
 const rand = (n) => `R ${n.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -1838,6 +1854,10 @@ export default function App() {
   const [levyMeta, setLevyMeta] = useState({ financialYear: FY_ACTIVE, carriedForward: false, carriedFromFY: null });
   const [vatRate, setVatRate] = useState(VAT_RATE_DEFAULT);
   const [commonPropertyElectricityKwh, setCommonPropertyElectricityKwh] = useState(COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT);
+  const [commonPropertyWaterKl, setCommonPropertyWaterKl] = useState(COMMON_PROPERTY_WATER_KL_DEFAULT);
+  // Which FY the two standards above belong to, and whether they were carried
+  // forward from the year before because this one has no row yet.
+  const [standardsMeta, setStandardsMeta] = useState({ financialYear: null, carriedForward: false, carriedFromFY: null });
   const [additionalCharges, setAdditionalCharges] = useState(ADDITIONAL_CHARGES_DEFAULT);
   const [remittanceDeductions, setRemittanceDeductions] = useState({});
   const [remittanceAdvices, setRemittanceAdvices] = useState({});
@@ -1942,6 +1962,12 @@ export default function App() {
         setVatRate(data.vatRate);
         if (data.levyRates) {
           setCommonPropertyElectricityKwh(data.levyRates.commonPropertyElectricityKwh);
+          setCommonPropertyWaterKl(data.levyRates.commonPropertyWaterKl);
+          setStandardsMeta({
+            financialYear: data.levyRates.financialYear,
+            carriedForward: Boolean(data.levyRates.carriedForward),
+            carriedFromFY: data.levyRates.carriedFromFY || null,
+          });
         }
         setLevyBreakdown(data.levyBreakdown);
         setLevyMeta({
@@ -2103,7 +2129,7 @@ export default function App() {
 
   const alloc = useAllocation(
     waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges,
-    commonPropertyElectricityKwh, unitsSource, readings, councilInvoice, statementOverrides
+    commonPropertyElectricityKwh, commonPropertyWaterKl, unitsSource, readings, councilInvoice, statementOverrides
   );
 
   // Resident capability-URL mode takes precedence over the trustee login —
@@ -2207,6 +2233,9 @@ export default function App() {
                 vatRate={vatRate} setVatRate={setVatRate}
                 commonPropertyElectricityKwh={commonPropertyElectricityKwh}
                 setCommonPropertyElectricityKwh={setCommonPropertyElectricityKwh}
+                commonPropertyWaterKl={commonPropertyWaterKl}
+                setCommonPropertyWaterKl={setCommonPropertyWaterKl}
+                standardsMeta={standardsMeta}
               />
             )}
             {tab === "rate-history" && <RateHistory />}
@@ -2216,6 +2245,7 @@ export default function App() {
                 levyMeta={levyMeta} onSaved={() => setDataVersion((v) => v + 1)}
                 waterBands={waterBands} electricityRate={electricityRate} vatRate={vatRate}
                 commonPropertyElectricityKwh={commonPropertyElectricityKwh}
+                commonPropertyWaterKl={commonPropertyWaterKl}
                 councilInvoice={councilInvoice}
               />
             )}
@@ -2806,7 +2836,7 @@ function UtilityBills({ councilInvoice, setCouncilInvoice, alloc, period = CURRE
   // standards used for the Common Property levy lines.
   const waterGap = alloc.commonWater;
   const elecGap = alloc.commonElec;
-  const waterDiff = round2(COMMON_PROPERTY_WATER_KL - waterGap);
+  const waterDiff = round2(alloc.commonPropertyWaterKl - waterGap);
   const elecDiff = round2(alloc.commonPropertyElectricityKwh - elecGap);
   const verdict = (diff, unit, provision, actual) =>
     Math.abs(diff) < 0.005
@@ -2867,7 +2897,7 @@ function UtilityBills({ councilInvoice, setCouncilInvoice, alloc, period = CURRE
           <><br />Waiting on this month's council bills — the check needs real bulk figures.</>
         ) : (
           <>
-            <br />Water — {verdict(waterDiff, "kL", COMMON_PROPERTY_WATER_KL, waterGap)}
+            <br />Water — {verdict(waterDiff, "kL", alloc.commonPropertyWaterKl, waterGap)}
             <br />Electricity — {verdict(elecDiff, "kWh", alloc.commonPropertyElectricityKwh, elecGap)}
           </>
         )}
@@ -2903,7 +2933,7 @@ function Allocation({ alloc, billMissing = false }) {
           <div style={{ fontSize: 12, color: "#94A0AC", marginTop: 4 }}>{ci.bulkWaterKl} kL · metered sum {alloc.totalW.toFixed(2)} kL{billMissing ? "" : ` · common ${alloc.commonWater.toFixed(2)} kL`}</div>
           {!billMissing && (
             <div style={{ fontSize: 11.5, marginTop: 6, color: "#64748B" }}>
-              Actual metered common-area gap valued at {rand(alloc.commonWaterCostTotal)}, vs. the suggested "Common Property Water" figure from the fixed {COMMON_PROPERTY_WATER_KL}kL standard: {rand(alloc.commonPropertyWaterCost)} total ({rand(alloc.commonPropertyWaterPerUnit)}/unit) — a reference for the manual levy grid, not billed automatically.
+              Actual metered common-area gap valued at {rand(alloc.commonWaterCostTotal)}, vs. the suggested "Common Property Water" figure from the configurable {alloc.commonPropertyWaterKl}kL standard: {rand(alloc.commonPropertyWaterCost)} total ({rand(alloc.commonPropertyWaterPerUnit)}/unit) — a reference for the manual levy grid, not billed automatically.
             </div>
           )}
         </Card>
@@ -2923,10 +2953,10 @@ function Allocation({ alloc, billMissing = false }) {
 }
 
 // ---------- Levy breakdown setup (set annually at the AGM) ----------
-function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, councilInvoice }) {
+function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, commonPropertyWaterKl, councilInvoice }) {
   // VAT-inclusive suggested values from the confirmed rules (bill figures +
   // rates). They pre-fill via the button below but every cell stays editable.
-  const suggestions = computeSuggestedLevyItems({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, councilInvoice });
+  const suggestions = computeSuggestedLevyItems({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, commonPropertyWaterKl, councilInvoice });
 
   // Insurance is the one line that differs per unit, so it is loaded from that
   // unit's own row on the insurance schedule rather than from the flat
@@ -3434,6 +3464,8 @@ function RateSettings({
   electricityEffectiveFrom, setElectricityEffectiveFrom,
   vatRate, setVatRate,
   commonPropertyElectricityKwh, setCommonPropertyElectricityKwh,
+  commonPropertyWaterKl, setCommonPropertyWaterKl,
+  standardsMeta = {},
 }) {
   // The water card is a self-contained editor. It deliberately does NOT write
   // into the app-wide `waterBands` state, because that is what the month
@@ -3547,7 +3579,7 @@ function RateSettings({
           effectiveFrom: c.date,
           bands: bandDefs.map((b) => ({ label: b.label, from: b.from, to: b.to, rate: rateFor(c.date, b.label) })),
         }));
-      await saveTariffsToDb({ waterSets, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh });
+      await saveTariffsToDb({ waterSets, electricityRate, electricityEffectiveFrom, vatRate, commonPropertyElectricityKwh, commonPropertyWaterKl });
       setEdits({});
       setAddedDates([]);
       setSaveStatus("saved");
@@ -3737,27 +3769,47 @@ function RateSettings({
       </Card>
 
       <Card style={{ marginTop: 16 }}>
-        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Common property standards</div>
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 4 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5 }}>Common property standards</div>
+          {/* Both standards are set annually at the AGM and stored per financial
+              year, so the year has to be on screen — otherwise there is no way
+              to tell which year's figures are being edited. It follows the
+              period selector in the top bar, like every other FY-scoped screen. */}
+          {standardsMeta.financialYear && (
+            <span style={{ fontSize: 11.5, color: "#64748B" }}>
+              Financial year <b className="f-mono">{standardsMeta.financialYear}</b> — follows the period selected above
+            </span>
+          )}
+        </div>
         <p style={{ fontSize: 12, color: "#94A0AC", marginBottom: 12 }}>
           Water Demand Levy, Sewerage, and the Electricity Service/Network charges now come from the uploaded utility bills — see <b>Invoice allocation</b>. Only the common-property standards live here; they drive the calculated values on the Levy breakdown page.
         </p>
+        {standardsMeta.carriedForward && (
+          <div style={{ marginBottom: 12, padding: "9px 12px", borderRadius: 7, background: "#FBF3E9", border: "1px solid #E3C9A8", color: "#8A5A1E", fontSize: 12, lineHeight: 1.6 }}>
+            <b>FY {standardsMeta.financialYear} hasn’t been set up yet.</b> These are FY {standardsMeta.carriedFromFY}’s standards, shown as a starting point — nothing has been saved against FY {standardsMeta.financialYear}, and FY {standardsMeta.carriedFromFY} stays untouched. Adjust them for this year, then save.
+          </div>
+        )}
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <span style={{ fontSize: 13, width: 220 }}>Common Property Water standard</span>
-            <span className="f-mono" style={{ fontSize: 13, fontWeight: 700 }}>{COMMON_PROPERTY_WATER_KL} kL</span>
-            <span style={{ fontSize: 11.5, color: "#94A0AC" }}>fixed, not configurable — billed on the real tariff scale above, split 7 ways</span>
+            <input
+              type="number" step="1" min="0" value={commonPropertyWaterKl}
+              onChange={(e) => setCommonPropertyWaterKl(parseFloat(e.target.value) || 0)}
+              style={{ ...inputStyle, width: 110, borderColor: "#2F5D50", fontWeight: 700 }}
+            />
+            <span style={{ fontSize: 11.5, color: "#94A0AC" }}>kL / month, billed on the real tariff scale above (free first 6kL included), split 7 ways</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <span style={{ fontSize: 13, width: 220 }}>Common Property Electricity standard</span>
             <input
-              type="number" step="1" value={commonPropertyElectricityKwh}
+              type="number" step="1" min="0" value={commonPropertyElectricityKwh}
               onChange={(e) => setCommonPropertyElectricityKwh(parseFloat(e.target.value) || 0)}
               style={{ ...inputStyle, width: 110, borderColor: "#2F5D50", fontWeight: 700 }}
             />
             <span style={{ fontSize: 11.5, color: "#94A0AC" }}>kWh / month, billed at the flat rate above, split 7 ways</span>
           </div>
           <div style={{ fontSize: 12, color: "#64748B" }} className="f-mono">
-            Common Property Water: {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, currentBandsForCalc))} total · {rand(calcWaterCost(COMMON_PROPERTY_WATER_KL, currentBandsForCalc) / UNITS.length)} per unit
+            Common Property Water: {rand(calcWaterCost(commonPropertyWaterKl, currentBandsForCalc))} total · {rand(calcWaterCost(commonPropertyWaterKl, currentBandsForCalc) / UNITS.length)} per unit
             <br />
             Common Property Electricity: {rand(commonPropertyElectricityKwh * electricityRate)} total · {rand((commonPropertyElectricityKwh * electricityRate) / UNITS.length)} per unit
           </div>
@@ -4987,7 +5039,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
   E.push(H2("Provision, demand levy and sewerage"));
   const c7b = [hrow(["Item", CUR, NEW], ["left", "right", "right"])];
   const cpw = (l) => (l.common_property_water_kl == null ? "" : nb(`${Number(l.common_property_water_kl)} kL`));
-  c7b.push(row(["Common property provision (kL / month)", cpw(levyCurr) || nb(`${COMMON_PROPERTY_WATER_KL} kL`), cpw(levyNext)], ["left", "right", "right"]));
+  c7b.push(row(["Common property provision (kL / month)", cpw(levyCurr) || nb(`${COMMON_PROPERTY_WATER_KL_DEFAULT} kL`), cpw(levyNext)], ["left", "right", "right"]));
   c7b.push(row(["Water Demand Levy (per unit / month) excl VAT",
     money(levyCurr.water_demand_levy != null ? levyCurr.water_demand_levy : demandLevyPerUnit),
     levyNext.water_demand_levy == null ? "" : money(levyNext.water_demand_levy)], ["left", "right", "right"]));
@@ -5231,7 +5283,7 @@ async function fetchUsageTrend(fy) {
   // than dropping the line entirely.
   const lr = (levy.data || [])[0];
   const cpWater = lr && lr.common_property_water_kl != null
-    ? Number(lr.common_property_water_kl) : COMMON_PROPERTY_WATER_KL;
+    ? Number(lr.common_property_water_kl) : COMMON_PROPERTY_WATER_KL_DEFAULT;
   const cpElec = lr && lr.common_property_electricity_kwh != null
     ? Number(lr.common_property_electricity_kwh) : COMMON_PROPERTY_ELECTRICITY_KWH_DEFAULT;
 
