@@ -3864,11 +3864,15 @@ function Analytics({ expenseCategories }) {
   const generateAgmReport = async () => {
     setAgmStatus("working");
     try {
-      const [prevReport, extras] = await Promise.all([
+      // Usage is fetched here rather than read off the rendered charts so the
+      // report doesn't depend on the trends card having finished loading, and
+      // a failure there costs the section rather than the whole document.
+      const [prevReport, extras, usage] = await Promise.all([
         loadFyReport(previousFY(fy), expenseCategories).catch(() => null),
         fetchAgmExtras(fy),
+        fetchUsageTrend(fy).catch((err) => { console.warn("Loading usage for the AGM report failed:", err); return null; }),
       ]);
-      await exportAgmReportDocx({ fy, report, prevReport, extras });
+      await exportAgmReportDocx({ fy, report, prevReport, extras, usage });
       setAgmStatus("idle");
     } catch (err) {
       console.error("Generating the AGM report failed:", err);
@@ -4140,8 +4144,8 @@ async function fetchAgmExtras(fy) {
   const { from, to } = fyBounds(fy);
   const nextFrom = fyBounds(nfy).from;
 
-  const [units, bands, elec, levies, split, ops, txns, invoices, remits] = await Promise.all([
-    client.from("units").select("id, unit_number, participation_quota").order("unit_number"),
+  const [units, bands, elec, levies, split, ops, txns, invoices, remits, insurance, settings] = await Promise.all([
+    client.from("units").select("id, unit_number, participation_quota, sqm").order("unit_number"),
     client.from("water_tariff_bands").select("*").in("financial_year", [fy, nfy]).order("from_kl"),
     client.from("electricity_rates").select("rate_per_kwh, effective_from").order("effective_from"),
     client.from("levy_rates").select("*").in("financial_year", [fy, nfy]),
@@ -4157,12 +4161,18 @@ async function fetchAgmExtras(fy) {
     // carry no ops_expenses or bank row of their own.
     client.from("remittance_advices").select("unit_id, period, deduction_approved, deduction_amount, deduction_comment, deductions")
       .gte("period", from).lte("period", to),
+    // Insurance schedule and the AGM-approved figures that have no home in
+    // levy_rates or the tariff tables. Both are maintained on Config; a year
+    // with no row renders as blank cells, exactly as the whole section used to.
+    client.from("insurance_schedule").select("*").eq("financial_year", fy),
+    client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1),
   ]);
-  const bad = [units, bands, elec, levies, split, ops, txns, invoices, remits].find((r) => r.error);
+  const bad = [units, bands, elec, levies, split, ops, txns, invoices, remits, insurance, settings].find((r) => r.error);
   if (bad) throw bad.error;
 
   const unitList = (units.data || []).map((u) => ({
     id: u.id, no: u.unit_number, pq: Number(u.participation_quota) || 0,
+    sqm: u.sqm == null ? null : Number(u.sqm),
   }));
 
   // Water bands, one row per band with the current and next year's rate side
@@ -4207,42 +4217,50 @@ async function fetchAgmExtras(fy) {
   // makes this table add up to the Miscellaneous line in section 1; omitting
   // deductions was why it previously fell short.
   const MISC = "Miscellaneous";
-  const misc = [];
-  (ops.data || []).forEach((e) => {
-    if (e.category !== MISC) return;
-    misc.push({ date: e.expense_date, amount: round2(Math.abs(Number(e.amount) || 0)), desc: e.notes || MISC, source: "Body corp expense" });
-  });
-  (txns.data || []).forEach((t) => {
-    if (t.direction !== "debit" || t.expense_category !== MISC) return;
-    misc.push({ date: t.txn_date, amount: round2(Math.abs(Number(t.amount) || 0)), desc: t.description_raw || MISC, source: "Bank payment" });
-  });
-  (remits.data || []).forEach((r) => {
-    if (!r.deduction_approved) return;
-    // Same shape-tolerance as the report: a claim either itemises its
-    // deductions or carries a single untagged amount (which lands in
-    // Unclassified, not here).
-    const items = Array.isArray(r.deductions) && r.deductions.length
-      ? r.deductions
-      : (Number(r.deduction_amount) > 0 ? [{ amount: r.deduction_amount, expenseCategory: null, description: r.deduction_comment }] : []);
-    items.forEach((it) => {
-      if ((it.expenseCategory || null) !== MISC) return;
-      const amount = round2(Math.abs(Number(it.amount) || 0));
-      if (!(amount > 0)) return;
-      const who = noById[r.unit_id] ? `Unit ${noById[r.unit_id]}` : "a unit";
-      // Each line of a claim carries its own `comment`; the claim-level
-      // deduction_comment is only a fallback for a single untagged amount.
-      // Using the claim comment per item would print the whole claim's text
-      // against every one of its lines.
-      const what = it.comment || it.description || it.note || r.deduction_comment || MISC;
-      misc.push({
-        date: r.period,
-        amount,
-        desc: `${what} — paid by ${who}, recovered by levy deduction`,
-        source: "Approved deduction",
+  const MAINT = "Repairs & Maintenance";
+  const itemisedFor = (category) => {
+    const out = [];
+    (ops.data || []).forEach((e) => {
+      if (e.category !== category) return;
+      out.push({ date: e.expense_date, amount: round2(Math.abs(Number(e.amount) || 0)), desc: e.notes || category, source: "Body corp expense" });
+    });
+    (txns.data || []).forEach((t) => {
+      if (t.direction !== "debit" || t.expense_category !== category) return;
+      out.push({ date: t.txn_date, amount: round2(Math.abs(Number(t.amount) || 0)), desc: t.description_raw || category, source: "Bank payment" });
+    });
+    (remits.data || []).forEach((r) => {
+      if (!r.deduction_approved) return;
+      // Same shape-tolerance as the report: a claim either itemises its
+      // deductions or carries a single untagged amount (which lands in
+      // Unclassified, not here).
+      const items = Array.isArray(r.deductions) && r.deductions.length
+        ? r.deductions
+        : (Number(r.deduction_amount) > 0 ? [{ amount: r.deduction_amount, expenseCategory: null, description: r.deduction_comment }] : []);
+      items.forEach((it) => {
+        if ((it.expenseCategory || null) !== category) return;
+        const amount = round2(Math.abs(Number(it.amount) || 0));
+        if (!(amount > 0)) return;
+        const who = noById[r.unit_id] ? `Unit ${noById[r.unit_id]}` : "a unit";
+        // Each line of a claim carries its own `comment`; the claim-level
+        // deduction_comment is only a fallback for a single untagged amount.
+        // Using the claim comment per item would print the whole claim's text
+        // against every one of its lines.
+        const what = it.comment || it.description || it.note || r.deduction_comment || category;
+        out.push({
+          date: r.period,
+          amount,
+          desc: `${what} — paid by ${who}, recovered by levy deduction`,
+          source: "Approved deduction",
+        });
       });
     });
-  });
-  misc.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    return out.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  };
+  // Sections 3 and 4 are the same table over two different categories, so they
+  // are built by the same function rather than a second hand-written copy that
+  // could drift.
+  const misc = itemisedFor(MISC);
+  const maintenance = itemisedFor(MAINT);
 
   // Blockwatch is carried by the Body Corp and paid by a unit, so the actual
   // cost lives in the operating-expense log rather than on a levy line.
@@ -4250,12 +4268,54 @@ async function fetchAgmExtras(fy) {
   const bwTotal = round2(bwRows.reduce((s, e) => s + Math.abs(Number(e.amount) || 0), 0));
   const inv = (invoices.data || [])[0] || {};
 
+  // Insurance schedule keyed by unit number. Per-annum is the sum of the four
+  // charge columns and per-month is a twelfth of it — both derived here rather
+  // than stored, so a total can never disagree with its own components. The
+  // schedule total is the sum of the rounded per-unit figures, which is how the
+  // insurer's own schedule adds up.
+  const insById = Object.fromEntries((insurance.data || []).map((r) => [r.unit_id, r]));
+  const insuranceRows = unitList.map((u) => {
+    const r = insById[u.id];
+    if (!r) return { no: u.no, sqm: u.sqm, sumInsured: null, premium: null, commonProperty: null, sasria: null, broker: null, perAnnum: null, perMonth: null };
+    const premium = r.premium == null ? null : Number(r.premium);
+    const cp = r.common_property == null ? null : Number(r.common_property);
+    const sasria = r.sasria == null ? null : Number(r.sasria);
+    const broker = r.broker_fee == null ? null : Number(r.broker_fee);
+    const parts = [premium, cp, sasria, broker];
+    const perAnnum = parts.every((v) => v == null) ? null : round2(parts.reduce((s, v) => s + (v || 0), 0));
+    return {
+      no: u.no, sqm: u.sqm,
+      sumInsured: r.sum_insured == null ? null : Number(r.sum_insured),
+      premium, commonProperty: cp, sasria, broker,
+      perAnnum, perMonth: perAnnum == null ? null : round2(perAnnum / 12),
+    };
+  });
+  const insuranceHasData = insuranceRows.some((r) => r.perAnnum != null || r.sumInsured != null);
+
+  const st = (settings.data || [])[0] || {};
+
   return {
     fy, nfy, units: unitList, waterBands,
     elecCurr: rateAsOf(from), elecNext: rateAsOf(nextFrom),
     levyCurr: levyFor(fy), levyNext: levyFor(nfy),
     levySplit, levySplitIsCarriedOver,
-    misc,
+    misc, maintenance,
+    insuranceRows, insuranceHasData,
+    settings: {
+      gardenRatePerDay: st.garden_rate_per_day == null ? null : Number(st.garden_rate_per_day),
+      gardenIncreasePct: st.garden_increase_pct == null ? null : Number(st.garden_increase_pct),
+      gardenProposedRatePerDay: st.garden_proposed_rate_per_day == null ? null : Number(st.garden_proposed_rate_per_day),
+      gardenVisitsPerMonth: st.garden_visits_per_month == null ? null : Number(st.garden_visits_per_month),
+      gardenBonusAmount: st.garden_bonus_amount == null ? null : Number(st.garden_bonus_amount),
+      gardenBonusDueDate: st.garden_bonus_due_date || null,
+      gardenIncreaseEffectiveDate: st.garden_increase_effective_date || null,
+      blockwatchMonthlyCurrent: st.blockwatch_monthly_current == null ? null : Number(st.blockwatch_monthly_current),
+      blockwatchMonthlyProposed: st.blockwatch_monthly_proposed == null ? null : Number(st.blockwatch_monthly_proposed),
+      servicesNoteAnnualEstimate: st.services_note_annual_estimate == null ? null : Number(st.services_note_annual_estimate),
+      seweragePerUnitNew: st.sewerage_per_unit_new == null ? null : Number(st.sewerage_per_unit_new),
+      preparedBy: st.prepared_by || null,
+      checkedBy: st.checked_by || null,
+    },
     blockwatch: { actualTotal: bwTotal, monthCount: bwRows.length, monthly: bwRows.length ? round2(bwTotal / bwRows.length) : null },
     sewerPerUnit: inv.sewer_charge_per_unit == null ? null : Number(inv.sewer_charge_per_unit),
     demandLevyPerUnit: inv.water_demand_levy_per_unit == null ? null : Number(inv.water_demand_levy_per_unit),
@@ -4265,13 +4325,17 @@ async function fetchAgmExtras(fy) {
 // Builds and downloads the AGM annual report as an editable .docx. Sections the
 // database can fill are filled; the rest render as tables with empty cells so
 // the figures can be typed straight into Word before the meeting.
-async function exportAgmReportDocx({ fy, report, prevReport, extras }) {
+async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
   const D = await ensureDocxLoaded();
   const {
     Document, Packer, Paragraph, TextRun, HeadingLevel,
-    Table, TableRow, TableCell, WidthType, AlignmentType, PageOrientation,
+    Table, TableRow, TableCell, WidthType, AlignmentType, PageOrientation, ImageRun,
   } = D;
-  const { nfy, units, waterBands, elecCurr, elecNext, levyCurr, levyNext, levySplit, levySplitIsCarriedOver, misc, blockwatch, sewerPerUnit, demandLevyPerUnit } = extras;
+  const {
+    nfy, units, waterBands, elecCurr, elecNext, levyCurr, levyNext,
+    levySplit, levySplitIsCarriedOver, misc, maintenance,
+    insuranceRows, insuranceHasData, settings, blockwatch, sewerPerUnit, demandLevyPerUnit,
+  } = extras;
   const prev = prevReport && prevReport.hasData ? prevReport : null;
 
   // en-ZA formats money as "R 1 234,56" — spaces separate thousands. Every one
@@ -4280,6 +4344,16 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras }) {
   const nb = (s) => String(s).replace(/\s/g, " ");
   const money = (n) => (n == null || n === "" ? "" : nb("R " + round2(Number(n) || 0).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })));
   const dec = (n) => round2(Number(n) || 0).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  // "2027-01-01" -> "01-January-2027", the form the template uses for the
+  // increase and bonus dates. Parsed off the string rather than through Date,
+  // which would shift the day in a negative-offset timezone.
+  const longDate = (iso) => {
+    if (!iso) return "";
+    const [y, m, d] = String(iso).slice(0, 10).split("-");
+    const name = MONTH_NAMES[Number(m) - 1];
+    return name ? nb(`${d}-${name}-${y}`) : "";
+  };
+  const pct = (n) => (n == null || n === "" ? "" : `${Number(n)}%`);
   // Same value without the "R" prefix, for grids wide enough that repeating the
   // prefix on every column is what pushes an amount onto a second line. Those
   // tables carry an "all figures in rand" note instead.
@@ -4365,82 +4439,148 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras }) {
   B.push(tbl(b2));
   B.push(hint("All figures in rand, including cents. The R prefix is dropped so each amount stays on one line. Owner contributions sit in the statement month they settle, not the month the money arrived."));
 
-  // ---------- Portrait C: section 3 ----------
+  // ---------- Portrait C: sections 3 and 4 ----------
   const C = [];
 
-  C.push(H1("3. Miscellaneous expenses"));
-  const c3 = [hrow(["Month", "Year", "Amount", "Description"], ["left", "left", "right", "left"])];
-  misc.forEach((it) => {
-    const y = String(it.date).slice(0, 4);
-    const m = MONTH_NAMES[parseInt(String(it.date).slice(5, 7), 10) - 1] || "";
-    c3.push(row([m, y, money(it.amount), it.desc], ["left", "left", "right", "left"]));
-  });
-  if (!misc.length) c3.push(row(["", "", "", "No miscellaneous expenses recorded this year."], ["left", "left", "right", "left"]));
-  // The total is taken from the report's own Miscellaneous line, not from the
-  // sum of the rows above, so this table can never contradict the figure on the
-  // dashboard and in section 1. The report line also folds in approved resident
-  // deductions and nets nothing off for additional-charge recoveries; where that
-  // differs from the itemised rows, the gap is stated rather than hidden.
-  const miscItemised = round2(misc.reduce((s, it) => s + it.amount, 0));
-  const miscReported = round2((report.expenseRows.find((r) => r.label === "Miscellaneous") || {}).total || 0);
-  c3.push(row(["Total", "", money(miscReported), ""], ["left", "left", "right", "left"], true, BAND));
-  C.push(tbl(c3));
-  // The rows above cover all three sources that feed the Miscellaneous line, so
-  // these should agree. If they ever don't, the document says so rather than
+  // Sections 3 and 4 are the same table over two expense categories. The total
+  // is taken from the report's own line rather than from the sum of the rows
+  // above, so the table can never contradict the figure on the dashboard and in
+  // section 1 — and where the two disagree the document says so rather than
   // quietly printing a total the rows don't support.
-  if (Math.abs(miscReported - miscItemised) > 0.005) {
-    C.push(hint(`The total shown is the Miscellaneous line from section 1 (${money(miscReported)}); the rows above itemise ${money(miscItemised)}. The ${money(round2(Math.abs(miscReported - miscItemised)))} difference means an item is tagged Miscellaneous somewhere the itemisation doesn't reach — check the Bank reconciliation and Body corp expenses pages before the meeting.`));
-  }
+  const itemisedSection = (heading, items, reportLabel, emptyText) => {
+    const out = [];
+    out.push(H1(heading));
+    const aligns = ["left", "left", "right", "left"];
+    const rows = [hrow(["Month", "Year", "Amount", "Description"], aligns)];
+    items.forEach((it) => {
+      const y = String(it.date).slice(0, 4);
+      const m = MONTH_NAMES[parseInt(String(it.date).slice(5, 7), 10) - 1] || "";
+      rows.push(row([m, y, money(it.amount), it.desc], aligns));
+    });
+    if (!items.length) rows.push(row(["", "", "", emptyText], aligns));
+    const itemised = round2(items.reduce((s, it) => s + it.amount, 0));
+    const reported = round2((report.expenseRows.find((r) => r.label === reportLabel) || {}).total || 0);
+    rows.push(row(["Total", "", money(reported), ""], aligns, true, BAND));
+    out.push(tbl(rows));
+    if (Math.abs(reported - itemised) > 0.005) {
+      out.push(hint(`The total shown is the ${reportLabel} line from section 1 (${money(reported)}); the rows above itemise ${money(itemised)}. The ${money(round2(Math.abs(reported - itemised)))} difference means an item is tagged ${reportLabel} somewhere the itemisation doesn't reach — check the Bank reconciliation and Body corp expenses pages before the meeting.`));
+    }
+    return out;
+  };
 
-  // ---------- Landscape D: section 4 ----------
+  itemisedSection("3. Miscellaneous expenses", misc, "Miscellaneous", "No miscellaneous expenses recorded this year.").forEach((el) => C.push(el));
+  itemisedSection("4. Maintenance expenses", maintenance, "Repairs & Maintenance", "No maintenance expenses recorded this year.").forEach((el) => C.push(el));
+
+  // ---------- Landscape D: section 5 ----------
   const Dsec = [];
-  Dsec.push(H1("4. Insurance schedule (per unit)"));
-  Dsec.push(hint("Blank cells are for entry from the insurer's schedule. On landscape so the nine columns fit without splitting an amount across lines."));
+  Dsec.push(H1("5. Insurance schedule (per unit)"));
   const insCols = ["Unit No", "Sqm", "Sum Ins", "Premium", "Com Prop", "Sasria", "Broker", "Per Annum", "Per Month"];
   const insAligns = ["left", "right", "right", "right", "right", "right", "right", "right", "right"];
   const c4 = [hrow(insCols, insAligns)];
-  units.forEach((u) => c4.push(row([`Unit ${u.no}`, "", "", "", "", "", "", "", ""], insAligns)));
-  c4.push(row(["Total", "", "", "", "", "", "", "", ""], insAligns, true, BAND));
+  // Per annum and per month are derived, never stored, so the schedule cannot
+  // hold a total that disagrees with its own components. The column totals sum
+  // the rounded per-unit figures — which is how the insurer's schedule adds up,
+  // and half a cent off summing the raw values.
+  const insTotals = { premium: 0, commonProperty: 0, sasria: 0, broker: 0, perAnnum: 0, perMonth: 0 };
+  insuranceRows.forEach((r) => {
+    Object.keys(insTotals).forEach((k) => { insTotals[k] = round2(insTotals[k] + (r[k] || 0)); });
+    c4.push(row([
+      `Unit ${r.no}`,
+      r.sqm == null ? "" : String(r.sqm),
+      r.sumInsured == null ? "" : money(r.sumInsured),
+      r.premium == null ? "" : money(r.premium),
+      r.commonProperty == null ? "" : money(r.commonProperty),
+      r.sasria == null ? "" : money(r.sasria),
+      r.broker == null ? "" : money(r.broker),
+      r.perAnnum == null ? "" : money(r.perAnnum),
+      r.perMonth == null ? "" : money(r.perMonth),
+    ], insAligns));
+  });
+  c4.push(row([
+    "Total", "", "",
+    insTotals.premium ? money(insTotals.premium) : "",
+    insTotals.commonProperty ? money(insTotals.commonProperty) : "",
+    insTotals.sasria ? money(insTotals.sasria) : "",
+    insTotals.broker ? money(insTotals.broker) : "",
+    insTotals.perAnnum ? money(insTotals.perAnnum) : "",
+    insTotals.perMonth ? money(insTotals.perMonth) : "",
+  ], insAligns, true, BAND));
   Dsec.push(tbl(c4));
+  Dsec.push(hint(insuranceHasData
+    ? `Per annum is premium plus common property, Sasria and broker fee; per month is a twelfth of it. Maintained on Config — edit the schedule there rather than in this document, so next year's report carries it forward. On landscape so the nine columns fit without splitting an amount across lines.`
+    : `No insurance schedule has been captured for FY ${fy}, so the cells are blank for entry from the insurer's schedule. Capture it on Config to have this table fill automatically.`));
 
-  // ---------- Portrait E: sections 5 to 9 ----------
+  // ---------- Portrait E: sections 6, 7 and 8 ----------
   const E = [];
+  const CUR = `Current — FY ${fy}`;
+  const NEW = `New — FY ${nfy}`;
 
-  E.push(H1("5. Blockwatch"));
+  E.push(H1("6. Blockwatch"));
+  // The recorded monthly figure is the average of what actually went out; the
+  // agreed fee is the one the meeting votes on, so a captured setting wins.
+  const bwCurrent = settings.blockwatchMonthlyCurrent != null ? settings.blockwatchMonthlyCurrent : blockwatch.monthly;
   const c5 = [hrow(["Item", "Amount"], ["left", "right"])];
-  c5.push(row(["Monthly fee payable — current", blockwatch.monthly == null ? "" : money(blockwatch.monthly)], ["left", "right"]));
+  c5.push(row(["Monthly fee payable — current", bwCurrent == null ? "" : money(bwCurrent)], ["left", "right"]));
   c5.push(row([`Total paid in FY ${fy} (recorded)`, money(blockwatch.actualTotal)], ["left", "right"]));
-  c5.push(row([`Monthly fee payable — proposed FY ${nfy}`, ""], ["left", "right"]));
+  c5.push(row([`Monthly fee payable — proposed FY ${nfy}`,
+    settings.blockwatchMonthlyProposed == null ? "" : money(settings.blockwatchMonthlyProposed)], ["left", "right"]));
   E.push(tbl(c5));
-  E.push(para("Carried by the Body Corp and paid directly by a unit, then recovered by levy deduction against proof of payment — so it shows at R 0.00 on the levy statement.", { size: 20 }));
+  const bwUnchanged = settings.blockwatchMonthlyProposed != null && bwCurrent != null
+    && round2(settings.blockwatchMonthlyProposed) === round2(bwCurrent);
+  E.push(para(
+    bwUnchanged
+      ? "Blockwatch contribution remains unchanged."
+      : "Carried by the Body Corp and paid directly by a unit, then recovered by levy deduction against proof of payment — so it shows at R 0.00 on the levy statement.",
+    { size: 20 }));
 
-  E.push(H1("6. Garden service"));
+  E.push(H1("7. Garden service"));
   const gardenActual = (report.expenseRows.find((r) => r.label === "Garden Service") || {}).total || 0;
+  const gs = settings;
+  // Projected cost is derived from the proposed rate rather than typed, so it
+  // moves with the increase instead of being a figure to remember to update.
+  const projectedAnnual = gs.gardenProposedRatePerDay != null && gs.gardenVisitsPerMonth != null
+    ? round2(gs.gardenProposedRatePerDay * gs.gardenVisitsPerMonth * 12) : null;
+  const bonusLabel = gs.gardenBonusDueDate
+    ? `Proposed year-end bonus (Payable by ${longDate(gs.gardenBonusDueDate)})`
+    : "Proposed year-end bonus";
+  const projLabel = gs.gardenVisitsPerMonth != null
+    ? `Projected Annual cost — based on ${gs.gardenVisitsPerMonth} visits per month`
+    : "Projected Annual cost";
   const c6 = [hrow(["Item", "Amount / value"], ["left", "right"])];
-  c6.push(row([`Total servicing costs FY ${fy} (actual)`, money(gardenActual)], ["left", "right"]));
-  c6.push(row(["Total salary (annual)", ""], ["left", "right"]));
-  c6.push(row(["Proposed salary increase (%)", ""], ["left", "right"]));
-  c6.push(row(["Proposed year-end bonus", ""], ["left", "right"]));
+  c6.push(row([`Total salary costs FY ${fy} (actual)`, money(gardenActual)], ["left", "right"]));
+  c6.push(row(["Current Rate Per Day", gs.gardenRatePerDay == null ? "" : money(gs.gardenRatePerDay)], ["left", "right"]));
+  c6.push(row(["Proposed salary increase (%)", pct(gs.gardenIncreasePct)], ["left", "right"]));
+  c6.push(row([`Proposed salary for FY ${nfy} — Per Day`, gs.gardenProposedRatePerDay == null ? "" : money(gs.gardenProposedRatePerDay)], ["left", "right"]));
+  c6.push(row([bonusLabel, gs.gardenBonusAmount == null ? "" : money(gs.gardenBonusAmount)], ["left", "right"]));
+  c6.push(row(["Increase Effective Date", longDate(gs.gardenIncreaseEffectiveDate)], ["left", "right"]));
+  c6.push(row([projLabel, projectedAnnual == null ? "" : money(projectedAnnual)], ["left", "right"]));
   E.push(tbl(c6));
-  E.push(hint("Servicing cost is the actual spend recorded this year. Salary, increase and bonus are for approval at the meeting."));
+  E.push(hint("Actual cost is the spend recorded this year. Rate, increase, bonus and effective date are maintained on Config and are for approval at the meeting; the projected annual cost is the proposed rate times the visits per month, over twelve months."));
 
-  E.push(H1("7. Water tariffs"));
-  E.push(H2("Increasing block tariff (R / kL)"));
-  const c7 = [hrow(["Band (kL)", `Current — FY ${fy}`, `Proposed — FY ${nfy}`], ["left", "right", "right"])];
+  // Water and electricity sit under one Tariffs heading, with the usage trends
+  // as the closing subsection — the charts read against the rates the meeting
+  // is being asked to approve.
+  E.push(H1("8. Tariffs"));
+  E.push(H2("Water — Increasing block tariff (R / kL)"));
+  const c7 = [hrow(["Band (kL)", CUR, NEW], ["left", "right", "right"])];
   waterBands.forEach((b) => c7.push(row([b.label, b.curr == null ? "" : money(b.curr), b.next == null ? "" : money(b.next)], ["left", "right", "right"])));
   E.push(tbl(c7));
   E.push(H2("Provision, demand levy and sewerage"));
-  const c7b = [hrow(["Item", `Current — FY ${fy}`, `Proposed — FY ${nfy}`], ["left", "right", "right"])];
+  const c7b = [hrow(["Item", CUR, NEW], ["left", "right", "right"])];
   const cpw = (l) => (l.common_property_water_kl == null ? "" : nb(`${Number(l.common_property_water_kl)} kL`));
   c7b.push(row(["Common property provision (kL / month)", cpw(levyCurr) || nb(`${COMMON_PROPERTY_WATER_KL} kL`), cpw(levyNext)], ["left", "right", "right"]));
-  c7b.push(row(["Water Demand Levy (per unit / month)",
+  c7b.push(row(["Water Demand Levy (per unit / month) excl VAT",
     money(levyCurr.water_demand_levy != null ? levyCurr.water_demand_levy : demandLevyPerUnit),
     levyNext.water_demand_levy == null ? "" : money(levyNext.water_demand_levy)], ["left", "right", "right"]));
-  c7b.push(row(["Sewerage (per unit / month)", sewerPerUnit == null ? "" : money(sewerPerUnit), ""], ["left", "right", "right"]));
+  // The New column has no council source until the tariff is published, so it
+  // is captured on Config alongside the other AGM figures.
+  c7b.push(row(["Sewerage (per unit / month) excl VAT",
+    sewerPerUnit == null ? "" : money(sewerPerUnit),
+    settings.seweragePerUnitNew == null ? "" : money(settings.seweragePerUnitNew)], ["left", "right", "right"]));
   E.push(tbl(c7b));
 
-  E.push(H1("8. Electricity tariffs"));
-  const c8 = [hrow(["Item", `Current — FY ${fy}`, `Proposed — FY ${nfy}`], ["left", "right", "right"])];
+  E.push(H2("Electricity — Increasing tariffs"));
+  const c8 = [hrow(["Item", CUR, NEW], ["left", "right", "right"])];
   c8.push(row(["Flat rate (R / kWh)",
     elecCurr == null ? "" : nb("R " + elecCurr.toFixed(4)),
     elecNext == null ? "" : nb("R " + elecNext.toFixed(4))], ["left", "right", "right"]));
@@ -4454,18 +4594,66 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras }) {
     levyNext.electricity_network_fee == null ? "" : money(levyNext.electricity_network_fee)], ["left", "right", "right"]));
   E.push(tbl(c8));
   if (!levyNext || levyNext.financial_year == null) {
-    E.push(hint(`No FY ${nfy} levy rates have been captured yet, so the proposed column is blank where the figure isn't already on the tariff tables. Capture them on Tariffs & rates to have them fill automatically.`));
+    E.push(hint(`No FY ${nfy} levy rates have been captured yet, so the "New" column is blank where the figure isn't already on the tariff tables. Capture them on Tariffs & rates to have them fill automatically.`));
   }
 
-  E.push(H1("9. Service notes"));
-  E.push(H2("Fire extinguisher servicing"));
-  E.push(para("Annual servicing of the complex's fire extinguishers, paid directly by the Body Corp and never billed to a unit. Recorded in the operating-expense log.", { size: 20 }));
-  E.push(H2("Garden service"));
-  E.push(para("Grounds maintenance carried by the Body Corp, most commonly paid personally by a unit and reimbursed via a levy deduction with proof of payment. Shown at R 0.00 on the levy statement.", { size: 20 }));
-  E.push(H2("Blockwatch"));
-  E.push(para(`Neighbourhood watch contribution carried by the Body Corp and paid directly by a unit; shown at R 0.00 on the levy statement. Recorded cost for FY ${fy} was ${money(blockwatch.actualTotal)}.`, { size: 20 }));
-  E.push(H2("CSOS"));
-  E.push(para("The statutory Community Schemes Ombud Service levy, paid by the Body Corp. Tracked in the operating-expense log for the annual report.", { size: 20 }));
+  // ---------- Landscape G: section 8.4, the usage trend charts ----------
+  // The same two charts as the Financial dashboard, from the same builder, so
+  // the report cannot show a different picture from the screen. Landscape so
+  // both fit at a legible width.
+  const G = [];
+  G.push(H2("Usage trends"));
+  G.push(para(
+    "The two charts below are the dashboard's usage trends for the year under review. Read the dotted line — everything the body corporate allocated, being the seven unit meters plus the common-property provision — against the solid CoJ bulk line: below it means the council metered consumption nobody was billed for, above it means the complex billed more than the council metered that month.",
+    { size: 20 }));
+
+  // A chart is a supporting exhibit, not the report. If the browser refuses to
+  // rasterise (older Safari taints a canvas an SVG has been drawn into) the
+  // section says where to find it and the document is still produced.
+  let chartsEmbedded = 0;
+  if (usage) {
+    const trend = usageTrendSeries(usage);
+    const charts = [
+      { title: `Electricity — CoJ bulk vs allocated (kWh), FY ${fy}`, unit: "kWh", series: trend.electricity },
+      { title: `Water — CoJ bulk vs allocated (kL), FY ${fy}`, unit: "kL", series: trend.water },
+    ];
+    for (const ch of charts) {
+      const svg = buildTrendChartSvgWithLegend({ labels: usage.labels, series: ch.series, unit: ch.unit });
+      const bytes = svg ? await svgToPngBytes(svg, 2) : null;
+      G.push(new Paragraph({ spacing: { before: 220, after: 80 }, children: [new TextRun({ text: ch.title, bold: true, size: 20 })] }));
+      if (bytes) {
+        // Sized in points at the SVG's own aspect ratio — about 8.9in wide,
+        // inside the text column of a landscape A4 page.
+        const hm = /height="(\d+(?:\.\d+)?)"/.exec(svg);
+        const svgH = hm ? Number(hm[1]) : CHART_H;
+        const w = 640;
+        G.push(new Paragraph({ children: [new ImageRun({ data: bytes, transformation: { width: w, height: Math.round((svgH / CHART_W) * w) } })] }));
+        chartsEmbedded += 1;
+      } else {
+        G.push(hint("This chart could not be rendered into the document by your browser — it is on the Financial dashboard under Usage trends."));
+      }
+    }
+  } else {
+    G.push(hint(`No usage could be loaded for FY ${fy}, so the charts are omitted. They are on the Financial dashboard under Usage trends.`));
+  }
+  if (chartsEmbedded) {
+    G.push(hint("The dotted line adds the flat common-property provision from the levy rates, not bulk less meters — that derived gap goes negative in some months because council invoice periods do not line up with reading months, and it is covered by the provision check on Utility bills."));
+  }
+
+  // ---------- Portrait E2: section 9 ----------
+  const E2 = [];
+  E2.push(H1("9. Service notes"));
+  E2.push(H2("Fire extinguisher servicing"));
+  E2.push(para("Annual servicing of the complex's fire extinguishers, paid directly by the Body Corp and never billed to a unit. Recorded in the operating-expense log.", { size: 20 }));
+  E2.push(H2("Garden service"));
+  E2.push(para(`Grounds maintenance carried by the Body Corp, most commonly paid personally by a unit and reimbursed via a levy deduction with proof of payment. Shown at R 0.00 on the levy statement. Recorded cost for FY ${fy} was ${money(gardenActual)}.`, { size: 20 }));
+  E2.push(H2("Blockwatch"));
+  E2.push(para(`Neighbourhood watch contribution carried by the Body Corp and paid directly by a unit; shown at R 0.00 on the levy statement. Recorded cost for FY ${fy} was ${money(blockwatch.actualTotal)}.`, { size: 20 }));
+  E2.push(H2("CSOS"));
+  E2.push(para("The statutory Community Schemes Ombud Service levy, paid by the Body Corp. Tracked in the operating-expense log for the annual report.", { size: 20 }));
+  if (gs.servicesNoteAnnualEstimate != null) {
+    E2.push(para(`Note: it is recommended that the above services are once again paid by the body corporate to keep levies low. The estimated annual cost of this would be ${money(gs.servicesNoteAnnualEstimate)}.`, { size: 20 }));
+  }
 
   // ---------- Landscape F: section 10 ----------
   // Nine columns of rand amounts; landscape so no figure has to wrap.
@@ -4482,13 +4670,25 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras }) {
     const vals = units.map((u) => (levySplit[u.no] && levySplit[u.no][item] != null ? Number(levySplit[u.no][item]) : null));
     units.forEach((u, i) => { colTotals[u.no] = round2(colTotals[u.no] + (vals[i] || 0)); });
     const lineTotal = round2(vals.reduce((a, v) => a + (v || 0), 0));
-    c10.push(row([item, ...vals.map((v) => (v == null ? "" : money(v))), lineTotal ? money(lineTotal) : ""], lAligns, false, undefined, WIDE));
+    // A line every unit was billed R0.00 on prints as R 0,00; a blank cell is
+    // reserved for a figure that was never captured, which means something else.
+    const anyVal = vals.some((v) => v != null);
+    c10.push(row([item, ...vals.map((v) => (v == null ? "" : money(v))), anyVal ? money(lineTotal) : ""], lAligns, false, undefined, WIDE));
   });
   const grand = round2(units.reduce((a, u) => a + colTotals[u.no], 0));
-  c10.push(row(["Total per unit", ...units.map((u) => (colTotals[u.no] ? money(colTotals[u.no]) : "")), grand ? money(grand) : ""], lAligns, true, BAND, WIDE));
+  const anyCaptured = units.some((u) => levySplit[u.no] && Object.keys(levySplit[u.no]).length);
+  c10.push(row(["Total per unit", ...units.map((u) => (anyCaptured ? money(colTotals[u.no]) : "")), anyCaptured ? money(grand) : ""], lAligns, true, BAND, WIDE));
   F.push(tbl(c10));
 
-  F.push(new Paragraph({ spacing: { before: 300 }, children: [new TextRun({ text: `Prepared ${new Date().toLocaleDateString("en-ZA")} · El Corazon Body Corporate finance trustee.`, italics: true, size: 18, color: "94A0AC" })] }));
+  // Signature line. The names come from Config so the document doesn't have to
+  // be edited in Word every year just to change who checked it; with none
+  // captured it falls back to the generic trustee wording.
+  const preparedDate = new Date().toISOString().slice(0, 10).replace(/-/g, "/");
+  const who = [
+    settings.preparedBy ? `${settings.preparedBy}` : "El Corazon Body Corporate finance trustee",
+    settings.checkedBy ? `Checked by ${settings.checkedBy}` : null,
+  ].filter(Boolean).join("; ");
+  F.push(new Paragraph({ spacing: { before: 300 }, children: [new TextRun({ text: `Prepared ${preparedDate} · ${who}`, italics: true, size: 18, color: "94A0AC" })] }));
 
   const portrait = { page: { size: { orientation: PageOrientation.PORTRAIT } } };
   const landscape = { page: { size: { orientation: PageOrientation.LANDSCAPE } } };
@@ -4500,6 +4700,8 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras }) {
       { properties: portrait, children: C },
       { properties: landscape, children: Dsec },
       { properties: portrait, children: E },
+      { properties: landscape, children: G },
+      { properties: portrait, children: E2 },
       { properties: landscape, children: F },
     ],
   });
@@ -4627,22 +4829,34 @@ function niceAxis(maxVal, targetTicks = 4) {
   return { max, ticks };
 }
 
-// A minimal multi-series line chart. Hand-rolled SVG deliberately: no chart
-// library in the bundle, and it prints with the rest of the dashboard.
-function TrendChart({ labels, series, unit }) {
-  const W = 760, H = 280;
-  const M = { top: 16, right: 14, bottom: 34, left: 58 };
+// A minimal multi-series line chart, built as a standalone SVG string.
+// Hand-rolled deliberately: no chart library in the bundle, and it prints with
+// the rest of the dashboard.
+//
+// This is a pure string builder rather than JSX because the AGM report embeds
+// the same two charts as PNGs. Rendering both from one function is the point —
+// a chart in the report can never drift from the chart on screen. `TrendChart`
+// below is a thin wrapper that drops the output into the page; the exporter
+// rasterises the same string through a canvas.
+//
+// `standalone` adds the xmlns declaration and a solid background, which a
+// browser doesn't need to render inline but a canvas does need to rasterise.
+const CHART_W = 760, CHART_H = 280;
+const CHART_M = { top: 16, right: 14, bottom: 34, left: 58 };
+// Fonts are named with generic fallbacks on every text node. Inline SVG picks
+// up the page's webfonts, but an SVG loaded into an Image for rasterising has
+// no access to them and would otherwise fall back to a serif default.
+const CHART_SANS = "Inter, 'Helvetica Neue', Arial, sans-serif";
+const CHART_MONO = "'IBM Plex Mono', ui-monospace, 'Courier New', monospace";
+
+function buildTrendChartSvg({ labels, series, unit, standalone = false }) {
+  const W = CHART_W, H = CHART_H, M = CHART_M;
   const iw = W - M.left - M.right;
   const ih = H - M.top - M.bottom;
 
   const all = series.flatMap((s) => s.values).filter((v) => v != null && isFinite(v));
-  if (!all.length) {
-    return (
-      <div style={{ padding: "36px 0", textAlign: "center", color: "#94A0AC", fontSize: 13 }}>
-        No usage captured for this financial year yet.
-      </div>
-    );
-  }
+  if (!all.length) return null;
+
   const { max, ticks } = niceAxis(Math.max(...all));
   const x = (i) => M.left + (labels.length > 1 ? (i / (labels.length - 1)) * iw : iw / 2);
   const y = (v) => M.top + ih - (v / max) * ih;
@@ -4659,47 +4873,118 @@ function TrendChart({ labels, series, unit }) {
     return d.trim();
   };
   const fmt = (v) => (Number.isInteger(v) ? v.toLocaleString("en-ZA") : v.toFixed(1));
+  // Series labels carry a "+300 kWh" suffix and month labels an en dash, so
+  // anything interpolated into markup is escaped rather than trusted.
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
+  const parts = [];
+
+  ticks.forEach((t) => {
+    parts.push(`<line x1="${M.left}" x2="${W - M.right}" y1="${y(t)}" y2="${y(t)}" stroke="#EEE7D6" stroke-width="1"/>`);
+    parts.push(`<text x="${M.left - 9}" y="${y(t) + 4}" text-anchor="end" font-family="${CHART_MONO}" font-size="10.5" fill="#94A0AC">${esc(fmt(t))}</text>`);
+  });
+  parts.push(`<line x1="${M.left}" x2="${M.left}" y1="${M.top}" y2="${M.top + ih}" stroke="#D8D0BE" stroke-width="1"/>`);
+
+  labels.forEach((lab, i) => {
+    parts.push(`<text x="${x(i)}" y="${H - 12}" text-anchor="middle" font-family="${CHART_SANS}" font-size="10.5" fill="#64748B">${esc(lab)}</text>`);
+  });
+
+  series.forEach((s) => {
+    const dash = s.dashed ? ' stroke-dasharray="6 4"' : "";
+    parts.push(`<path d="${pathFor(s.values)}" fill="none" stroke="${esc(s.color)}" stroke-width="${s.dashed ? 2 : 2.2}"${dash} stroke-linejoin="round" stroke-linecap="round"/>`);
+    if (!s.dashed) {
+      s.values.forEach((v, i) => {
+        if (v == null || !isFinite(v)) return;
+        const tip = `${s.label} · ${labels[i]} · ${v.toLocaleString("en-ZA")} ${unit}`;
+        parts.push(`<circle cx="${x(i)}" cy="${y(v)}" r="3" fill="#fff" stroke="${esc(s.color)}" stroke-width="1.8"><title>${esc(tip)}</title></circle>`);
+      });
+    }
+  });
+
+  parts.push(`<text x="${M.left - 9}" y="${M.top - 4}" text-anchor="end" font-family="${CHART_SANS}" font-size="10" fill="#94A0AC">${esc(unit)}</text>`);
+
+  const open = standalone
+    ? `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`
+    : `<svg viewBox="0 0 ${W} ${H}" width="100%" style="min-width:520px;display:block" role="img">`;
+  const bg = standalone ? `<rect width="${W}" height="${H}" fill="#FFFFFF"/>` : "";
+  return `${open}${bg}${parts.join("")}</svg>`;
+}
+
+// The same legend as the screen, drawn into the SVG so the exported PNG is
+// readable on its own. Screen keeps the HTML legend (it wraps responsively);
+// the report needs it baked in, because a docx image carries nothing with it.
+function buildTrendChartSvgWithLegend({ labels, series, unit }) {
+  const chart = buildTrendChartSvg({ labels, series, unit, standalone: false });
+  if (!chart) return null;
+  const rowH = 20;
+  const H = CHART_H + 8 + rowH * series.length;
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // One legend entry per line, left-aligned under the y-axis. Stacking rather
+  // than running them across avoids having to measure text width to know
+  // whether three labels fit on one row.
+  const rows = series.map((s, i) => {
+    const yy = CHART_H + 8 + rowH * i + 12;
+    const dash = s.dashed ? ' stroke-dasharray="5 3"' : "";
+    return `<line x1="${CHART_M.left}" x2="${CHART_M.left + 22}" y1="${yy - 4}" y2="${yy - 4}" stroke="${esc(s.color)}" stroke-width="2.2"${dash} stroke-linecap="round"/>`
+      + `<text x="${CHART_M.left + 30}" y="${yy}" font-family="${CHART_SANS}" font-size="11.5" fill="#1B2A38">${esc(s.label)}</text>`;
+  }).join("");
+  const inner = chart.replace(/^<svg[^>]*>/, "").replace(/<\/svg>$/, "");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${CHART_W}" height="${H}" viewBox="0 0 ${CHART_W} ${H}">`
+    + `<rect width="${CHART_W}" height="${H}" fill="#FFFFFF"/>${inner}${rows}</svg>`;
+}
+
+// Rasterises an SVG string to PNG bytes via an offscreen canvas, at 2x for a
+// print-resolution image. Returns null rather than throwing if the browser
+// refuses — older Safari taints a canvas that has had an SVG drawn into it, and
+// a chart is not worth failing the whole report over.
+function svgToPngBytes(svg, scale = 2) {
+  return new Promise((resolve) => {
+    try {
+      const m = /width="(\d+(?:\.\d+)?)" height="(\d+(?:\.\d+)?)"/.exec(svg);
+      const w = m ? Number(m[1]) : CHART_W;
+      const h = m ? Number(m[2]) : CHART_H;
+      const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }));
+      const img = new Image();
+      const done = (bytes) => { URL.revokeObjectURL(url); resolve(bytes); };
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.round(w * scale);
+          canvas.height = Math.round(h * scale);
+          const ctx = canvas.getContext("2d");
+          ctx.fillStyle = "#FFFFFF";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const b64 = canvas.toDataURL("image/png").split(",")[1];
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          done(bytes);
+        } catch (err) {
+          console.warn("Rasterising the usage chart failed:", err);
+          done(null);
+        }
+      };
+      img.onerror = () => done(null);
+      img.src = url;
+    } catch (err) {
+      console.warn("Rasterising the usage chart failed:", err);
+      resolve(null);
+    }
+  });
+}
+
+function TrendChart({ labels, series, unit }) {
+  const svg = buildTrendChartSvg({ labels, series, unit });
+  if (!svg) {
+    return (
+      <div style={{ padding: "36px 0", textAlign: "center", color: "#94A0AC", fontSize: 13 }}>
+        No usage captured for this financial year yet.
+      </div>
+    );
+  }
   return (
-    <div className="scroll-x" style={{ margin: "0 -4px" }}>
-      <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ minWidth: 520, display: "block" }} role="img">
-        {ticks.map((t, i) => (
-          <g key={i}>
-            <line x1={M.left} x2={W - M.right} y1={y(t)} y2={y(t)} stroke="#EEE7D6" strokeWidth="1" />
-            <text x={M.left - 9} y={y(t) + 4} textAnchor="end"
-                  fontFamily="'IBM Plex Mono', monospace" fontSize="10.5" fill="#94A0AC">
-              {fmt(t)}
-            </text>
-          </g>
-        ))}
-        <line x1={M.left} x2={M.left} y1={M.top} y2={M.top + ih} stroke="#D8D0BE" strokeWidth="1" />
-
-        {labels.map((lab, i) => (
-          <text key={i} x={x(i)} y={H - 12} textAnchor="middle"
-                fontFamily="'Inter', sans-serif" fontSize="10.5" fill="#64748B">
-            {lab}
-          </text>
-        ))}
-
-        {series.map((s) => (
-          <g key={s.label}>
-            <path d={pathFor(s.values)} fill="none" stroke={s.color} strokeWidth={s.dashed ? 2 : 2.2}
-                  strokeDasharray={s.dashed ? "6 4" : undefined}
-                  strokeLinejoin="round" strokeLinecap="round" />
-            {!s.dashed && s.values.map((v, i) =>
-              v == null || !isFinite(v) ? null : (
-                <circle key={i} cx={x(i)} cy={y(v)} r="3" fill="#fff" stroke={s.color} strokeWidth="1.8">
-                  <title>{`${s.label} · ${labels[i]} · ${v.toLocaleString("en-ZA")} ${unit}`}</title>
-                </circle>
-              )
-            )}
-          </g>
-        ))}
-
-        <text x={M.left - 9} y={M.top - 4} textAnchor="end"
-              fontFamily="'Inter', sans-serif" fontSize="10" fill="#94A0AC">{unit}</text>
-      </svg>
-    </div>
+    <div className="scroll-x" style={{ margin: "0 -4px" }} dangerouslySetInnerHTML={{ __html: svg }} />
   );
 }
 
@@ -4719,6 +5004,21 @@ function ChartLegend({ series }) {
   );
 }
 
+// The three series per utility, shared by the dashboard and the AGM report so
+// colours, labels and ordering are defined once. Takes the output of
+// fetchUsageTrend() unchanged.
+function usageTrendSeries(data) {
+  const trio = (d, provision, unit) => [
+    { label: "CoJ bulk meter", color: "#1B2A38", values: d.bulk },
+    { label: "All units combined", color: "#2F5D50", values: d.units },
+    { label: `Units + common property (+${provision} ${unit})`, color: "#B5651D", dashed: true, values: d.allocated },
+  ];
+  return {
+    electricity: trio(data.electricity, data.provision.electricity, "kWh"),
+    water: trio(data.water, data.provision.water, "kL"),
+  };
+}
+
 function UsageTrends({ fy }) {
   const [data, setData] = useState(null);
   const [status, setStatus] = useState("loading"); // loading | ready | error
@@ -4736,16 +5036,8 @@ function UsageTrends({ fy }) {
     return () => { alive = false; };
   }, [fy]);
 
-  const elecSeries = data ? [
-    { label: "CoJ bulk meter", color: "#1B2A38", values: data.electricity.bulk },
-    { label: "All units combined", color: "#2F5D50", values: data.electricity.units },
-    { label: `Units + common property (+${data.provision.electricity} kWh)`, color: "#B5651D", dashed: true, values: data.electricity.allocated },
-  ] : [];
-  const waterSeries = data ? [
-    { label: "CoJ bulk meter", color: "#1B2A38", values: data.water.bulk },
-    { label: "All units combined", color: "#2F5D50", values: data.water.units },
-    { label: `Units + common property (+${data.provision.water} kL)`, color: "#B5651D", dashed: true, values: data.water.allocated },
-  ] : [];
+  const elecSeries = data ? usageTrendSeries(data).electricity : [];
+  const waterSeries = data ? usageTrendSeries(data).water : [];
 
   return (
     <div style={{ marginTop: 18 }}>
@@ -4985,7 +5277,259 @@ function Config({ expenseCategories, setExpenseCategories }) {
           <strong> Delete</strong> is only permitted when nothing references the category.
         </p>
       </Card>
+
+      <AgmReportSettings />
     </>
+  );
+}
+
+// ---------- Config: AGM report figures ----------
+// The insurance schedule and the garden/blockwatch figures the AGM approves are
+// the two parts of the annual report with no other home in the schema — they
+// used to render as blank cells for typing into Word each September, which meant
+// re-keying them every year. Kept per financial year so last year's report can
+// still be regenerated exactly as it was signed off.
+const AGM_FIELDS = [
+  { key: "garden_rate_per_day", label: "Garden — current rate per day", kind: "money" },
+  { key: "garden_increase_pct", label: "Garden — proposed increase (%)", kind: "number" },
+  { key: "garden_proposed_rate_per_day", label: "Garden — proposed rate per day", kind: "money" },
+  { key: "garden_visits_per_month", label: "Garden — visits per month", kind: "number" },
+  { key: "garden_bonus_amount", label: "Garden — proposed year-end bonus", kind: "money" },
+  { key: "garden_bonus_due_date", label: "Garden — bonus payable by", kind: "date" },
+  { key: "garden_increase_effective_date", label: "Garden — increase effective date", kind: "date" },
+  { key: "blockwatch_monthly_current", label: "Blockwatch — monthly fee, current", kind: "money" },
+  { key: "blockwatch_monthly_proposed", label: "Blockwatch — monthly fee, proposed", kind: "money" },
+  { key: "sewerage_per_unit_new", label: "Sewerage — new rate per unit / month", kind: "money" },
+  { key: "services_note_annual_estimate", label: "Service notes — estimated annual cost", kind: "money" },
+  { key: "prepared_by", label: "Report prepared by", kind: "text" },
+  { key: "checked_by", label: "Report checked by", kind: "text" },
+];
+const INS_FIELDS = [
+  { key: "sum_insured", label: "Sum insured" },
+  { key: "premium", label: "Premium" },
+  { key: "common_property", label: "Com prop" },
+  { key: "sasria", label: "Sasria" },
+  { key: "broker_fee", label: "Broker" },
+];
+
+function AgmReportSettings() {
+  // Which years to offer: the current body-corp FY and the three before it. The
+  // report is only ever run for a year that has data, and a longer list is just
+  // noise on a scheme this size.
+  const years = useMemo(() => {
+    const start = Number(periodToFY(CURRENT_PERIOD).split("/")[0]);
+    return [0, 1, 2, 3].map((n) => `${start - n}/${start - n + 1}`);
+  }, []);
+  const [fy, setFy] = useState(years[0]);
+  const [units, setUnits] = useState([]);
+  const [ins, setIns] = useState({});       // unitId -> { field: string }
+  const [settings, setSettings] = useState({});
+  const [status, setStatus] = useState("loading"); // loading | ready | error
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState(null);
+  const [error, setError] = useState(null);
+
+  // Values are held as strings while editing — the same reason the Tariffs and
+  // Meter readings tables do: an <input type="number"> renders through the en-ZA
+  // locale and turns 33.57 into 33,57, and strips trailing zeros.
+  useEffect(() => {
+    let alive = true;
+    setStatus("loading"); setNotice(null); setError(null);
+    (async () => {
+      try {
+        const client = await ensureSupabaseClient();
+        const [u, i, s] = await Promise.all([
+          client.from("units").select("id, unit_number, sqm").order("unit_number"),
+          client.from("insurance_schedule").select("*").eq("financial_year", fy),
+          client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1),
+        ]);
+        const bad = [u, i, s].find((r) => r.error);
+        if (bad) throw bad.error;
+        if (!alive) return;
+        setUnits((u.data || []).map((r) => ({ id: r.id, no: r.unit_number, sqm: r.sqm == null ? "" : String(r.sqm) })));
+        const byUnit = {};
+        (i.data || []).forEach((r) => {
+          byUnit[r.unit_id] = Object.fromEntries(INS_FIELDS.map((f) => [f.key, r[f.key] == null ? "" : String(r[f.key])]));
+        });
+        setIns(byUnit);
+        const row = (s.data || [])[0] || {};
+        setSettings(Object.fromEntries(AGM_FIELDS.map((f) => [f.key, row[f.key] == null ? "" : String(row[f.key])])));
+        setStatus("ready");
+      } catch (err) {
+        console.error("Loading AGM report settings failed:", err);
+        if (alive) setStatus("error");
+      }
+    })();
+    return () => { alive = false; };
+  }, [fy]);
+
+  // "1234,56" and "1234.56" both mean the same thing to a South African typing
+  // into this form; parseFloat on the comma form silently returns 1234.
+  const num = (v) => {
+    const t = String(v ?? "").trim().replace(/\s/g, "").replace(",", ".");
+    if (t === "") return null;
+    const n = Number(t);
+    return isFinite(n) ? n : null;
+  };
+  const txt = (v) => { const t = String(v ?? "").trim(); return t === "" ? null : t; };
+
+  const setInsField = (unitId, key, value) =>
+    setIns((prev) => ({ ...prev, [unitId]: { ...(prev[unitId] || {}), [key]: value } }));
+
+  // Per annum and per month are shown live so a typo is obvious before saving —
+  // and they are computed by exactly the arithmetic the report uses.
+  const derived = (unitId) => {
+    const r = ins[unitId] || {};
+    const parts = ["premium", "common_property", "sasria", "broker_fee"].map((k) => num(r[k]));
+    if (parts.every((v) => v == null)) return { perAnnum: null, perMonth: null };
+    const perAnnum = round2(parts.reduce((s, v) => s + (v || 0), 0));
+    return { perAnnum, perMonth: round2(perAnnum / 12) };
+  };
+
+  const save = async () => {
+    setBusy(true); setNotice(null); setError(null);
+    try {
+      const client = await ensureSupabaseClient();
+      // Floor area lives on the unit, not on the year's schedule — it is a
+      // title-deed fact, so it is written back to units rather than repeated.
+      for (const u of units) {
+        const sqm = num(u.sqm);
+        const { error: e } = await client.from("units").update({ sqm }).eq("id", u.id);
+        if (e) throw e;
+      }
+      const rows = units.map((u) => {
+        const r = ins[u.id] || {};
+        return {
+          financial_year: fy, unit_id: u.id,
+          ...Object.fromEntries(INS_FIELDS.map((f) => [f.key, num(r[f.key])])),
+          updated_at: new Date().toISOString(),
+        };
+      });
+      const { error: ie } = await client.from("insurance_schedule").upsert(rows, { onConflict: "financial_year,unit_id" });
+      if (ie) throw ie;
+      const payload = { financial_year: fy, updated_at: new Date().toISOString() };
+      AGM_FIELDS.forEach((f) => { payload[f.key] = f.kind === "money" || f.kind === "number" ? num(settings[f.key]) : txt(settings[f.key]); });
+      const { error: se } = await client.from("agm_report_settings").upsert(payload, { onConflict: "financial_year" });
+      if (se) throw se;
+      setNotice(`Saved for FY ${fy}. The AGM report picks this up the next time it is generated.`);
+    } catch (err) {
+      console.error("Saving AGM report settings failed:", err);
+      setError(err.message || "Save failed — see browser console.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cellInput = { ...inputStyle, width: 104 };
+  const th = { padding: "6px 8px", color: "#64748B", fontSize: 10.5, textTransform: "uppercase", textAlign: "right", whiteSpace: "nowrap" };
+
+  const totals = INS_FIELDS.reduce((acc, f) => {
+    acc[f.key] = round2(units.reduce((s, u) => s + (num((ins[u.id] || {})[f.key]) || 0), 0));
+    return acc;
+  }, {});
+  const totalPerAnnum = round2(units.reduce((s, u) => s + (derived(u.id).perAnnum || 0), 0));
+  const totalPerMonth = round2(units.reduce((s, u) => s + (derived(u.id).perMonth || 0), 0));
+
+  return (
+    <Card style={{ marginTop: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 4 }}>
+        <div style={{ fontWeight: 700, fontSize: 13.5 }}>AGM report figures</div>
+        <label style={{ fontSize: 12.5, color: "#64748B" }}>
+          Financial year{" "}
+          <select value={fy} onChange={(e) => setFy(e.target.value)}
+                  style={{ ...inputStyle, width: 130, textAlign: "left", fontFamily: "inherit" }}>
+            {years.map((y) => <option key={y} value={y}>{y}</option>)}
+          </select>
+        </label>
+      </div>
+      <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 0, marginBottom: 14, lineHeight: 1.6 }}>
+        The insurance schedule and the garden, blockwatch and sign-off figures used by the annual report.
+        Per annum and per month are derived — premium plus common property, Sasria and broker fee, then a twelfth of it — so they can never disagree with their own components.
+      </p>
+
+      {status === "loading" && <div style={{ color: "#94A0AC", fontSize: 13 }}>Loading…</div>}
+      {status === "error" && <div style={{ color: "#B5651D", fontWeight: 600, fontSize: 13 }}>Couldn’t load the AGM figures — see browser console.</div>}
+
+      {status === "ready" && (
+        <>
+          <div className="scroll-x">
+            <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", minWidth: 780 }}>
+              <thead>
+                <tr>
+                  <th style={{ ...th, textAlign: "left" }}>Unit</th>
+                  <th style={th}>Sqm</th>
+                  {INS_FIELDS.map((f) => <th key={f.key} style={th}>{f.label}</th>)}
+                  <th style={th}>Per annum</th>
+                  <th style={th}>Per month</th>
+                </tr>
+              </thead>
+              <tbody>
+                {units.map((u) => {
+                  const d = derived(u.id);
+                  return (
+                    <tr key={u.id} style={{ borderTop: "1px solid #EEE7D6" }}>
+                      <td style={{ padding: "6px 8px", fontWeight: 600 }}>Unit {u.no}</td>
+                      <td style={{ padding: "6px 8px", textAlign: "right" }}>
+                        <input type="text" inputMode="decimal" value={u.sqm}
+                               onChange={(e) => setUnits((prev) => prev.map((x) => (x.id === u.id ? { ...x, sqm: e.target.value } : x)))}
+                               style={{ ...cellInput, width: 70 }} />
+                      </td>
+                      {INS_FIELDS.map((f) => (
+                        <td key={f.key} style={{ padding: "6px 8px", textAlign: "right" }}>
+                          <input type="text" inputMode="decimal" value={(ins[u.id] || {})[f.key] ?? ""}
+                                 onChange={(e) => setInsField(u.id, f.key, e.target.value)}
+                                 style={cellInput} />
+                        </td>
+                      ))}
+                      <td className="f-mono" style={{ padding: "6px 8px", textAlign: "right", color: "#64748B" }}>{d.perAnnum == null ? "—" : rand(d.perAnnum)}</td>
+                      <td className="f-mono" style={{ padding: "6px 8px", textAlign: "right", fontWeight: 700 }}>{d.perMonth == null ? "—" : rand(d.perMonth)}</td>
+                    </tr>
+                  );
+                })}
+                <tr style={{ borderTop: "2px solid #D8D0BE", background: "#F6F1E7" }}>
+                  <td style={{ padding: "8px", fontWeight: 700 }}>Total</td>
+                  <td />
+                  {INS_FIELDS.map((f) => (
+                    <td key={f.key} className="f-mono" style={{ padding: "8px", textAlign: "right", fontWeight: 700 }}>
+                      {totals[f.key] ? rand(totals[f.key]) : "—"}
+                    </td>
+                  ))}
+                  <td className="f-mono" style={{ padding: "8px", textAlign: "right", fontWeight: 700 }}>{totalPerAnnum ? rand(totalPerAnnum) : "—"}</td>
+                  <td className="f-mono" style={{ padding: "8px", textAlign: "right", fontWeight: 700 }}>{totalPerMonth ? rand(totalPerMonth) : "—"}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "10px 24px", marginTop: 20 }}>
+            {AGM_FIELDS.map((f) => (
+              <label key={f.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, fontSize: 12.5 }}>
+                <span style={{ color: "#1B2A38" }}>{f.label}</span>
+                <input
+                  type={f.kind === "date" ? "date" : "text"}
+                  inputMode={f.kind === "money" || f.kind === "number" ? "decimal" : undefined}
+                  value={settings[f.key] ?? ""}
+                  onChange={(e) => setSettings((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                  style={{ ...inputStyle, width: f.kind === "text" || f.kind === "date" ? 150 : 110, textAlign: f.kind === "text" ? "left" : "right", fontFamily: f.kind === "text" || f.kind === "date" ? "inherit" : inputStyle.fontFamily }}
+                />
+              </label>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 18, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+            <button style={primaryBtn} onClick={save} disabled={busy}>
+              {busy ? "Saving…" : `Save AGM figures for FY ${fy}`}
+            </button>
+            {notice && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>{notice}</span>}
+            {error && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{error}</span>}
+          </div>
+          <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 12, lineHeight: 1.6 }}>
+            The projected annual garden cost in the report is the proposed rate per day times the visits per month, over twelve months — it isn’t entered here, so it can’t fall out of step with the rate.
+            Leaving a field blank renders that row of the report as an empty cell to complete in Word, which is how the whole section used to work.
+          </p>
+        </>
+      )}
+    </Card>
   );
 }
 

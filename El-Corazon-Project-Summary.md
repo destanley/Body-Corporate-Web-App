@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 6 August 2026, session 2 (supersedes the 6 August 2026 session 1 summary)
+Last updated: 6 August 2026, session 3 (supersedes the 6 August 2026 session 2 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,65 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 6 August 2026, session 3
+
+### AGM report generator rebuilt against the trustee's updated .docx template
+
+The trustee supplied an updated `ElCorazon-AGM-Report-FY2025-2026.docx` and asked the generator to produce that document instead of its own layout, plus the dashboard's usage trend charts under Tariffs.
+
+**Structure now matches the template section for section:**
+
+| # | Section | Change |
+|---|---|---|
+| 1 | I&E year on year | unchanged |
+| 2 | I&E month to month | unchanged |
+| 3 | Miscellaneous expenses | unchanged |
+| 4 | **Maintenance expenses** | **new** — same table over `Repairs & Maintenance` |
+| 5 | Insurance schedule | was blank cells, now DB-fed |
+| 6 | Blockwatch | was 5 |
+| 7 | Garden service | was 6; four rows became seven |
+| 8 | **Tariffs** | water (was 7) and electricity (was 8) merged under one heading, with **8.4 Usage trends** as a landscape subsection |
+| 9 | Service notes | + the "recommended these services stay with the body corporate" note |
+| 10 | Levy split | unchanged |
+
+Column headings are now `Current — FY x` / **`New — FY y`** (was "Proposed"). The footer is `Prepared YYYY/MM/DD · <prepared_by>; Checked by <checked_by>`, both from the DB.
+
+Eight page sections now, alternating: 2, 5, 8.4 and 10 are landscape.
+
+### Sections 3 and 4 share one builder
+`itemisedFor(category)` in `fetchAgmExtras` replaced the hand-written Miscellaneous itemisation; sections 3 and 4 call one `itemisedSection()` helper. Both still cover **all three expenditure sources** (ops expenses, bank debits, approved resident deductions) and both still take their total from the report's own line in section 1, footnoting any gap rather than printing a total the rows don't support.
+
+### Two new tables (migration `agm_report_insurance_schedule_and_settings`, + `agm_report_settings_sewerage_new`)
+Mirrored in `migrations/agm_report_insurance_and_settings.sql`. Additive; nothing existing altered.
+
+- **`units.sqm`** — floor area is a title-deed fact like `participation_quota`, so it sits on the unit rather than being re-keyed on each year's schedule.
+- **`insurance_schedule`** — one row per unit per FY: `sum_insured`, `premium`, `common_property`, `sasria`, `broker_fee`. **Per annum and per month are derived, never stored** (premium + the three charges, then / 12), so a total can't drift from its components. Column totals sum the *rounded* per-unit figures — that is how the insurer's own schedule adds up.
+- **`agm_report_settings`** — one row per FY: garden rate/day, increase %, proposed rate/day, visits/month, bonus + due date, increase effective date, blockwatch current/proposed, the services-note estimate, `sewerage_per_unit_new`, and `prepared_by`/`checked_by`.
+- Both RLS-enabled, trustee-only via `is_trustee()`. Seeded with the template's FY2025/2026 figures, so the report reproduces it out of the box.
+- **Projected annual garden cost is not stored** — it is proposed rate × visits/month × 12, so it can't fall out of step with the rate.
+- `sewerage_per_unit_new` exists because the New column had **no source at all**: `council_invoices` only carries the rate being billed now, and next year's isn't published yet. It was a permanent blank.
+
+### Config screen: "AGM report figures" card
+New `AgmReportSettings` component under the categories card. FY selector (current body-corp FY plus the three before it), the insurance grid with live derived per-annum/per-month, and the settings fields. Text inputs with `inputMode="decimal"` and a comma-tolerant parser — **not `type="number"`**, for the reasons already recorded under session 2 (en-ZA renders `33.57` as `33,57` and strips trailing zeros). A blank field still renders that report row as an empty cell to complete in Word, which is how the whole section used to work.
+
+### Usage trend charts embedded as PNGs (§8.4)
+- `TrendChart`'s JSX was replaced by **`buildTrendChartSvg()`, a pure SVG-string builder**, with the component now a thin wrapper around it. The report rasterises the same string, so **a chart in the document cannot drift from the chart on screen**. `usageTrendSeries()` likewise defines the three series once for both.
+- `buildTrendChartSvgWithLegend()` bakes the legend into the SVG — a docx image carries nothing with it, unlike the screen where the HTML legend sits alongside.
+- Fonts are named with generic fallbacks on **every** text node: inline SVG picks up the page's webfonts, but an SVG loaded into an `Image` for rasterising has no access to them and falls back to serif.
+- `svgToPngBytes()` draws through an offscreen canvas at 2x and **returns null rather than throwing** — older Safari taints a canvas an SVG has been drawn into. The section then prints a line pointing at the dashboard and the document is still produced. Same for a failed usage fetch, which is caught in `generateAgmReport` rather than failing the export.
+- Usage is fetched in `generateAgmReport`'s `Promise.all`, **not read off the rendered charts**, so the report doesn't depend on the trends card having finished loading.
+
+### Verified
+`vite build` clean. The generator was then bundled with esbuild and run in Node against the template's own FY2025/2026 figures, and the output diffed cell by cell against the uploaded .docx. Every table matches except:
+
+- **Template arithmetic:** Unit 3 per annum reads `R 3 139,15`; 2 932,57 + 67,39 + 105,78 + 33,42 = **3 139,16**. The schedule total is a cent out for the same reason.
+- **Template typos:** `R 12 107.89`, `R2 160 000.00` and `R 697.73` use a decimal point where every other figure uses a comma.
+- **Deliberate:** `Proposed salary for FY 2026/2027` rather than the template's hardcoded `FY27`; em dashes throughout rather than the template's mix of hyphen and en dash; the stray trailing `-` on the garden actual-cost label dropped.
+
+A genuine R0.00 levy line now prints `R 0,00`; an empty cell is reserved for a figure never captured, which says something different.
 
 ---
 
