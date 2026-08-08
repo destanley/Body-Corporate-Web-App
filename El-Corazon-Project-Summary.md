@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 8 August 2026, session 10 (supersedes the 8 August 2026 session 9 summary)
+Last updated: 8 August 2026, session 11 (supersedes the 8 August 2026 session 10 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,98 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 8 August 2026, session 11 — PMR 22 schema, and two new AGM sections
+
+### Migration `maintenance_plan_and_reserve_fund.sql` (applied)
+
+Four tables, with the design decisions taken with Devon before building:
+
+| Table | Holds |
+|---|---|
+| `assets` | Component register — the basis of the ten-year plan |
+| `asset_inspections` | **Dated** condition history, many rows per component |
+| `reserve_fund_entries` | Notional reserve ledger |
+| `maintenance_plan_snapshots` | The plan **as approved** at an AGM, frozen |
+
+Three choices worth remembering:
+
+1. **The reserve fund is notional, permanently.** Book entries against the single
+   FNB account — there is no separate reserve bank account and none is planned, so
+   the ledger carries no account linkage at all.
+2. **Condition is a dated log, never a field on the asset.** A deterioration trend
+   across years is what justifies moving a replacement date forward, and PMR 22
+   plans are re-approved annually. `revised_remaining_life_years` on an inspection
+   overrides the age-derived figure — an inspector's judgement beats a table.
+3. **The plan is computed live; approved versions are snapshotted.** It cannot go
+   stale, and there is still a record of what the meeting adopted — which is what
+   compliance actually rests on.
+
+All four are RLS-protected behind `is_trustee()`, consistent with the other 16 tables.
+
+### 27 components seeded as a checklist — with no invented figures
+
+Every age, life and cost is deliberately **null**. Those come from walking the
+property, and a seeded guess would be indistinguishable from real data in six
+months. Three components carry notes from what the expense record already proves
+(the Sep 2025 lighting work, the four insured geysers, the annual extinguisher
+service) — those narrow the age question without pretending to answer it.
+
+### AGM report — section 3, Bank account
+
+Sections 1 and 2 are the accrual view; this is the cash counterpart, and the only
+part of the report a member can check against a document the bank sent. Position,
+month-by-month table, and **verification** — each month either ties to its own
+statement or it is named as not doing so.
+
+Includes **months of cash cover** (closing balance ÷ average monthly spend), which
+nobody calculates and which is the difference between a balance that looks healthy
+and one that is. At R210,844.15 against R234,425.28 of annual spend that is about
+**10.8 months** — and the report says plainly that a balance that size usually means
+a scheme accumulating without a stated purpose, which is what section 13 addresses.
+
+### AGM report — section 13, Maintenance plan and reserve fund (PMR 22)
+
+Register coverage first, deliberately: **a plan built on 3 of 27 components is not
+a plan**, and the section says so before it shows a single rand. Then the reserve
+position, the statutory floor, the annual contribution, the ten-year schedule and
+the component detail.
+
+> **The number the meeting has to face.** Levies collected FY 2025/2026 were
+> R238,065.78, so the 25% reserve threshold is **R59,516.45**. The reserve fund
+> holds **R0.00**, so the floor bites: the coming year's budgeted reserve
+> contribution must be **at least 15% of the budgeted administrative contribution
+> — R35,163.79, about R418.62 per unit per month.** That is regulation, not a
+> proposal, and it applies whether or not the register has been completed.
+
+Sections renumbered to make room: 3→4 Misc, 4→5 Maintenance, 5→6 Insurance,
+6→7 Blockwatch, 7→8 Garden, 8→9 Tariffs, 9→10 Water, 10→11 Service notes,
+11→12 Levy split. The signature line moved to the end of the new section 13.
+
+### New "Maintenance plan" module
+
+Editable register (install date, expected life, replacement cost, cost basis), an
+inspection form per component, and the reserve ledger. Capturing a cost **and** a
+life flips a component from `not_assessed` to `assessed` automatically — the two
+fields that let it carry a provision are exactly the two that define assessment.
+
+### `TODAY_ISO` hoisted to module scope
+
+It was a local const inside the tariff editor; the register and inspection form
+both need it. A second definition of "what is today" is how two screens end up
+disagreeing about the date.
+
+### Verified
+
+`no-undef` clean (run per the session 10 agreement), bundle clean. PMR 22 maths
+tested against the real position and against a worked three-component example:
+provisions sum correctly (450000/12 + 180000/3 + 28000/5 = R103,100), an
+apportioned reserve sums back to exactly the balance held, `remaining = 0` divides
+by `max(1, n)` rather than producing Infinity, a reserve exceeding replacement cost
+floors the provision at 0, and unassessed components are excluded rather than
+counted as zero.
 
 ---
 

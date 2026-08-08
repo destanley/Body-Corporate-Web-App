@@ -1105,6 +1105,10 @@ let ACTIVE_PAYMENT_PERIOD = nextPeriod(CURRENT_PERIOD);
 
 // "2026-06-01" -> "June 2026". Used for every period label in the UI so they
 // track the selected month instead of a hardcoded "June 2026".
+// Today, as an ISO date. Module scope because the tariff editor, the
+// maintenance register and the inspection form all need it, and a second
+// definition is how two screens end up disagreeing about what day it is.
+const TODAY_ISO = new Date().toISOString().slice(0, 10);
 const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 // "2026-08-06" -> "6 August 2026". Module level because the statement screen
 // needs it too; the AGM report builder keeps its own local copy.
@@ -2774,6 +2778,7 @@ export default function App() {
                 onImported={() => setDataVersion((v) => v + 1)}
               />
             )}
+            {tab === "maintenance" && <MaintenancePlan />}
             {tab === "rate-history" && <RateHistory />}
             {tab === "levy-setup" && (
               <LevySetup
@@ -2915,6 +2920,7 @@ function SideNav({ tab, setTab }) {
     ["allocation", "Invoice allocation"],
     ["reconciliation", "Tenant recon"],
     ["bank-recon", "Bank recon"],
+    ["maintenance", "Maintenance plan"],
     ["statement-preview", "Statement preview"],
     ["analytics", "Financial dashboard"],
     ["tariffs", "Tariffs & rates"],
@@ -3498,7 +3504,7 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, wa
   // Insurance is the one line that differs per unit, so it is loaded from that
   // unit's own row on the insurance schedule rather than from the flat
   // suggestions object: per annum (premium + common property + Sasria + broker)
-  // over twelve, exactly as section 5 of the AGM report prints it. Captured on
+  // over twelve, exactly as section 6 of the AGM report prints it. Captured on
   // the Insurance page. Like every other line it pre-fills and stays editable.
   const [insurancePerUnit, setInsurancePerUnit] = useState({});
   const insuranceFY = levyMeta.financialYear || FY_ACTIVE;
@@ -4031,7 +4037,6 @@ function RateSettings({
   //   Current  = the newest set with an effective date on or before today
   //   Next     = the first set dated after today (blank until one is added)
   // Anything beyond "Next" is shown too, labelled by its own date.
-  const TODAY_ISO = new Date().toISOString().slice(0, 10);
   const historyDates = useMemo(() => Object.keys(waterBandHistory || {}).sort(), [waterBandHistory]);
 
   // Rate sets created via "Add new rates" but not yet saved.
@@ -4889,15 +4894,27 @@ function Analytics({ expenseCategories }) {
       // Usage is fetched here rather than read off the rendered charts so the
       // report doesn't depend on the trends card having finished loading, and
       // a failure there costs the section rather than the whole document.
-      const [prevReport, extras, usage, water] = await Promise.all([
+      const [prevReport, extras, usage, water, bank, plan] = await Promise.all([
         loadFyReport(previousFY(fy), expenseCategories).catch(() => null),
         fetchAgmExtras(fy),
         fetchUsageTrend(fy).catch((err) => { console.warn("Loading usage for the AGM report failed:", err); return null; }),
-        // Same treatment as usage: section 9 is worth failing on its own rather
+        // Same treatment as usage: section 10 is worth failing on its own rather
         // than costing the whole document.
         fetchWaterReconciliation(fy).catch((err) => { console.warn("Loading water charged-vs-billed for the AGM report failed:", err); return null; }),
+        fetchBankAccountSummary(fy).catch((err) => { console.warn("Loading the bank account summary for the AGM report failed:", err); return null; }),
+        fetchMaintenancePlan(fy).catch((err) => { console.warn("Loading the maintenance plan for the AGM report failed:", err); return null; }),
       ]);
-      await exportAgmReportDocx({ fy, report, prevReport, extras, usage, water });
+      // The PMR 22 floor needs figures from three places at once: the reserve
+      // ledger, the year's levy income, and next year's administrative budget.
+      // Levy income is the Levies line from the income statement; the admin
+      // budget is this year's total expenditure, which is the best available
+      // proxy until a budget is captured as its own record.
+      const leviesCollected = report && report.incomeRows
+        ? round2(report.incomeRows.reduce((s, r) => s + (r.total || 0), 0)) : null;
+      const floor = plan && leviesCollected != null
+        ? { ...reserveFundFloor({ reserveBalance: plan.reserve.balance, leviesCollected, adminBudget: report.totalExpense }), leviesCollected }
+        : null;
+      await exportAgmReportDocx({ fy, report, prevReport, extras, usage, water, bank, plan, floor });
       setAgmStatus("idle");
     } catch (err) {
       console.error("Generating the AGM report failed:", err);
@@ -5288,7 +5305,7 @@ async function fetchAgmExtras(fy) {
     return out.sort((a, b) => String(a.date).localeCompare(String(b.date)));
   };
   const itemisedFor = (category) => itemisedBy((c) => c === category, category);
-  // Sections 3 and 4 are the same table over two different categories, so they
+  // Sections 4 and 5 are the same table over two different categories, so they
   // are built by the same function rather than a second hand-written copy that
   // could drift.
   const misc = itemisedFor(MISC);
@@ -5386,7 +5403,7 @@ async function fetchAgmExtras(fy) {
 // Builds and downloads the AGM annual report as an editable .docx. Sections the
 // database can fill are filled; the rest render as tables with empty cells so
 // the figures can be typed straight into Word before the meeting.
-async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, water }) {
+async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, water, bank, plan, floor }) {
   const D = await ensureDocxLoaded();
   const {
     Document, Packer, Paragraph, TextRun, HeadingLevel,
@@ -5501,10 +5518,98 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   B.push(tbl(b2));
   B.push(hint("All figures in rand, including cents. The R prefix is dropped so each amount stays on one line. Owner contributions sit in the statement month they settle, not the month the money arrived."));
 
-  // ---------- Portrait C: sections 3 and 4 ----------
+  // ---------- Portrait BK: section 3, bank account ----------
+  // Sections 1 and 2 are the accrual view. This is the cash counterpart, and
+  // the only part of the report a member can check against a document the bank
+  // sent. It therefore reports not just the position but whether the position
+  // is PROVEN — each month either ties to its own statement or it does not.
+  const BK = [];
+  BK.push(H1("3. Bank account"));
+  if (!bank) {
+    BK.push(hint(`The bank account summary could not be loaded for FY ${fy}, so this section is omitted. It rebuilds from the imported statements — check Bank recon and generate the report again.`));
+  } else {
+    const bt = bank.totals;
+    BK.push(para(
+      `Money on Call account${bank.accountNumber ? ` ${bank.accountNumber}` : ""}. Opening and closing balances are the figures printed on the bank's own statements, not a calculated position.`,
+      { size: 20 }));
+
+    const pAligns = ["left", "right"];
+    const pRows = [hrow(["Position", `FY ${fy}`], pAligns)];
+    pRows.push(row(["Opening balance", bt.opening == null ? "—" : money(bt.opening)], pAligns));
+    pRows.push(row([`Money in (${bank.months.reduce((s, m) => s + (m.credits > 0 ? 1 : 0), 0)} months)`, money(bt.credits)], pAligns));
+    pRows.push(row(["Money out", money(bt.debits)], pAligns));
+    pRows.push(row(["Net movement", money(bt.movement)], pAligns, true));
+    pRows.push(row(["Closing balance", bt.closing == null ? "—" : money(bt.closing)], pAligns, true, BAND));
+    BK.push(tbl(pRows));
+
+    // Cash cover. The figure that separates a balance which looks healthy from
+    // one that is, and the reason it belongs in front of a meeting being asked
+    // to fund a reserve.
+    if (bank.monthsOfCover != null) {
+      BK.push(H2("Cash cover"));
+      const cAligns = ["left", "right"];
+      const cRows = [hrow(["", `FY ${fy}`], cAligns)];
+      cRows.push(row(["Average monthly expenditure", money(bank.avgMonthlySpend)], cAligns));
+      cRows.push(row(["Closing balance", money(bt.closing)], cAligns));
+      cRows.push(row(["Months of expenditure covered", nb(`${bank.monthsOfCover.toFixed(1)} months`)], cAligns, true, BAND));
+      BK.push(tbl(cRows));
+      BK.push(para(
+        bank.monthsOfCover >= 12
+          ? `The closing balance covers ${bank.monthsOfCover.toFixed(1)} months of the year's average spend — over a full year of expenditure held in cash. A balance this size is normally the sign of a scheme that has been accumulating without a stated purpose for the money, which is what section 13 addresses.`
+          : bank.monthsOfCover >= 3
+            ? `The closing balance covers ${bank.monthsOfCover.toFixed(1)} months of the year's average spend.`
+            : `The closing balance covers only ${bank.monthsOfCover.toFixed(1)} months of the year's average spend. A scheme with no reserve and under three months of cover has no capacity to absorb an unplanned repair without a special levy.`,
+        { size: 20 }));
+    }
+
+    BK.push(H2("Month by month"));
+    const mAl = ["left", "right", "right", "right", "right", "center"];
+    const mRows = [hrow(["Month", "Opening", "In", "Out", "Closing", "Reconciled"], mAl, WIDE)];
+    bank.months.forEach((m) => {
+      mRows.push(row([
+        m.label,
+        m.opening == null ? "—" : amt(m.opening),
+        m.credits ? amt(m.credits) : "—",
+        m.debits ? amt(m.debits) : "—",
+        m.closing == null ? "—" : amt(m.closing),
+        !m.hasStatement ? "no statement" : m.reconciled ? "yes" : `out by ${amt(m.drift)}`,
+      ], mAl, false, m.hasStatement && !m.reconciled ? "F4E7E7" : undefined, WIDE));
+    });
+    mRows.push(row([
+      "Year", bt.opening == null ? "—" : amt(bt.opening), amt(bt.credits), amt(bt.debits),
+      bt.closing == null ? "—" : amt(bt.closing),
+      bt.drift != null && Math.abs(bt.drift) <= 0.005 ? "yes" : (bt.drift == null ? "—" : `out by ${amt(bt.drift)}`),
+    ], mAl, true, BAND, WIDE));
+    BK.push(tbl(mRows));
+    BK.push(hint("All figures in rand, without the R prefix so no amount wraps. Reconciled means the statement's own opening and closing balances bracket that month's movements exactly."));
+
+    BK.push(H2("Verification"));
+    const vAligns = ["left", "right"];
+    const vRows = [hrow(["", `FY ${fy}`], vAligns)];
+    vRows.push(row(["Statements imported", nb(`${bank.statementsPresent} of ${bank.statementsExpected}`)], vAligns));
+    vRows.push(row(["Months reconciling to the statement", nb(`${bank.monthsReconciled} of ${bank.statementsPresent}`)], vAligns));
+    vRows.push(row(["Transactions recorded", String(bank.months.reduce((s, m) => s + m.lineCount, 0))], vAligns));
+    BK.push(tbl(vRows));
+    if (bank.monthsReconciled === bank.statementsExpected) {
+      BK.push(para(
+        `Every month of FY ${fy} reconciles to its bank statement to the cent. The income and expenditure statement in section 1 is built on transactions that have been checked line by line against what the bank printed.`,
+        { size: 20 }));
+    }
+    if (bank.monthsMissing.length) {
+      BK.push(hint(`No statement is imported for ${bank.monthsMissing.join(", ")}. Those months carry no verified position — import them on Bank recon.`));
+    }
+    if (bank.monthsUnreconciled.length) {
+      BK.push(hint(`${bank.monthsUnreconciled.join(", ")} ${bank.monthsUnreconciled.length === 1 ? "does" : "do"} not reconcile to the imported statement. The difference is shown against the month above and needs resolving before the accounts are presented.`));
+    }
+    if (bank.derivedMonths.length) {
+      BK.push(hint(`Opening and closing for ${bank.derivedMonths.join(", ")} were derived from the transaction lines rather than read off the statement header. Re-importing the PDF replaces them with the printed figures.`));
+    }
+  }
+
+  // ---------- Portrait C: sections 4 and 5 ----------
   const C = [];
 
-  // Sections 3 and 4 are the same table over two expense categories. The total
+  // Sections 4 and 5 are the same table over two expense categories. The total
   // is taken from the report's own line rather than from the sum of the rows
   // above, so the table can never contradict the figure on the dashboard and in
   // section 1 — and where the two disagree the document says so rather than
@@ -5530,12 +5635,12 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     return out;
   };
 
-  itemisedSection("3. Miscellaneous expenses", misc, "Miscellaneous", "No miscellaneous expenses recorded this year.").forEach((el) => C.push(el));
-  itemisedSection("4. Maintenance expenses", maintenance, "Repairs & Maintenance", "No maintenance expenses recorded this year.").forEach((el) => C.push(el));
+  itemisedSection("4. Miscellaneous expenses", misc, "Miscellaneous", "No miscellaneous expenses recorded this year.").forEach((el) => C.push(el));
+  itemisedSection("5. Maintenance expenses", maintenance, "Repairs & Maintenance", "No maintenance expenses recorded this year.").forEach((el) => C.push(el));
 
-  // ---------- Landscape D: section 5 ----------
+  // ---------- Landscape D: section 6 ----------
   const Dsec = [];
-  Dsec.push(H1("5. Insurance schedule (per unit)"));
+  Dsec.push(H1("6. Insurance schedule (per unit)"));
   const insCols = ["Unit No", "Sqm", "Sum Ins", "Premium", "Com Prop", "Sasria", "Broker", "Per Annum", "Per Month"];
   const insAligns = ["left", "right", "right", "right", "right", "right", "right", "right", "right"];
   const c4 = [hrow(insCols, insAligns)];
@@ -5572,12 +5677,12 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     ? `Per annum is premium plus common property, Sasria and broker fee; per month is a twelfth of it. Maintained on Config — edit the schedule there rather than in this document, so next year's report carries it forward. On landscape so the nine columns fit without splitting an amount across lines.`
     : `No insurance schedule has been captured for FY ${fy}, so the cells are blank for entry from the insurer's schedule. Capture it on Config to have this table fill automatically.`));
 
-  // ---------- Portrait E: sections 6, 7 and 8 ----------
+  // ---------- Portrait E: sections 7, 8 and 9 ----------
   const E = [];
   const CUR = `Current — FY ${fy}`;
   const NEW = `New — FY ${nfy}`;
 
-  E.push(H1("6. Blockwatch"));
+  E.push(H1("7. Blockwatch"));
   // The recorded monthly figure is the average of what actually went out; the
   // agreed fee is the one the meeting votes on, so a captured setting wins.
   const bwCurrent = settings.blockwatchMonthlyCurrent != null ? settings.blockwatchMonthlyCurrent : blockwatch.monthly;
@@ -5607,7 +5712,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     E.push(hint(`Recorded over ${blockwatch.monthCount} of the year's 12 months — the remaining ${12 - blockwatch.monthCount} carry no BlockWatch expense, bank debit or approved deduction. If the fee was paid in those months it hasn't been captured.`));
   }
 
-  E.push(H1("7. Garden service"));
+  E.push(H1("8. Garden service"));
   const gardenActual = (report.expenseRows.find((r) => r.label === "Garden Service") || {}).total || 0;
   const gs = settings;
   // Projected cost is derived from the proposed rate rather than typed, so it
@@ -5634,7 +5739,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   // Water and electricity sit under one Tariffs heading, with the usage trends
   // as the closing subsection — the charts read against the rates the meeting
   // is being asked to approve.
-  E.push(H1("8. Tariffs"));
+  E.push(H1("9. Tariffs"));
   E.push(H2("Water — Increasing block tariff (R / kL)"));
   const c7 = [hrow(["Band (kL)", CUR, NEW], ["left", "right", "right"])];
   waterBands.forEach((b) => c7.push(row([b.label, b.curr == null ? "" : money(b.curr), b.next == null ? "" : money(b.next)], ["left", "right", "right"])));
@@ -5702,7 +5807,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     E.push(hint(`No FY ${nfy} levy rates have been captured yet, so the "New" column is blank where the figure isn't already on the tariff tables. Capture them on Tariffs & rates to have them fill automatically.`));
   }
 
-  // ---------- Landscape G: section 8.4, the usage trend charts ----------
+  // ---------- Landscape G: section 9.4, the usage trend charts ----------
   // The same two charts as the Financial dashboard, from the same builder, so
   // the report cannot show a different picture from the screen. Landscape so
   // both fit at a legible width.
@@ -5745,7 +5850,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     G.push(hint("The dotted line adds the flat common-property provision from the levy rates, not bulk less meters — that derived gap goes negative in some months because council invoice periods do not line up with reading months, and it is covered by the provision check on Utility bills."));
   }
 
-  // ---------- Landscape W: section 9 ----------
+  // ---------- Landscape W: section 10 ----------
   // Water charged by CoJ against water billed to owners. A permanent part of
   // the template: it is the one place the meeting can see what the scheme
   // recovers on water versus what the council actually charged for it, and
@@ -5753,7 +5858,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   // nobody's meter accounts for. Built entirely from captured data — no figure
   // in it is typed into this document.
   const W = [];
-  W.push(H1("9. Water — charged by CoJ vs billed to owners"));
+  W.push(H1("10. Water — charged by CoJ vs billed to owners"));
   if (!water) {
     W.push(hint(`Water charged-vs-billed could not be loaded for FY ${fy}, so this section is omitted. It rebuilds from the council invoices, meter readings and levy grid — check those pages and generate the report again.`));
   } else {
@@ -5846,7 +5951,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
       fRows.push(row(["Sewerage", lastWithFixed.sewerPerUnit == null ? "" : money(lastWithFixed.sewerPerUnit), annual(lastWithFixed.sewerPerUnit)], fAligns));
       fRows.push(row(["Water demand levy", lastWithFixed.demandLevyPerUnit == null ? "" : money(lastWithFixed.demandLevyPerUnit), annual(lastWithFixed.demandLevyPerUnit)], fAligns));
       W.push(tbl(fRows));
-      W.push(hint("Both are charged by CoJ per dwelling and billed on to each unit at the same figure, so they recover exactly and are excluded from the margin above. Rates shown are the latest captured in the year; where one rose mid-year, section 8 says when."));
+      W.push(hint("Both are charged by CoJ per dwelling and billed on to each unit at the same figure, so they recover exactly and are excluded from the margin above. Rates shown are the latest captured in the year; where one rose mid-year, section 9 says when."));
     }
 
     // Everything that qualifies the numbers above, said plainly rather than
@@ -5869,9 +5974,9 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     }
   }
 
-  // ---------- Portrait E2: section 10 ----------
+  // ---------- Portrait E2: section 11 ----------
   const E2 = [];
-  E2.push(H1("10. Service notes"));
+  E2.push(H1("11. Service notes"));
   // Each note takes its recorded cost from its own line in section 1, so it
   // cannot contradict the statement and cannot go stale. The notes used to
   // assert WHERE a cost was recorded — "in the operating-expense log" — which
@@ -5898,7 +6003,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   // ---------- Landscape F: section 10 ----------
   // Nine columns of rand amounts; landscape so no figure has to wrap.
   const F = [];
-  F.push(H1(`11. Levy split — proposed for FY ${nfy}`));
+  F.push(H1(`12. Levy split — proposed for FY ${nfy}`));
   if (levySplitIsCarriedOver) {
     F.push(hint(`No FY ${nfy} levy grid has been captured yet, so this table carries forward the FY ${fy} figures as a starting point. Adjust each line for the new year.`));
   }
@@ -5920,6 +6025,132 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   c10.push(row(["Total per unit", ...units.map((u) => (anyCaptured ? money(colTotals[u.no]) : "")), anyCaptured ? money(grand) : ""], lAligns, true, BAND, WIDE));
   F.push(tbl(c10));
 
+  // ---------- Landscape MP: section 13 ----------
+  // The statutory section. PMR 22 requires a written maintenance, repair and
+  // replacement plan over at least ten years, re-approved at every AGM. It is
+  // built from the register rather than typed, so it cannot say one thing here
+  // and another on the Maintenance page.
+  const MP = [];
+  MP.push(H1("13. Maintenance, repair and replacement plan (PMR 22)"));
+  if (!plan) {
+    MP.push(hint(`The maintenance plan could not be loaded for FY ${fy}, so this section is omitted. It rebuilds from the asset register — check the Maintenance page and generate the report again.`));
+  } else {
+    MP.push(para(
+      "Prescribed Management Rule 22 requires the body corporate to maintain a written plan for the maintenance, repair and replacement of major capital items over at least ten years, and to have it approved at each annual general meeting. The plan below is built from the component register; the annual contribution is the rule's own formula, being replacement cost less the reserve already held, divided by the years remaining.",
+      { size: 20 }));
+
+    // Coverage first. A plan built on 3 of 27 components is not a plan, and the
+    // report should say so before it shows a single rand.
+    MP.push(H2("Register coverage"));
+    const cAligns = ["left", "right"];
+    const cRows = [hrow(["", "Components"], cAligns)];
+    cRows.push(row(["On the register", String(plan.totalCount)], cAligns));
+    cRows.push(row(["Assessed — cost and remaining life known", String(plan.assessedCount)], cAligns, true));
+    cRows.push(row(["Not yet assessed", String(plan.totalCount - plan.assessedCount)], cAligns));
+    MP.push(tbl(cRows));
+    if (plan.assessedCount === 0) {
+      MP.push(para(
+        `No component has been assessed yet, so no plan can be calculated and the tables below are empty. The register carries ${plan.totalCount} components as a checklist; each needs an age or install date, an expected life, a present condition and an estimated replacement cost. That is a walk around the property with a clipboard, not a consultant.`,
+        { size: 20 }));
+      MP.push(hint("Until this is done the scheme is not compliant with PMR 22. It is the single largest gap in the AGM pack."));
+    } else if (plan.assessedCount < plan.totalCount) {
+      MP.push(hint(`${plan.totalCount - plan.assessedCount} of ${plan.totalCount} components are unassessed and contribute nothing to the figures below, so the contribution is understated. They are listed at the end of this section.`));
+    }
+
+    // Reserve fund position.
+    MP.push(H2("Reserve fund"));
+    const rAligns = ["left", "right"];
+    const rRows = [hrow(["", `FY ${fy}`], rAligns)];
+    rRows.push(row(["Contributions and interest to date", money(plan.reserve.contributions)], rAligns));
+    rRows.push(row(["Drawdowns", money(plan.reserve.drawdowns)], rAligns));
+    rRows.push(row(["Balance held", money(plan.reserve.balance)], rAligns, true, BAND));
+    MP.push(tbl(rRows));
+    if (plan.reserve.entryCount === 0) {
+      MP.push(para(
+        "There is no reserve fund. The ledger has no entries, so the whole replacement cost of every component still has to be funded from future contributions — which is what makes the annual figure below as large as it is.",
+        { size: 20 }));
+    }
+
+    // The statutory floor.
+    if (floor) {
+      MP.push(H2("The statutory minimum"));
+      const fAligns = ["left", "right"];
+      const fRows = [hrow(["", `FY ${nfy}`], fAligns)];
+      fRows.push(row([`Levies collected in FY ${fy}`, money(floor.leviesCollected)], fAligns));
+      fRows.push(row(["25% of that — the reserve fund threshold", money(floor.threshold)], fAligns));
+      fRows.push(row(["Reserve fund held", money(plan.reserve.balance)], fAligns));
+      fRows.push(row(["Below the threshold?", floor.below ? "Yes" : "No"], fAligns, true));
+      if (floor.below && floor.floor != null) {
+        fRows.push(row(["Budgeted administrative contribution", money(floor.adminBudget)], fAligns));
+        fRows.push(row(["Minimum reserve contribution — 15% of it", money(floor.floor)], fAligns, true, BAND));
+        fRows.push(row(["Per unit, per month", money(round2(floor.floor / (units.length || 7) / 12))], fAligns));
+      }
+      MP.push(tbl(fRows));
+      if (floor.below && floor.floor != null) {
+        MP.push(para(
+          `Because the reserve fund is below 25% of last year's levies, PMR 22 requires the coming year's budgeted reserve contribution to be at least 15% of the budgeted administrative contribution — ${money(floor.floor)}, about ${money(round2(floor.floor / (units.length || 7) / 12))} per unit per month. This is a floor set by regulation, not a proposal, and it applies whether or not the plan below has been completed.`,
+          { size: 20 }));
+      }
+    }
+
+    if (plan.assessedCount > 0) {
+      MP.push(H2("Annual contribution required by the plan"));
+      const aAligns = ["left", "right"];
+      const aRows = [hrow(["", `FY ${fy}`], aAligns)];
+      aRows.push(row(["Replacement cost of assessed components", money(plan.totalReplacementCost)], aAligns));
+      aRows.push(row(["Less reserve already held", money(plan.reserve.balance)], aAligns));
+      aRows.push(row(["Annual contribution — PMR 22(2)", money(plan.annualContribution)], aAligns, true, BAND));
+      aRows.push(row(["Per unit, per month", money(round2(plan.annualContribution / (units.length || 7) / 12))], aAligns));
+      MP.push(tbl(aRows));
+      MP.push(hint(`Each component contributes its own replacement cost less the reserve attributed to it, divided by its remaining life; the total is the sum. Reserve entries tagged to a component are attributed directly, and the untagged balance is apportioned in proportion to replacement cost.`));
+
+      // The ten-year schedule.
+      MP.push(H2("Ten-year schedule"));
+      const sAligns = ["left", "left", "right"];
+      const sRows = [hrow(["Year", "Components falling due", `Cost at ${plan.inflationPct}% inflation`], sAligns, WIDE)];
+      plan.schedule.forEach((y) => {
+        sRows.push(row([
+          y.label,
+          y.items.length ? y.items.map((i) => i.name).join(", ") : "—",
+          y.total ? amt(y.total) : "—",
+        ], sAligns, false, undefined, WIDE));
+      });
+      sRows.push(row(["Ten-year total", "", amt(round2(plan.schedule.reduce((s, y) => s + y.total, 0)))], sAligns, true, BAND, WIDE));
+      MP.push(tbl(sRows));
+      MP.push(hint(`Costs are shown at the year each component falls due, inflated at ${plan.inflationPct}% a year from today's estimate. A year with no components due is not a year with no maintenance — it is a year with no major capital replacement.`));
+      if (plan.beyondWindow) {
+        MP.push(hint(`${plan.beyondWindow} component(s) fall due beyond the ten-year window, ${money(plan.beyondWindowCost)} at the same inflation assumption. They are excluded from the table but included in the annual contribution, which is what the later years are building towards.`));
+      }
+
+      // Component detail.
+      MP.push(H2("Component register"));
+      const dAligns = ["left", "left", "left", "right", "right", "right", "right"];
+      const dRows = [hrow(["Component", "Category", "Condition", "Life", "Remaining", "Replacement cost", "Annual provision"], dAligns, WIDE)];
+      plan.rows.filter((r) => r.assessed).forEach((r) => {
+        dRows.push(row([
+          r.name, r.category, r.condition || "not inspected",
+          r.expectedLife == null ? "—" : `${r.expectedLife}y`,
+          r.remaining == null ? "—" : `${r.remaining}y`,
+          amt(r.cost), amt(r.annualProvision),
+        ], dAligns, false, undefined, WIDE));
+      });
+      dRows.push(row(["Total", "", "", "", "", amt(plan.totalReplacementCost), amt(plan.annualContribution)], dAligns, true, BAND, WIDE));
+      MP.push(tbl(dRows));
+    }
+
+    if (plan.unassessed.length) {
+      MP.push(H2("Not yet assessed"));
+      MP.push(para(plan.unassessed.map((r) => r.name).join(" · "), { size: 18 }));
+      MP.push(hint("Each needs an install date or age, an expected life, a present condition and an estimated replacement cost before it can carry a provision. Captured on the Maintenance page."));
+    }
+
+    if (plan.snapshot) {
+      MP.push(hint(`A plan was approved for FY ${plan.snapshot.financial_year}${plan.snapshot.approved_on ? ` on ${plan.snapshot.approved_on}` : ""}${plan.snapshot.approved_by ? ` by ${plan.snapshot.approved_by}` : ""} and is held as a snapshot. The figures above are the live position from the register, which may since have moved.`));
+    } else {
+      MP.push(hint(`No approved plan is on record for FY ${fy}. Once the meeting adopts one, save it as a snapshot on the Maintenance page so the approved version is preserved — PMR 22 compliance rests on what was adopted, not on what the register says later.`));
+    }
+  }
+
   // Signature line. The names come from Config so the document doesn't have to
   // be edited in Word every year just to change who checked it; with none
   // captured it falls back to the generic trustee wording.
@@ -5928,7 +6159,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     settings.preparedBy ? `${settings.preparedBy}` : "El Corazon Body Corporate finance trustee",
     settings.checkedBy ? `Checked by ${settings.checkedBy}` : null,
   ].filter(Boolean).join("; ");
-  F.push(new Paragraph({ spacing: { before: 300 }, children: [new TextRun({ text: `Prepared ${preparedDate} · ${who}`, italics: true, size: 18, color: "94A0AC" })] }));
+  MP.push(new Paragraph({ spacing: { before: 300 }, children: [new TextRun({ text: `Prepared ${preparedDate} · ${who}`, italics: true, size: 18, color: "94A0AC" })] }));
 
   const portrait = { page: { size: { orientation: PageOrientation.PORTRAIT } } };
   const landscape = { page: { size: { orientation: PageOrientation.LANDSCAPE } } };
@@ -5937,6 +6168,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     sections: [
       { properties: portrait, children: A },
       { properties: landscape, children: B },
+      { properties: portrait, children: BK },
       { properties: portrait, children: C },
       { properties: landscape, children: Dsec },
       { properties: portrait, children: E },
@@ -5944,6 +6176,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
       { properties: landscape, children: W },
       { properties: portrait, children: E2 },
       { properties: landscape, children: F },
+      { properties: landscape, children: MP },
     ],
   });
   const blob = await Packer.toBlob(doc);
@@ -6200,6 +6433,222 @@ async function fetchWaterReconciliation(fy) {
     cpMonthly, cpMonthlyIncVat, cpCaptured, unitCount, vatRate,
     cpPerUnitIncVat: unitCount ? round2(cpMonthlyIncVat / unitCount) : null,
   };
+}
+
+// ---------- Bank account status ----------
+// Section 3 of the AGM report. The income & expenditure statement is an accrual
+// view; this is the cash counterpart, and it is the one a meeting can verify
+// against a piece of paper the bank sent.
+//
+// Everything here comes from `bank_statement_documents` and `bank_transactions`,
+// both of which now carry the statement's own printed balances, so the section
+// can state not just the position but whether it is PROVEN — every month either
+// reconciles to its statement or it does not, and a month that does not is named.
+async function fetchBankAccountSummary(fy) {
+  const client = await ensureSupabaseClient();
+  const { from, to } = fyBounds(fy);
+  const [docs, txns] = await Promise.all([
+    client.from("bank_statement_documents")
+      .select("period, file_name, opening_balance, closing_balance, balance_source, statement_from, statement_to, account_number")
+      .gte("period", from).lte("period", to).order("period"),
+    client.from("bank_transactions")
+      .select("period, amount, direction, balance_after, line_no, expense_category")
+      .gte("period", from).lte("period", to),
+  ]);
+  const failed = [docs, txns].find((r) => r.error);
+  if (failed) throw failed.error;
+
+  const docByPeriod = {};
+  (docs.data || []).forEach((d) => { docByPeriod[String(d.period).slice(0, 10)] = d; });
+  const byPeriod = {};
+  (txns.data || []).forEach((t) => {
+    const p = String(t.period).slice(0, 10);
+    if (!byPeriod[p]) byPeriod[p] = [];
+    byPeriod[p].push(t);
+  });
+
+  const periods = fyPeriods(fy);
+  const months = periods.map((p) => {
+    const d = docByPeriod[p];
+    const list = byPeriod[p] || [];
+    const credits = round2(list.filter((t) => t.direction === "credit").reduce((s, t) => s + Number(t.amount), 0));
+    const debits = round2(list.filter((t) => t.direction === "debit").reduce((s, t) => s + Number(t.amount), 0));
+    const opening = d && d.opening_balance != null ? Number(d.opening_balance) : null;
+    const closing = d && d.closing_balance != null ? Number(d.closing_balance) : null;
+    // Reconciled means the statement's own opening and closing bracket the
+    // movements exactly. Not "we think it is right" — the bank said so.
+    const drift = opening != null && closing != null ? round2(opening + credits - debits - closing) : null;
+    return {
+      period: p,
+      label: (() => { const [y, m] = p.split("-"); return `${MONTH_NAMES[parseInt(m, 10) - 1].slice(0, 3)} ${y.slice(2)}`; })(),
+      opening, closing, credits, debits, drift,
+      reconciled: drift != null && Math.abs(drift) <= 0.005,
+      hasStatement: Boolean(d),
+      balanceSource: d ? d.balance_source : null,
+      lineCount: list.length,
+      missingBalances: list.filter((t) => t.balance_after == null).length,
+      fileName: d ? d.file_name : null,
+    };
+  });
+
+  const present = months.filter((m) => m.hasStatement);
+  const withBalances = months.filter((m) => m.opening != null && m.closing != null);
+  const totals = {
+    credits: round2(months.reduce((s, m) => s + m.credits, 0)),
+    debits: round2(months.reduce((s, m) => s + m.debits, 0)),
+    opening: withBalances.length ? withBalances[0].opening : null,
+    closing: withBalances.length ? withBalances[withBalances.length - 1].closing : null,
+  };
+  totals.movement = round2(totals.credits - totals.debits);
+  totals.drift = totals.opening != null && totals.closing != null
+    ? round2(totals.opening + totals.credits - totals.debits - totals.closing) : null;
+
+  // Months of cover: how long the closing balance would fund the scheme at this
+  // year's average monthly spend. The number trustees actually want and that
+  // nobody works out, because it is the difference between a healthy balance and
+  // one that only looks healthy.
+  const monthsWithSpend = months.filter((m) => m.debits > 0).length || 12;
+  const avgMonthlySpend = monthsWithSpend ? round2(totals.debits / monthsWithSpend) : null;
+  const monthsOfCover = avgMonthlySpend > 0 && totals.closing != null
+    ? round2(totals.closing / avgMonthlySpend) : null;
+
+  return {
+    months, totals, avgMonthlySpend, monthsOfCover,
+    accountNumber: (docs.data || []).map((d) => d.account_number).find(Boolean) || null,
+    statementsPresent: present.length,
+    statementsExpected: periods.length,
+    monthsReconciled: months.filter((m) => m.reconciled).length,
+    monthsUnreconciled: months.filter((m) => m.hasStatement && !m.reconciled).map((m) => m.label),
+    monthsMissing: months.filter((m) => !m.hasStatement).map((m) => m.label),
+    derivedMonths: months.filter((m) => m.balanceSource === "derived").map((m) => m.label),
+  };
+}
+
+// ---------- PMR 22: maintenance plan and reserve fund ----------
+// The plan is COMPUTED from the register every time rather than stored, so it
+// cannot go stale. What gets stored is the version a meeting approved.
+//
+// Remaining life, in order of authority:
+//   1. the latest inspection's revised figure, where an inspector gave one
+//   2. expected life less age, where the install date and expected life are known
+//   3. unknown — and the component is reported as unassessed rather than guessed
+//
+// PMR 22(2): annual contribution = (estimated cost − past contributions) ÷
+// expected remaining life. "Past contributions" is the reserve already held.
+// Where a reserve entry is tagged to a component that attribution is used;
+// the untagged balance is apportioned across components in proportion to
+// replacement cost, which is stated in the report rather than left implicit.
+async function fetchMaintenancePlan(fy, opts = {}) {
+  const client = await ensureSupabaseClient();
+  const [assets, inspections, reserve, snapshot] = await Promise.all([
+    client.from("assets").select("*").eq("active", true).order("sort_order").order("name"),
+    client.from("asset_inspections").select("*").order("inspected_on", { ascending: false }),
+    client.from("reserve_fund_entries").select("*").order("entry_date"),
+    client.from("maintenance_plan_snapshots").select("*").eq("financial_year", fy).limit(1),
+  ]);
+  const failed = [assets, inspections, reserve, snapshot].find((r) => r.error);
+  if (failed) throw failed.error;
+
+  const inflationPct = opts.inflationPct != null ? Number(opts.inflationPct) : 6;
+  const fyStartYear = Number(String(fy).split("/")[0]);
+  const asOf = `${fyStartYear + 1}-07-31`;
+
+  const latestByAsset = {};
+  (inspections.data || []).forEach((i) => { if (!latestByAsset[i.asset_id]) latestByAsset[i.asset_id] = i; });
+
+  const entries = reserve.data || [];
+  const signed = (e) => (e.entry_type === "drawdown" ? -Math.abs(Number(e.amount)) : Number(e.amount));
+  const reserveBalance = round2(entries.reduce((s, e) => s + signed(e), 0));
+  const taggedByAsset = {};
+  entries.forEach((e) => { if (e.asset_id) taggedByAsset[e.asset_id] = round2((taggedByAsset[e.asset_id] || 0) + signed(e)); });
+  const taggedTotal = round2(Object.values(taggedByAsset).reduce((s, v) => s + v, 0));
+  const untagged = round2(reserveBalance - taggedTotal);
+
+  const rows = (assets.data || []).map((a) => {
+    const insp = latestByAsset[a.id] || null;
+    const cost = a.replacement_cost == null ? null : Number(a.replacement_cost);
+    const life = a.expected_life_years == null ? null : Number(a.expected_life_years);
+    let remaining = null, remainingBasis = null;
+    if (insp && insp.revised_remaining_life_years != null) {
+      remaining = Number(insp.revised_remaining_life_years);
+      remainingBasis = `inspection ${String(insp.inspected_on).slice(0, 10)}`;
+    } else if (life != null && a.installed_on) {
+      const ageYears = (new Date(asOf) - new Date(a.installed_on)) / (365.25 * 24 * 3600 * 1000);
+      remaining = Math.max(0, Math.round(life - ageYears));
+      remainingBasis = `age against a ${life}-year life`;
+    } else if (life != null) {
+      remaining = life;
+      remainingBasis = `full ${life}-year life — no install date captured`;
+    }
+    const assessed = cost != null && remaining != null;
+    return {
+      id: a.id, code: a.code, name: a.name, category: a.category, status: a.status,
+      installedOn: a.installed_on, expectedLife: life, cost, costBasis: a.cost_basis, notes: a.notes,
+      condition: insp ? insp.condition : null,
+      inspectedOn: insp ? String(insp.inspected_on).slice(0, 10) : null,
+      remaining, remainingBasis, assessed,
+      dueYear: assessed ? fyStartYear + Math.max(0, remaining) : null,
+    };
+  });
+
+  // Apportion the untagged reserve across assessed components by cost share.
+  const assessedRows = rows.filter((r) => r.assessed);
+  const assessedCost = round2(assessedRows.reduce((s, r) => s + r.cost, 0));
+  assessedRows.forEach((r) => {
+    const share = assessedCost > 0 ? untagged * (r.cost / assessedCost) : 0;
+    r.reserveHeld = round2((taggedByAsset[r.id] || 0) + share);
+    const years = Math.max(1, r.remaining || 0);
+    r.annualProvision = round2(Math.max(0, r.cost - r.reserveHeld) / years);
+    // Cost at the year it actually falls due, at the inflation assumption.
+    r.inflatedCost = round2(r.cost * Math.pow(1 + inflationPct / 100, Math.max(0, r.remaining || 0)));
+  });
+  rows.filter((r) => !r.assessed).forEach((r) => { r.reserveHeld = null; r.annualProvision = null; r.inflatedCost = null; });
+
+  const annualContribution = round2(assessedRows.reduce((s, r) => s + (r.annualProvision || 0), 0));
+
+  // The ten-year schedule, by the year each component falls due.
+  const schedule = Array.from({ length: 10 }, (_, i) => {
+    const year = fyStartYear + i;
+    const due = assessedRows.filter((r) => r.dueYear === year);
+    return {
+      year, label: `${year}/${year + 1}`,
+      items: due.map((r) => ({ name: r.name, code: r.code, cost: r.cost, inflatedCost: r.inflatedCost })),
+      total: round2(due.reduce((s, r) => s + (r.inflatedCost || 0), 0)),
+    };
+  });
+  // Anything falling due beyond the ten-year window still matters — it is what
+  // the later years of the contribution are building towards.
+  const beyond = assessedRows.filter((r) => r.dueYear != null && r.dueYear >= fyStartYear + 10);
+
+  return {
+    fy, asOf, inflationPct,
+    rows, assessedCount: assessedRows.length, totalCount: rows.length,
+    unassessed: rows.filter((r) => !r.assessed),
+    totalReplacementCost: assessedCost,
+    reserve: {
+      balance: reserveBalance, tagged: taggedTotal, untagged,
+      entryCount: entries.length,
+      contributions: round2(entries.filter((e) => e.entry_type !== "drawdown").reduce((s, e) => s + Number(e.amount), 0)),
+      drawdowns: round2(entries.filter((e) => e.entry_type === "drawdown").reduce((s, e) => s + Math.abs(Number(e.amount)), 0)),
+    },
+    annualContribution,
+    schedule, beyondWindow: beyond.length,
+    beyondWindowCost: round2(beyond.reduce((s, r) => s + (r.inflatedCost || 0), 0)),
+    snapshot: (snapshot.data || [])[0] || null,
+  };
+}
+
+// The PMR 22 minimum. If the reserve fund at the end of the last financial year
+// is below 25% of that year's total levies, the coming year's budgeted reserve
+// contribution must be at least 15% of the budgeted administrative contribution.
+// Returns the floor and whether it bites, so the report can state it as a rule
+// rather than as an opinion.
+function reserveFundFloor({ reserveBalance, leviesCollected, adminBudget }) {
+  if (leviesCollected == null) return null;
+  const threshold = round2(leviesCollected * 0.25);
+  const below = (reserveBalance || 0) < threshold;
+  const floor = below && adminBudget != null ? round2(adminBudget * 0.15) : null;
+  return { threshold, below, floor, adminBudget: adminBudget == null ? null : round2(adminBudget) };
 }
 
 // The water band set in force on a given date, in the shape calcWaterCost and
@@ -6906,7 +7355,7 @@ function InsurancePage() {
     <>
       <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Insurance</h1>
       <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 14 }}>
-        Upload the broker's annual Schedule of Insurance and it becomes the per-unit insurance figure — section 5 of the AGM report, and the Insurance line on every statement.
+        Upload the broker's annual Schedule of Insurance and it becomes the per-unit insurance figure — section 6 of the AGM report, and the Insurance line on every statement.
         The policy year runs 1 September; the body corp financial year runs 1 August to 31 July, so capture a renewal against the year it will be billed in.
       </p>
 
@@ -6945,7 +7394,7 @@ function InsurancePage() {
 
           {/* ---- Section 5 table ---- */}
           <Card style={{ marginBottom: 16 }}>
-            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Insurance schedule (per unit) — section 5 of the AGM report</div>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Insurance schedule (per unit) — section 6 of the AGM report</div>
             <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 0, marginBottom: 14, lineHeight: 1.6 }}>
               Per annum is premium plus common property, Sasria and broker fee; per month is a twelfth of it. Both are derived, never stored, so they cannot disagree with their own components.
               Every cell stays editable — the upload fills them, it doesn’t lock them.
@@ -9011,5 +9460,280 @@ function BankRecon({ periods, period, setPeriod, onImported }) {
         </>
       )}
     </>
+  );
+}
+
+// ---------- Maintenance plan & reserve fund ----------
+// Added 8 August 2026. Where the PMR 22 register actually lives: the component
+// list, its condition history, and the reserve fund ledger. Section 13 of the
+// AGM report is computed from exactly this data, so anything captured here
+// appears in the report and nothing has to be typed twice.
+function MaintenancePlan() {
+  const [plan, setPlan] = useState(null);
+  const [status, setStatus] = useState("loading"); // loading | ready | error
+  const [saving, setSaving] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [edits, setEdits] = useState({});          // assetId -> patch
+  const [inspectFor, setInspectFor] = useState(null);
+  const [entry, setEntry] = useState({ entry_date: TODAY_ISO, entry_type: "contribution", amount: "", description: "" });
+  const [reserveRows, setReserveRows] = useState([]);
+  const fy = FY_ACTIVE;
+
+  const load = async () => {
+    setStatus("loading");
+    try {
+      const [p, client] = [await fetchMaintenancePlan(fy), await ensureSupabaseClient()];
+      const r = await client.from("reserve_fund_entries").select("*").order("entry_date", { ascending: false });
+      if (r.error) throw r.error;
+      setPlan(p); setReserveRows(r.data || []); setStatus("ready");
+    } catch (err) {
+      console.error("Loading the maintenance plan failed:", err);
+      setStatus("error");
+    }
+  };
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const patch = (id, field, value) => setEdits((e) => ({ ...e, [id]: { ...(e[id] || {}), [field]: value } }));
+  const dirty = Object.keys(edits).length;
+
+  // Only the four fields a survey produces are editable here. Everything else
+  // about a component — its name, category, code — is register structure and is
+  // changed deliberately, not in passing while capturing a condition.
+  const saveAssets = async () => {
+    setSaving("assets"); setNotice(null);
+    try {
+      const client = await ensureSupabaseClient();
+      for (const [id, p] of Object.entries(edits)) {
+        const row = { updated_at: new Date().toISOString() };
+        if ("installed_on" in p) row.installed_on = p.installed_on || null;
+        if ("expected_life_years" in p) row.expected_life_years = p.expected_life_years === "" ? null : Number(p.expected_life_years);
+        if ("replacement_cost" in p) row.replacement_cost = p.replacement_cost === "" ? null : parseAmount(p.replacement_cost);
+        if ("cost_basis" in p) row.cost_basis = p.cost_basis || null;
+        if ("notes" in p) row.notes = p.notes || null;
+        // A component with both a cost and a life is assessed by definition.
+        const merged = { ...(plan.rows.find((r) => r.id === id) || {}) };
+        const cost = "replacement_cost" in row ? row.replacement_cost : merged.cost;
+        const life = "expected_life_years" in row ? row.expected_life_years : merged.expectedLife;
+        if (cost != null && life != null && merged.status === "not_assessed") row.status = "assessed";
+        const { error } = await client.from("assets").update(row).eq("id", id);
+        if (error) throw error;
+      }
+      setEdits({}); setNotice(`Saved ${Object.keys(edits).length} component(s).`);
+      await load();
+    } catch (err) {
+      console.error("Saving the register failed:", err);
+      setNotice("Saving failed — see browser console. Nothing was written.");
+    }
+    setSaving(null);
+  };
+
+  const addInspection = async (assetId, form) => {
+    setSaving("inspection"); setNotice(null);
+    try {
+      const client = await ensureSupabaseClient();
+      const { error } = await client.from("asset_inspections").upsert({
+        asset_id: assetId, inspected_on: form.inspected_on, condition: form.condition,
+        inspector: form.inspector || null, notes: form.notes || null,
+        revised_remaining_life_years: form.revised === "" || form.revised == null ? null : Number(form.revised),
+      }, { onConflict: "asset_id,inspected_on" });
+      if (error) throw error;
+      setInspectFor(null); setNotice("Inspection recorded.");
+      await load();
+    } catch (err) {
+      console.error("Recording the inspection failed:", err);
+      setNotice("Recording the inspection failed — see browser console.");
+    }
+    setSaving(null);
+  };
+
+  const addReserveEntry = async () => {
+    const amount = parseAmount(entry.amount);
+    if (!amount) { setNotice("Enter an amount."); return; }
+    setSaving("reserve"); setNotice(null);
+    try {
+      const client = await ensureSupabaseClient();
+      const { error } = await client.from("reserve_fund_entries").insert({
+        entry_date: entry.entry_date, financial_year: fy, entry_type: entry.entry_type,
+        // A drawdown is stored as a positive amount with its type carrying the
+        // sign, so the ledger reads the way a bank statement does.
+        amount: Math.abs(amount), description: entry.description || null,
+      });
+      if (error) throw error;
+      setEntry({ entry_date: TODAY_ISO, entry_type: "contribution", amount: "", description: "" });
+      setNotice("Reserve fund entry added.");
+      await load();
+    } catch (err) {
+      console.error("Adding the reserve entry failed:", err);
+      setNotice("Adding the entry failed — see browser console.");
+    }
+    setSaving(null);
+  };
+
+  const money = (n) => (n == null ? "—" : `R ${Number(n).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  const th = { padding: "6px 8px", textAlign: "left", fontSize: 11, textTransform: "uppercase", color: "#64748B" };
+  const td = { padding: "5px 8px", borderTop: "1px solid #F0EADC", fontSize: 12.5 };
+  const inp = { ...inputStyle, padding: "4px 6px", fontSize: 12.5, width: "100%", boxSizing: "border-box" };
+
+  if (status === "loading") return <Card><div style={{ fontSize: 13, color: "#64748B" }}>Loading the register…</div></Card>;
+  if (status === "error") return <Card><div style={{ fontSize: 13, color: "#B5651D" }}>Could not load the maintenance plan — see browser console.</div></Card>;
+
+  const val = (r, field, fallback) => {
+    const e = edits[r.id] || {};
+    return field in e ? e[field] : (fallback == null ? "" : fallback);
+  };
+
+  return (
+    <>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Maintenance plan & reserve fund</h1>
+      <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
+        The component register behind the statutory ten-year plan. Section 13 of the AGM report is computed from exactly this data — capture it once here and it appears in the report. A component needs <strong>an expected life and a replacement cost</strong> before it can carry a provision; everything else sharpens the estimate.
+      </p>
+
+      {notice && (
+        <Card style={{ marginBottom: 14, borderColor: "#B9D4C6" }}>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: "#2F5D50" }}>{notice}</div>
+        </Card>
+      )}
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 28, flexWrap: "wrap", fontSize: 13 }}>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>ASSESSED</div><strong>{plan.assessedCount} of {plan.totalCount}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>REPLACEMENT COST</div><strong>{money(plan.totalReplacementCost)}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>RESERVE HELD</div><strong>{money(plan.reserve.balance)}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>ANNUAL CONTRIBUTION</div><strong>{money(plan.annualContribution)}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>PER UNIT / MONTH</div><strong>{money(plan.annualContribution / 7 / 12)}</strong></div>
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 12, flexWrap: "wrap" }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5 }}>Component register</div>
+          <button style={{ ...primaryBtn, opacity: dirty ? 1 : 0.5 }} onClick={saveAssets} disabled={!dirty || saving === "assets"}>
+            {saving === "assets" ? "Saving…" : dirty ? `Save ${dirty} change(s)` : "No changes"}
+          </button>
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 1040 }}>
+            <thead><tr>
+              <th style={th}>Component</th><th style={th}>Installed</th><th style={th}>Life (yrs)</th>
+              <th style={th}>Replacement cost</th><th style={th}>Cost basis</th>
+              <th style={th}>Condition</th><th style={th}>Remaining</th><th style={th}>Provision / yr</th><th style={th} />
+            </tr></thead>
+            <tbody>
+              {plan.rows.map((r, i) => {
+                const prev = i === 0 || plan.rows[i - 1].category !== r.category;
+                return (
+                  <React.Fragment key={r.id}>
+                    {prev && (
+                      <tr><td colSpan={9} style={{ ...td, background: "#F6F1E7", fontWeight: 700, fontSize: 12 }}>{r.category}</td></tr>
+                    )}
+                    <tr style={r.assessed ? undefined : { background: "#FCFAF5" }}>
+                      <td style={td}>
+                        <div style={{ fontWeight: 600 }}>{r.name}</div>
+                        {r.notes && <div style={{ fontSize: 11, color: "#94A0AC", maxWidth: 260 }}>{r.notes}</div>}
+                      </td>
+                      <td style={td}><input type="date" style={inp} value={val(r, "installed_on", r.installedOn)} onChange={(e) => patch(r.id, "installed_on", e.target.value)} /></td>
+                      <td style={td}><input style={{ ...inp, maxWidth: 70 }} inputMode="numeric" value={val(r, "expected_life_years", r.expectedLife)} onChange={(e) => patch(r.id, "expected_life_years", e.target.value)} /></td>
+                      <td style={td}><input style={{ ...inp, maxWidth: 120 }} inputMode="decimal" value={val(r, "replacement_cost", r.cost)} onChange={(e) => patch(r.id, "replacement_cost", e.target.value)} /></td>
+                      <td style={td}>
+                        <select style={{ ...inp, maxWidth: 130 }} value={val(r, "cost_basis", r.costBasis)} onChange={(e) => patch(r.id, "cost_basis", e.target.value)}>
+                          <option value="">—</option><option value="quote">Quote</option><option value="valuation">Valuation</option>
+                          <option value="insurer schedule">Insurer schedule</option><option value="estimate">Estimate</option>
+                        </select>
+                      </td>
+                      <td style={td}>
+                        {r.condition ? <span style={{ fontWeight: 600 }}>{r.condition}</span> : <span style={{ color: "#94A0AC" }}>—</span>}
+                        {r.inspectedOn && <div style={{ fontSize: 10.5, color: "#94A0AC" }}>{r.inspectedOn}</div>}
+                      </td>
+                      <td style={{ ...td, textAlign: "right" }}>{r.remaining == null ? "—" : `${r.remaining}y`}</td>
+                      <td style={{ ...td, textAlign: "right", fontWeight: r.annualProvision ? 600 : 400 }}>{r.annualProvision == null ? "—" : money(r.annualProvision)}</td>
+                      <td style={td}>
+                        <button style={{ ...secondaryBtn, padding: "3px 8px", fontSize: 11.5 }} onClick={() => setInspectFor(inspectFor === r.id ? null : r.id)}>
+                          {inspectFor === r.id ? "Close" : "Inspect"}
+                        </button>
+                      </td>
+                    </tr>
+                    {inspectFor === r.id && (
+                      <tr><td colSpan={9} style={{ ...td, background: "#F6F1E7" }}>
+                        <InspectionForm onSave={(f) => addInspection(r.id, f)} saving={saving === "inspection"} />
+                      </td></tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 10 }}>
+          A shaded row is not yet assessed and contributes nothing to the plan. Remaining life comes from the latest inspection where one gives a revised figure, otherwise from age against the expected life.
+        </div>
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Reserve fund ledger</div>
+        <div style={{ fontSize: 12, color: "#94A0AC", marginBottom: 12 }}>
+          Notional — book entries against the main FNB account, not a separate bank account. Balance <strong>{money(plan.reserve.balance)}</strong> across {plan.reserve.entryCount} entr{plan.reserve.entryCount === 1 ? "y" : "ies"}.
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
+          <div><div style={{ fontSize: 11, color: "#64748B" }}>Date</div>
+            <input type="date" style={{ ...inp, width: 150 }} value={entry.entry_date} onChange={(e) => setEntry({ ...entry, entry_date: e.target.value })} /></div>
+          <div><div style={{ fontSize: 11, color: "#64748B" }}>Type</div>
+            <select style={{ ...inp, width: 140 }} value={entry.entry_type} onChange={(e) => setEntry({ ...entry, entry_type: e.target.value })}>
+              <option value="opening">Opening balance</option><option value="contribution">Contribution</option>
+              <option value="interest">Interest</option><option value="drawdown">Drawdown</option><option value="adjustment">Adjustment</option>
+            </select></div>
+          <div><div style={{ fontSize: 11, color: "#64748B" }}>Amount</div>
+            <input style={{ ...inp, width: 120 }} inputMode="decimal" value={entry.amount} onChange={(e) => setEntry({ ...entry, amount: e.target.value })} /></div>
+          <div style={{ flex: 1, minWidth: 200 }}><div style={{ fontSize: 11, color: "#64748B" }}>Description</div>
+            <input style={inp} value={entry.description} onChange={(e) => setEntry({ ...entry, description: e.target.value })} /></div>
+          <button style={primaryBtn} onClick={addReserveEntry} disabled={saving === "reserve"}>{saving === "reserve" ? "Adding…" : "Add entry"}</button>
+        </div>
+        {reserveRows.length === 0 ? (
+          <div style={{ fontSize: 12.5, color: "#64748B" }}>
+            No entries. The reserve fund does not exist yet — until it does, the whole replacement cost of every component has to be funded from future contributions, which is why the annual figure above is as large as it is.
+          </div>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr><th style={th}>Date</th><th style={th}>Type</th><th style={th}>Description</th><th style={{ ...th, textAlign: "right" }}>Amount</th></tr></thead>
+            <tbody>
+              {reserveRows.map((e) => (
+                <tr key={e.id}>
+                  <td style={td}>{String(e.entry_date).slice(0, 10)}</td>
+                  <td style={td}>{e.entry_type}</td>
+                  <td style={td}>{e.description || "—"}</td>
+                  <td style={{ ...td, textAlign: "right", color: e.entry_type === "drawdown" ? "#9B2C2C" : "#2F5D50" }}>
+                    {e.entry_type === "drawdown" ? "−" : ""}{money(Math.abs(Number(e.amount)))}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Card>
+    </>
+  );
+}
+
+// Condition capture. Separate from the register grid because an inspection is
+// an event with its own date, not an edit to the component.
+function InspectionForm({ onSave, saving }) {
+  const [f, setF] = useState({ inspected_on: TODAY_ISO, condition: "good", inspector: "", notes: "", revised: "" });
+  const inp = { ...inputStyle, padding: "4px 6px", fontSize: 12.5 };
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+      <div><div style={{ fontSize: 11, color: "#64748B" }}>Inspected</div>
+        <input type="date" style={{ ...inp, width: 145 }} value={f.inspected_on} onChange={(e) => setF({ ...f, inspected_on: e.target.value })} /></div>
+      <div><div style={{ fontSize: 11, color: "#64748B" }}>Condition</div>
+        <select style={{ ...inp, width: 100 }} value={f.condition} onChange={(e) => setF({ ...f, condition: e.target.value })}>
+          <option value="good">Good</option><option value="fair">Fair</option><option value="poor">Poor</option><option value="failed">Failed</option>
+        </select></div>
+      <div><div style={{ fontSize: 11, color: "#64748B" }}>Revised life left (yrs)</div>
+        <input style={{ ...inp, width: 130 }} inputMode="numeric" value={f.revised} onChange={(e) => setF({ ...f, revised: e.target.value })} /></div>
+      <div><div style={{ fontSize: 11, color: "#64748B" }}>Inspector</div>
+        <input style={{ ...inp, width: 140 }} value={f.inspector} onChange={(e) => setF({ ...f, inspector: e.target.value })} /></div>
+      <div style={{ flex: 1, minWidth: 180 }}><div style={{ fontSize: 11, color: "#64748B" }}>Notes</div>
+        <input style={{ ...inp, width: "100%", boxSizing: "border-box" }} value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} /></div>
+      <button style={primaryBtn} onClick={() => onSave(f)} disabled={saving}>{saving ? "Saving…" : "Record"}</button>
+    </div>
   );
 }

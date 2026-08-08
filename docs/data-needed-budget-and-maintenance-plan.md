@@ -85,8 +85,15 @@ on a rolling basis — year 1 falls away, a new year 10 is added.
 
 ### What the database holds today
 
-Nothing usable. There is no asset register, no component condition, no
-installation dates, no replacement costings and no reserve fund.
+**Updated 8 August 2026 — the schema now exists.** `assets`, `asset_inspections`,
+`reserve_fund_entries` and `maintenance_plan_snapshots` are live, and **27
+components are seeded as a walk-the-property checklist** on the new Maintenance
+plan page. Section 13 of the AGM report is computed from them.
+
+What is still missing is the *content*: every age, expected life, condition and
+replacement cost is null, because those come from the survey and a seeded guess
+would be indistinguishable from real data later. Filling them in is now data
+entry against a checklist rather than a schema problem.
 
 What I can infer is thin: seven units, 1,409 m² of unit area on a 3,964 m² stand,
 total sum insured **R16,234,560**, four geysers insured separately (units 2, 4, 5
