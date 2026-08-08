@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 8 August 2026, session 9 (supersedes the 8 August 2026 session 8 summary)
+Last updated: 8 August 2026, session 10 (supersedes the 8 August 2026 session 9 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,45 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 8 August 2026, session 10 — "DB offline — mock data" fixed
+
+**My bug, introduced in session 7.** Removing the Tenant recon upload handler deleted
+the `bankStatementStatus` state, but the **data-load effect still called
+`setBankStatementStatus`**:
+
+```js
+if (data.bankStatementMeta) {
+  setBankStatementMeta(data.bankStatementMeta);
+  setBankStatementStatus("done");   // <- deleted state; ReferenceError
+}
+```
+
+That throws inside the `.then()`, **before `setUnitsSource("database")` on the next
+line**. The effect's own `.catch()` swallows it and runs `setUnitsSource("error")`,
+so the whole app silently fell back to mock data. Everything downstream — every
+screen, every figure — was mock. Fixed by dropping both calls; Bank recon owns
+import status now, and this screen only needs the metadata it displays.
+
+> **The lesson, and it is the important part.** Vite and esbuild bundled this
+> without complaint — a call to a deleted `const` is a syntactically valid
+> identifier reference and only fails at runtime. **A clean build proves nothing
+> about deleted bindings.** What catches it is `no-undef`.
+>
+> **Run this after any refactor that deletes state, props or helpers:**
+> ```
+> npx eslint src/App.jsx --rule '{"no-undef":"error"}' --no-inline-config
+> ```
+> It found this in one pass and confirmed there were no other orphans from the
+> session 7 refactor. Bundling clean is necessary, not sufficient.
+
+Also worth noting: **a swallowed error in a `.catch()` that degrades to a fallback
+is the worst failure mode** — the app looked like it was working. The catch on the
+data-load effect logs to console (`Could not load app data from Supabase`), so the
+browser console names the real error immediately; check it before assuming the
+database or the network is at fault.
 
 ---
 
@@ -964,6 +1003,12 @@ Reconciliation moved onto `applied_period`; `manual_payments` table and UI added
 ---
 
 ## Working agreements
+
+- **After any refactor that deletes state, props or helpers, run `no-undef`.**
+  `npx eslint src/App.jsx --rule '{"no-undef":"error"}' --no-inline-config`.
+  Vite bundles a reference to a deleted binding without complaint; it only fails
+  at runtime, and if it fails inside the data-load `.then()` the app degrades
+  silently to mock data. See session 10.
 - Consider long-term effects before changing the **live** DB; when uncertain, ask. Keep credit usage low; prefer the simplest change that works.
 - **Never delete live financial records to "clean up" — flag them instead** (see `superseded_reason`). Let Devon decide.
 - Read this summary at the start of each new conversation.

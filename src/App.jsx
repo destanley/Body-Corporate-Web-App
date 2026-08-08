@@ -2493,13 +2493,9 @@ export default function App() {
         } else {
           setBankTxns([]);
         }
-        if (data.bankStatementMeta) {
-          setBankStatementMeta(data.bankStatementMeta);
-          setBankStatementStatus("done");
-        } else {
-          setBankStatementMeta(null);
-          setBankStatementStatus("idle");
-        }
+        // Bank recon owns import status now, so there is no upload state to
+        // drive here — only the metadata this screen displays.
+        setBankStatementMeta(data.bankStatementMeta || null);
         setRemittanceDeductions(data.remittanceDeductions);
         setRemittanceAdvices(data.remittanceAdvices);
         setManualPayments(data.manualPayments || []);
@@ -8765,7 +8761,9 @@ function BankRecon({ periods, period, setPeriod, onImported }) {
     catch (err) { console.error("Loading the saved statement failed:", err); setSaved(null); }
     setLoading(false);
   };
-  useEffect(() => { reload(period); /* eslint-disable-next-line */ }, [period]);
+  // `reload` is intentionally not a dependency — it is recreated every render,
+  // and depending on it would refetch the statement on every keystroke.
+  useEffect(() => { reload(period); }, [period]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const onFile = async (file) => {
     setStatus("parsing"); setError(null); setPreview(null);
