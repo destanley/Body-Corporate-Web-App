@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 7 August 2026, session 4 (supersedes the 6 August 2026 session 3 summary)
+Last updated: 8 August 2026, session 6 (supersedes the 7 August 2026 session 5 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,142 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 8 August 2026, session 6
+
+### AGM report §9 — "Water: charged by CoJ vs billed to owners" (now permanent in the template)
+
+The AGM report had no place where the meeting could see what the scheme recovers on water
+against what the council actually charged for it. The option-D analysis
+(`docs/water-billing-option-D-FY2025-2026.md`) found a **R9,083.55/year margin** — R108.14 per
+unit per month — but it lived in a one-off markdown file, so it would have been invisible at
+every AGM after this one. It is now **section 9 of the generated report and rebuilds itself
+from captured data every year**. Sections renumbered: service notes 9→**10**, levy split 10→**11**.
+
+**What it prints.** A landscape month-by-month grid (CoJ kL · CoJ charged · units kL · metered
+water billed · common-property provision · total billed · difference), then three blocks:
+
+| Block | Answers |
+|---|---|
+| Summary | What CoJ charged, what owners were billed, the margin in rand, % and per unit per month |
+| Common property water — provision vs actual | Bulk kL less unit kL = the real common-property draw, against the kL provision billed. FY 2025/2026: **6.94 kL actual vs 20 kL provided — 2.9×** |
+| Fixed water lines (memo) | Sewerage and water demand levy per unit, annualised — pass-throughs, deliberately **outside** the margin |
+
+**Three decisions taken with Devon before building** (all confirmed):
+
+1. **Consumption only** in the headline. Sewerage and the demand levy are flat per-dwelling
+   amounts billed on at cost, so they reconcile by construction; mixing them in would dilute
+   the only number the trustees need. They appear as a memo block instead.
+2. **The common-property provision counts as "billed"**, on its own row inside the total.
+   Both rows are money collected from owners for water. Folding them into one figure would
+   have hidden that most of the margin sits in the provision, not in the metered lines.
+3. **A month missing either side is printed, shaded, flagged, and excluded from the totals.**
+   Omitting it is exactly what let the 2026-02 capture error sit unnoticed. The total row
+   says "N of 12 months" and a note names the missing periods.
+
+**`fetchWaterReconciliation(fy)`** (beside `fetchUsageTrend`) is the whole data layer — seven
+parallel queries, no per-month round trips. Two things it does deliberately:
+
+- **A captured `statement_overrides.water_due` wins over the computed figure**, so the section
+  agrees with the statements that were actually sent rather than with what the current rule
+  would produce today. A note says how many months carry one.
+- **Prices each month on the band set in force that month**, via a new `waterBandsAsOf(rows, date)`
+  helper — the same effective-date resolution the statement screen uses. A year straddling a
+  tariff increase prices correctly on both sides of it. Falls back to `WATER_BANDS_DEFAULT`
+  when `water_tariff_bands` is empty.
+
+Failure is scoped like the usage charts: `fetchWaterReconciliation` is `.catch()`-ed to `null`
+in `generateAgmReport`, so a broken section 9 costs section 9 and not the document.
+
+### All twelve FY 2025/2026 CoJ water invoices verified by OCR
+
+The merged 10-page PDF and the June 2026 PDF are **scans with no text layer** — `pdftotext`
+returns nothing. Rasterised at 200 dpi and OCR'd (tesseract) to confirm the option-D
+reconstruction independently. Every reading period, meter reading, step ladder and consumption
+charge matches the doc. Two findings worth keeping:
+
+- **`COJ Water Utility June 2026.pdf` is a duplicate** of page 10 of the merged PDF — same
+  2026/06 billing period, 25-day reading period, 66 kL, R951.19. Not a thirteenth bill.
+- **2026-02 is genuinely absent from the supplied PDFs.** Page 7 jumps 2026/01 → 2026/03.
+  The R275.72 overstatement in `council_invoices` (**R1,216.06 stored vs R940.34 by the
+  invoice's own arithmetic**) is therefore still unverified against a physical invoice.
+
+> **Do this before the AGM:** the stored figures total **R14,441.22** for the year; corrected
+> they total **R14,165.50**. Section 9 will print whichever is in the table. Get the physical
+> 2026-02 invoice, correct `bulk_water_rand`, and regenerate.
+
+### Verified
+
+Parse and bundle clean via esbuild (`npx vite build` can't run in the Linux sandbox — the
+Windows-installed `node_modules` has no Linux rollup binary; **build on Windows before
+pushing**). Logic harness over the real OCR'd invoice data confirms: 12-month totals
+(R14,441.22 stored / R14,165.50 corrected / 973 kL bulk), the 20 kL provision at R493.46/month
+= R5,921.52/year, `waterBandsAsOf` resolving 2025-08 → R29.84 and 2025-06 → R28.20 and empty →
+8 default bands, `individualWaterCost` holding the legacy merged band for July 2026 (R149.20 on
+5 kL) and the flat minimum from August 2026 (R29.84), and excluded months dropping out of both
+sides of the margin.
+
+---
+
+## Done on 7 August 2026, session 5
+
+### Water: flat minimum charge below 6kL (trustee rule change, effective the August 2026 statement)
+
+**The rule, in full.** An individual unit's water is now billed:
+
+| Consumption | Charge |
+|---|---|
+| 0 – 6 kL | a **flat minimum charge** — R33.57 on the 1 Aug 2026 rates. 5 kL costs R33.57, not 5 × R33.57. **0 kL also costs R33.57**: it is a charge for holding the connection, not for the water. |
+| over 6 kL | the configured tariff table, free first 6kL intact. Nothing else — no floor, no minimum. |
+| common property (the kL standard) | **unchanged** — always the real municipal scale, free tier included, because that is genuinely how CoJ bills the bulk meter. |
+
+**The minimum charge is derived, not stored.** It is one kL at the **first paid band's rate** — the `>6-10` band, R33.57 from 1 Aug 2026 and R29.84 on the 2025/2026 set. This was a deliberate choice over adding a column: the figure re-prices itself when each July's rates are captured, and there is no second place to forget to update. *If CoJ ever publishes a minimum that diverges from the `>6-10` rate, this must become an effective-dated column on `water_tariff_bands` plus a field on Tariffs & rates — not a constant.* No migration was needed for this change; the schema is untouched.
+
+**The two rules meet at a step, and that is accepted — don't "fix" it.** A unit on 6.5 kL pays 0.5 × R33.57 = **R16.79**, *less* than a unit on 5 kL paying R33.57, because crossing 6 kL earns the whole free tier. Usage between 6 kL and 7 kL therefore costs less than the minimum. Flooring the table at the minimum charge was offered and **declined by the trustee on 7 August 2026**: over 6 kL bills the tariff table and nothing else. The step is far smaller than the one it replaces (the old rule fell from ≈R201.42 at 6 kL to R16.79 at 6.5 kL), but it is still a step. A note to this effect sits on the constant in `App.jsx`.
+
+| kL | was (July 2026 rule) | now (August 2026 rule) |
+|---:|---:|---:|
+| 0 | R 0.00 | **R 33.57** |
+| 3 | R 100.71 | **R 33.57** |
+| 5 | R 167.85 | **R 33.57** |
+| 5.99 | R 201.08 | **R 33.57** |
+| 6 | R 201.42 | **R 33.57** |
+| 6.5 | R 16.79 | R 16.79 |
+| 7 and above | table | table (unchanged) |
+
+*(The "was" column is the old rule priced on the new 1 Aug 2026 bands, so the two columns are comparable. Above 6 kL the two rules were already identical.)*
+
+### One helper, three screens — the drift is now impossible
+
+The two-rule calculation was written out **three separate times**: `computeStatementRow` (the resident's own statement view), `useAllocation` (the trustee dashboard) and `splitStatementForChangeover`. Three copies of a billing rule is how a resident's statement and the trustee's dashboard come to disagree. All three now call a single **`individualWaterCost(kl, bands, period)`**, alongside `waterFreeBandLimit()` and `waterMinimumCharge()`. Nothing else computes an individual unit's water.
+
+- **`useAllocation` now takes `period`** (`selectedPeriod`, threaded from the top bar) as a trailing argument and a memo dependency. It is **not** used to pick rates — `waterBands` already arrives period-scoped — only to decide which *rule* applies.
+- **Statements before August 2026 are untouched.** `WATER_MINIMUM_CHARGE_FROM = "2026-08"`; anything earlier runs the superseded calculation so an already-issued statement reprints to the cent. `deriveIndividualWaterBands()` survives **only** to serve that legacy branch — its docblock now says so, and nothing else should call it.
+- **A missing period bills on the current rule**, deliberately: an oversight that under-charges a historic reprint is recoverable; one that over-charges a live statement by 4× is not.
+
+### Ownership changeover: the month's water is costed once, then split
+
+Costing each half of a transfer month independently — which is what it did — **double-charged the minimum**: two owners each under 6 kL paid R33.57 apiece, R67.14 for a month a single owner would have been charged R33.57 for. The same objection applied further up the scale, where each half got its own free first 6 kL.
+
+`splitStatementForChangeover` now costs the **whole month once** via `individualWaterCost`, then divides it **in proportion to each owner's actual consumption**, with the incoming owner taking the remainder — the same convention every levy line already uses, so the two halves reconcile to the full month exactly. Consumption, not days, is the divisor: the reading is taken on the changeover date precisely so nobody is billed for water someone else ran. Days are the fallback only when neither owner used anything, which still leaves the minimum to split.
+
+Electricity is unchanged — still actual consumption per half at a flat rate, never pro-rated.
+
+**Verified** (esbuild clean, plus the engine functions extracted and run headless against the real 1 Aug 2026 bands):
+
+| Case | Result |
+|---|---|
+| 0 / 3 / 5 / 5.99 / 6 kL | R33.57 each — flat, as specified |
+| 6.5 / 7 / 7.13 / 8 / 12 / 20 / 25 kL | table applies, identical to before, unfloored |
+| Transfer 15 Aug, 3 kL out / 2 kL in | R20.14 + R13.43 = **R33.57**, one minimum, reconciles |
+| Transfer, 0 kL both halves | R16.24 + R17.33 = **R33.57**, split by days |
+| Transfer, 14 kL out / 10 kL in | R482.28 + R344.49 = **R826.77** = the whole month |
+| Pre-August periods | legacy figures unchanged |
+| Common property water | untouched on every path |
+
+**Note:** `CURRENT_PERIOD` is still hard-coded `"2026-07-01"`, so **the app opens on July and shows the old figures**. Switch the period selector to August 2026 to see the new rule bill.
 
 ---
 
@@ -501,8 +637,8 @@ Reconciliation moved onto `applied_period`; `manual_payments` table and UI added
 - `/api/notify-remittance` (remittance email via Resend) is a **stub** and 404s on static hosting until a serverless function is added. Email notifications are not live.
 - Advisor warnings remaining are known and acceptable: the token RPCs and `get_expense_categories` are intentionally anon-callable; `pg_net` in `public`. **Zero advisor errors.**
 
-**Billing logic (still unverified — carried over)**
-- `deriveIndividualWaterBands()` — confirm it implements the **6kL minimum-charge threshold** rule (usage >6kL uses the real scale incl. the free first 6kL; usage ≤6kL bills every kL at the first paid rate). Earlier notes flagged it may still use the old "merge free band for everyone" logic.
+**Billing logic**
+- ~~`deriveIndividualWaterBands()` — confirm the 6kL threshold rule.~~ **Closed session 5.** It was implementing the rule correctly; that rule has now been *replaced* by the flat minimum charge, and the function is retained only for pre-August 2026 reprints. See session 5 above.
 - Electricity rate convention: seed is R2.5755 (municipal) vs app default R2.58 (rounded). Confirm the canonical production value.
 
 **Product**

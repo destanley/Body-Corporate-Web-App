@@ -751,7 +751,7 @@ function normaliseDeductionItems(deductions, fallbackAmount, fallbackComment) {
 }
 
 // Builds the statement row from RPC data using the exact same billing helpers
-// the trustee allocation uses (calcWaterCost, the 6kL minimum-charge rule, VAT),
+// the trustee allocation uses (individualWaterCost, the 6kL minimum charge, VAT),
 // so a resident's past statement matches what the trustee sees to the cent.
 function computeStatementRow(data) {
   if (!data) return null;
@@ -768,10 +768,7 @@ function computeStatementRow(data) {
   const wUse = round2(wCurr - wPrev);
   const eUse = round2(eCurr - ePrev);
 
-  const individualBands = deriveIndividualWaterBands(bands);
-  const sortedByFrom = [...bands].sort((a, b) => a.from - b.from);
-  const freeBandLimit = sortedByFrom[0] && (sortedByFrom[0].rate2025 || 0) === 0 ? (sortedByFrom[0].to || 0) : 0;
-  const waterCostComputed = wUse > freeBandLimit ? calcWaterCost(wUse, bands) : calcWaterCost(wUse, individualBands);
+  const waterCostComputed = individualWaterCost(wUse, bands, data.period);
   const elecCostComputed = eUse * electricityRate;
   // Apply any manual per-statement override so the tenant sees the same aligned
   // figures the trustee set (null = use computed).
@@ -1733,11 +1730,12 @@ function calcWaterCost(kl, bands, yearField = "rate2025") {
   return cost;
 }
 
-// No-free-tier scale: merges the free 0-6kL band into the next paid band, so
-// every kL from 0 bills at the >6-10 rate. Per the trustee's July 2026 rule
-// update this now applies ONLY to units consuming at or under 6kL (the
-// "minimum charge" for low-usage units) — units over 6kL bill on the real
-// municipal scale with the free tier intact, same as common property water.
+// SUPERSEDED from August 2026 — retained only for reprinting statements from
+// July 2026 and earlier, which were billed this way and must not change.
+// Merges the free 0-6kL band into the next paid band, so every kL from 0 bills
+// at the >6-10 rate: 5kL cost 5 × R29.84 = R149.20. Replaced by a flat minimum
+// charge — see individualWaterCost below. Nothing outside the legacy branch of
+// that function should call this.
 function deriveIndividualWaterBands(bands) {
   const sorted = [...bands].sort((a, b) => a.from - b.from);
   if (sorted.length < 2) return sorted;
@@ -1748,15 +1746,92 @@ function deriveIndividualWaterBands(bands) {
   return [merged, ...rest.slice(1)];
 }
 
+// ---------- Individual-unit water: the minimum-charge rule ----------
+//
+// Trustee rule change, effective the August 2026 statement period. A unit's
+// water is billed:
+//   * 0 – 6 kL  → a FLAT minimum charge, whatever was used. Zero consumption
+//                 still pays it: it is a charge for holding the connection,
+//                 not for the water. 5kL = R33.57, not 5 × R33.57.
+//   * over 6 kL → the configured tariff table, free first tier intact.
+//                 Nothing else: no floor, no minimum, just the table.
+//   * common property water is NOT affected — the 20kL standard keeps billing
+//     on the real municipal scale, because that is how CoJ bills the bulk
+//     meter. Only individual units get the minimum.
+//
+// The minimum charge is deliberately NOT a separately stored figure. It is one
+// kL at the FIRST PAID band's rate — R33.57 on the set effective 1 Aug 2026,
+// R29.84 on the 2025/2026 set. Deriving it from the tariff table means it
+// re-prices itself when each July's rates are captured, and there is no second
+// place to forget to update. If CoJ ever publishes a minimum that diverges from
+// the >6-10 rate, this becomes an effective-dated column on water_tariff_bands
+// and a field on Tariffs & rates — not a constant.
+//
+// KNOWN, ACCEPTED CONSEQUENCE — do not "fix" this without asking the trustee.
+// The two rules meet at a step, not a slope. At the Aug 2026 rates a unit on
+// 6.5kL pays 0.5 × R33.57 = R16.79, LESS than a unit on 5kL paying R33.57,
+// because crossing 6kL earns the whole free tier. Usage between 6kL and 7kL
+// therefore costs less than the minimum. Flooring the table at the minimum was
+// offered and DECLINED (7 Aug 2026): over 6kL bills the tariff table and
+// nothing else. The step is much smaller than the one it replaced (the old rule
+// jumped ≈R201 at 5.99kL down to ≈R16.79 at 6.5kL), but it is still a step.
+const WATER_MINIMUM_CHARGE_FROM = "2026-08";
+
+// The free opening band's upper limit — 6kL on every rate set captured so far.
+// 0 if the set does not open with a free band, in which case there is no
+// minimum-charge threshold and the tariff table applies throughout.
+function waterFreeBandLimit(bands) {
+  const first = [...bands].sort((a, b) => a.from - b.from)[0];
+  return first && (first.rate2025 || 0) === 0 ? (first.to || 0) : 0;
+}
+
+// One kL at the first paid band's rate. 0 when the set has no free opening
+// band (nothing for a minimum to be the minimum of).
+function waterMinimumCharge(bands) {
+  const sorted = [...bands].sort((a, b) => a.from - b.from);
+  const first = sorted[0];
+  if (!first || (first.rate2025 || 0) !== 0) return 0;
+  const firstPaid = sorted.find((b) => (b.rate2025 || 0) > 0);
+  return firstPaid ? firstPaid.rate2025 || 0 : 0;
+}
+
+// THE single place an individual unit's water cost is worked out. The trustee
+// allocation, the resident's statement view and the ownership-change split all
+// go through this, so the rule cannot drift between the three screens — which
+// is exactly how they drifted before.
+//
+// `period` is the statement month ("YYYY-MM"). Anything from August 2026 uses
+// the rule above; earlier months keep the superseded merged-band calculation so
+// statements already sent reprint to the cent. A MISSING period bills on the
+// current rule, not the legacy one: an oversight that under-charges a historic
+// reprint is recoverable, one that over-charges a live statement by 4× is not.
+function individualWaterCost(kl, bands, period) {
+  const use = Math.max(0, kl);
+  const freeBandLimit = waterFreeBandLimit(bands);
+
+  if (period && String(period) < WATER_MINIMUM_CHARGE_FROM) {
+    return use > freeBandLimit
+      ? calcWaterCost(use, bands)
+      : calcWaterCost(use, deriveIndividualWaterBands(bands));
+  }
+
+  // At or under the free band: the flat minimum. Above it: the table, unfloored.
+  return use <= freeBandLimit ? waterMinimumCharge(bands) : calcWaterCost(use, bands);
+}
+
 // ---------- Ownership change: pro-rata split on transfer ----------
 // Turns one unit's statement row into two, for the month a unit changes hands.
 //
-// The two halves obey different rules, and treating them the same is the usual
-// mistake:
-//   * Water and electricity are NOT pro-rated. A reading is taken on the
-//     changeover date, so each owner is billed their ACTUAL consumption —
-//     that is what the reading is for. Pro-rating metered usage by days would
-//     charge a seller for water the buyer ran.
+// The three kinds of line obey different rules, and treating them the same is
+// the usual mistake:
+//   * Electricity is NOT pro-rated at all. A reading is taken on the changeover
+//     date, so each owner is billed their ACTUAL consumption at a flat rate —
+//     that is what the reading is for.
+//   * Water is costed for the WHOLE MONTH and then divided by each owner's
+//     actual consumption. It cannot be costed per half: the minimum charge and
+//     the free first 6kL are both once-a-month-per-unit, and billing the halves
+//     independently hands the unit two of each. Splitting by consumption keeps
+//     the seller off the buyer's water while charging the month once.
 //   * The fixed levy lines ARE pro-rated, by days of the month.
 //
 // Each levy line is apportioned individually and the incoming owner gets the
@@ -1775,19 +1850,33 @@ function splitStatementForChangeover(r, change, waterBands, period) {
   const wMid = change.waterReading == null ? r.wCurr : Number(change.waterReading);
   const eMid = change.electricityReading == null ? r.eCurr : Number(change.electricityReading);
 
-  // Same two-rule water calculation the engine uses: the free first tier only
-  // applies above the free-band limit, otherwise the merged individual bands do.
-  const sortedByFrom = [...waterBands].sort((a, b) => a.from - b.from);
-  const individualBands = deriveIndividualWaterBands(waterBands);
-  const freeBandLimit = sortedByFrom[0] && (sortedByFrom[0].rate2025 || 0) === 0 ? (sortedByFrom[0].to || 0) : 0;
-  const waterCostOf = (use) => (use > freeBandLimit
-    ? calcWaterCost(use, waterBands)
-    : calcWaterCost(use, individualBands));
+  // Water: the MONTH is costed once, then divided between the two owners in
+  // proportion to what each of them actually ran.
+  //
+  // Costing each half independently — which is what this did before — now
+  // double-charges the minimum: two owners each under 6kL would pay R33.57
+  // apiece, R67.14 for a month a single owner would have been charged R33.57
+  // for. A transfer is not a reason for the unit to owe twice the minimum. The
+  // same objection applies further up the scale, where each half would get its
+  // own free first 6kL.
+  //
+  // Consumption, not days, is the divisor — a reading is taken on the
+  // changeover date precisely so nobody is billed for water someone else ran.
+  // Days are only the fallback when neither owner used anything and there is
+  // nothing to apportion by, which still leaves the minimum charge to split.
+  const fullWaterUse = round2(r.wCurr - r.wPrev);
+  const outWaterUse = round2(wMid - r.wPrev);
+  const fullWaterCost = round2(individualWaterCost(fullWaterUse, waterBands, period));
+  const outWaterCost = fullWaterUse > 0
+    ? round2(fullWaterCost * outWaterUse / fullWaterUse)
+    : round2(fullWaterCost * outDays / daysInMonth);
+  // The incoming owner takes the remainder, so the two halves reconcile to the
+  // full month exactly — the same convention every levy line below uses.
+  const inWaterCost = round2(fullWaterCost - outWaterCost);
 
-  const half = ({ wPrev, wCurr, ePrev, eCurr, days, levyShare, owner, label, from, to, extras }) => {
+  const half = ({ wPrev, wCurr, ePrev, eCurr, waterCost, days, levyShare, owner, label, from, to, extras }) => {
     const wUse = round2(wCurr - wPrev);
     const eUse = round2(eCurr - ePrev);
-    const waterCost = round2(waterCostOf(wUse));
     const elecCost = round2(eUse * r.electricityRate);
     const subTotal = round2(waterCost + elecCost);
     const vat = round2(subTotal * r.vatRate);
@@ -1824,6 +1913,7 @@ function splitStatementForChangeover(r, change, waterBands, period) {
     daysInMonth, outDays, inDays,
     outgoing: half({
       wPrev: r.wPrev, wCurr: wMid, ePrev: r.ePrev, eCurr: eMid,
+      waterCost: outWaterCost,
       days: outDays, levyShare: outShare, owner: change.outgoingOwner,
       label: "Outgoing owner", from: iso(1), to: iso(outDays),
       // Ad-hoc charges stay with the outgoing owner: they were raised against
@@ -1833,6 +1923,7 @@ function splitStatementForChangeover(r, change, waterBands, period) {
     }),
     incoming: half({
       wPrev: wMid, wCurr: r.wCurr, ePrev: eMid, eCurr: r.eCurr,
+      waterCost: inWaterCost,
       days: inDays, levyShare: inShare, owner: change.incomingOwner,
       label: "Incoming owner", from: iso(outDays + 1), to: iso(daysInMonth),
       extras: [],
@@ -1844,7 +1935,12 @@ function splitStatementForChangeover(r, change, waterBands, period) {
 // unitsSource ("mock" | "database" | "error") is only used as a memo dependency:
 // when the DB units replace the mock UNITS binding, the source flips and this
 // recomputes against the fresh rows — nothing inside reads the value itself.
-function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges, commonPropertyElectricityKwh, commonPropertyWaterKl, unitsSource, readings, councilInvoice, statementOverrides = {}) {
+//
+// `period` ("YYYY-MM") is the selected statement month. It is not used to pick
+// rates — `waterBands` arrives already scoped to the month — only to decide
+// which water billing RULE applies, so August 2026 onwards gets the minimum
+// charge and earlier months reprint on the superseded calculation.
+function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges, commonPropertyElectricityKwh, commonPropertyWaterKl, unitsSource, readings, councilInvoice, statementOverrides = {}, period = null) {
   return useMemo(() => {
     const totalW = round2(Object.values(readings).reduce((s, r) => s + (r.wCurr - r.wPrev), 0));
     const totalE = round2(Object.values(readings).reduce((s, r) => s + (r.eCurr - r.ePrev), 0));
@@ -1856,18 +1952,11 @@ function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, addi
     const commonWaterCostTotal = calcWaterCost(commonWater, waterBands);
     const commonElecCostTotal = commonElec * electricityRate;
 
-    // Water billing rules (trustee-confirmed, 12 July 2026):
-    //   1. Consumption OVER the free band (6kL): real municipal scale,
-    //      free tier included — the first 6kL cost nothing.
-    //   2. Consumption AT or UNDER 6kL: no free tier — every kL bills at the
-    //      first paid band's rate (the minimum charge for low-usage units,
-    //      so nobody's water line is R0.00).
-    //   3. Common property water (20kL standard): always the real scale.
-    // Note the deliberate step at the boundary: ~5.99kL bills ≈R178.74 while
-    // ~6.5kL bills ≈R14.92, because crossing 6kL earns the whole free tier.
-    const individualWaterBands = deriveIndividualWaterBands(waterBands);
-    const sortedByFrom = [...waterBands].sort((a, b) => a.from - b.from);
-    const freeBandLimit = sortedByFrom[0] && (sortedByFrom[0].rate2025 || 0) === 0 ? (sortedByFrom[0].to || 0) : 0;
+    // Individual-unit water is billed by individualWaterCost — a flat minimum
+    // charge at or under 6kL, the tariff table above it, floored at the
+    // minimum. See the rule and its history where that function is defined.
+    // Common property water (the kL standard below) is deliberately NOT put
+    // through it: bulk water genuinely gets the free first 6kL.
 
     // Common property (body corp) standards: fixed 20kL of water (real, unmodified
     // scale) and a configurable kWh of electricity (flat rate), split equally across
@@ -1890,9 +1979,7 @@ function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, addi
       const wUse = round2(r.wCurr - r.wPrev);
       const eUse = round2(r.eCurr - r.ePrev);
       // Computed utility "due" figures, before any manual override.
-      const waterCostComputed = wUse > freeBandLimit
-        ? calcWaterCost(wUse, waterBands)           // rule 1 — free tier applies
-        : calcWaterCost(wUse, individualWaterBands); // rule 2 — minimum charge
+      const waterCostComputed = individualWaterCost(wUse, waterBands, period);
       const elecCostComputed = eUse * electricityRate;
       // Manual per-statement override (used to align a past statement to the one
       // physically sent). A null field falls back to the computed value.
@@ -1930,7 +2017,7 @@ function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, addi
       tariffWaterTotal, tariffElecTotal,
       councilInvoice,
     };
-  }, [waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges, commonPropertyElectricityKwh, commonPropertyWaterKl, unitsSource, readings, councilInvoice, statementOverrides]);
+  }, [waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges, commonPropertyElectricityKwh, commonPropertyWaterKl, unitsSource, readings, councilInvoice, statementOverrides, period]);
 }
 
 const rand = (n) => `R ${n.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -2310,7 +2397,8 @@ export default function App() {
 
   const alloc = useAllocation(
     waterBands, electricityRate, levyBreakdown, vatRate, additionalCharges,
-    commonPropertyElectricityKwh, commonPropertyWaterKl, unitsSource, readings, councilInvoice, statementOverrides
+    commonPropertyElectricityKwh, commonPropertyWaterKl, unitsSource, readings, councilInvoice, statementOverrides,
+    selectedPeriod
   );
 
   // Resident capability-URL mode takes precedence over the trustee login —
@@ -4538,12 +4626,15 @@ function Analytics({ expenseCategories }) {
       // Usage is fetched here rather than read off the rendered charts so the
       // report doesn't depend on the trends card having finished loading, and
       // a failure there costs the section rather than the whole document.
-      const [prevReport, extras, usage] = await Promise.all([
+      const [prevReport, extras, usage, water] = await Promise.all([
         loadFyReport(previousFY(fy), expenseCategories).catch(() => null),
         fetchAgmExtras(fy),
         fetchUsageTrend(fy).catch((err) => { console.warn("Loading usage for the AGM report failed:", err); return null; }),
+        // Same treatment as usage: section 9 is worth failing on its own rather
+        // than costing the whole document.
+        fetchWaterReconciliation(fy).catch((err) => { console.warn("Loading water charged-vs-billed for the AGM report failed:", err); return null; }),
       ]);
-      await exportAgmReportDocx({ fy, report, prevReport, extras, usage });
+      await exportAgmReportDocx({ fy, report, prevReport, extras, usage, water });
       setAgmStatus("idle");
     } catch (err) {
       console.error("Generating the AGM report failed:", err);
@@ -5032,7 +5123,7 @@ async function fetchAgmExtras(fy) {
 // Builds and downloads the AGM annual report as an editable .docx. Sections the
 // database can fill are filled; the rest render as tables with empty cells so
 // the figures can be typed straight into Word before the meeting.
-async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
+async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, water }) {
   const D = await ensureDocxLoaded();
   const {
     Document, Packer, Paragraph, TextRun, HeadingLevel,
@@ -5391,9 +5482,130 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
     G.push(hint("The dotted line adds the flat common-property provision from the levy rates, not bulk less meters — that derived gap goes negative in some months because council invoice periods do not line up with reading months, and it is covered by the provision check on Utility bills."));
   }
 
-  // ---------- Portrait E2: section 9 ----------
+  // ---------- Landscape W: section 9 ----------
+  // Water charged by CoJ against water billed to owners. A permanent part of
+  // the template: it is the one place the meeting can see what the scheme
+  // recovers on water versus what the council actually charged for it, and
+  // whether the common-property provision bears any relation to the volume
+  // nobody's meter accounts for. Built entirely from captured data — no figure
+  // in it is typed into this document.
+  const W = [];
+  W.push(H1("9. Water — charged by CoJ vs billed to owners"));
+  if (!water) {
+    W.push(hint(`Water charged-vs-billed could not be loaded for FY ${fy}, so this section is omitted. It rebuilds from the council invoices, meter readings and levy grid — check those pages and generate the report again.`));
+  } else {
+    const wt = water.totals;
+    W.push(para(
+      "Charged is the consumption line off the CoJ invoice, excluding VAT — not the sewer charge or the water demand levy, which are flat per-dwelling amounts passed through to owners at cost and reported separately below. Billed is metered unit water priced exactly as each statement priced it, plus the common-property water provision recovered through the levy. A positive difference means the body corporate collected more for water than the council charged.",
+      { size: 20 }));
+
+    const wCols = ["Month", "CoJ kL", "CoJ charged", "Units kL", "Metered water billed", "Common property provision", "Total billed", "Difference"];
+    const wAligns = ["left", "right", "right", "right", "right", "right", "right", "right"];
+    const wRows = [hrow(wCols, wAligns, WIDE)];
+    const blankOr = (v, fmt) => (v == null ? "—" : fmt(v));
+    water.rows.forEach((r) => {
+      wRows.push(row([
+        r.label,
+        blankOr(r.councilKl, dec),
+        blankOr(r.councilRand, amt),
+        blankOr(r.unitsKl, dec),
+        blankOr(r.unitsRand, amt),
+        r.unitsRand == null ? "—" : amt(r.cpRand),
+        blankOr(r.totalBilled, amt),
+        blankOr(r.difference, amt),
+      ], wAligns, false, r.comparable ? undefined : "F4E7E7", WIDE));
+    });
+    wRows.push(row([
+      `Total (${water.monthsCompared} of ${water.monthsTotal} months)`,
+      dec(wt.councilKl), amt(wt.councilRand), dec(wt.unitsKl),
+      amt(wt.unitsRand), amt(wt.cpRand), amt(wt.totalBilled), amt(wt.margin),
+    ], wAligns, true, BAND, WIDE));
+    W.push(tbl(wRows));
+    W.push(hint("All rand figures exclude VAT and are shown without the R prefix so no amount wraps. A shaded row is a month left out of the total — see the notes below."));
+
+    // The one-line answer, separated from the month grid so it can be read out
+    // at the meeting without anyone having to add up a column.
+    W.push(H2("Summary"));
+    const sAligns = ["left", "right"];
+    const sRows = [hrow(["", `FY ${fy}`], sAligns)];
+    sRows.push(row(["CoJ charged for water consumption", money(wt.councilRand)], sAligns));
+    sRows.push(row(["Billed to owners — metered unit water", money(wt.unitsRand)], sAligns));
+    sRows.push(row(["Billed to owners — common property provision", money(wt.cpRand)], sAligns));
+    sRows.push(row(["Total billed to owners for water", money(wt.totalBilled)], sAligns, true));
+    sRows.push(row([
+      wt.margin >= 0 ? "Recovered above cost" : "Recovered below cost",
+      `${money(Math.abs(wt.margin))}${wt.marginPct == null ? "" : nb(`  (${wt.marginPct >= 0 ? "+" : ""}${wt.marginPct}%)`)}`,
+    ], sAligns, true, BAND));
+    if (wt.marginPerUnitPerMonth != null) {
+      sRows.push(row(["Per unit, per month", money(wt.marginPerUnitPerMonth)], sAligns));
+    }
+    W.push(tbl(sRows));
+    W.push(para(
+      wt.margin >= 0
+        ? `Over the ${water.monthsCompared} months compared, owners were billed ${money(wt.margin)} more for water than the City of Johannesburg charged the complex — ${money(wt.marginPerUnitPerMonth)} per unit per month. This is not a loss to anyone: it funds the scheme. It is shown here so that it is a decision the meeting takes deliberately rather than a markup nobody sees.`
+        : `Over the ${water.monthsCompared} months compared, the City of Johannesburg charged ${money(Math.abs(wt.margin))} more for water than owners were billed — the body corporate is carrying the shortfall out of general levies.`,
+      { size: 20 }));
+
+    // The volume side. A provision set far above the metered gap is the usual
+    // reason the margin above is large, and it cannot be seen from rand alone.
+    W.push(H2("Common property water — provision vs actual"));
+    const cAligns = ["left", "right"];
+    const cRows = [hrow(["", `FY ${fy}`], cAligns)];
+    cRows.push(row(["CoJ metered for the complex", nb(`${dec(wt.councilKl)} kL`)], cAligns));
+    cRows.push(row(["Accounted for by the seven unit meters", nb(`${dec(wt.unitsKl)} kL`)], cAligns));
+    cRows.push(row(["Common property use and losses", nb(`${dec(wt.commonPropertyKl)} kL`)], cAligns, true, BAND));
+    if (wt.commonPropertyKlPerMonth != null) {
+      cRows.push(row(["— per month, actual", nb(`${dec(wt.commonPropertyKlPerMonth)} kL`)], cAligns));
+    }
+    cRows.push(row(["— per month, provision billed", levyCurr.common_property_water_kl == null
+      ? nb(`${COMMON_PROPERTY_WATER_KL_DEFAULT} kL`)
+      : nb(`${Number(levyCurr.common_property_water_kl)} kL`)], cAligns));
+    W.push(tbl(cRows));
+    const provisionKl = levyCurr.common_property_water_kl == null
+      ? COMMON_PROPERTY_WATER_KL_DEFAULT : Number(levyCurr.common_property_water_kl);
+    if (wt.commonPropertyKlPerMonth != null && provisionKl > 0) {
+      const ratio = round2(provisionKl / Math.max(wt.commonPropertyKlPerMonth, 0.01));
+      W.push(para(
+        wt.commonPropertyKlPerMonth <= 0
+          ? `The unit meters account for at least as much water as CoJ metered for the complex, so no common-property use is measurable this year — yet ${provisionKl} kL a month is provided for and billed. The provision is worth reviewing.`
+          : `The provision is ${nb(`${ratio}×`)} the measured common-property draw of ${dec(wt.commonPropertyKlPerMonth)} kL a month. Setting it closer to actual is the single largest lever the meeting has over what water costs an owner.`,
+        { size: 20 }));
+    }
+
+    // Pass-throughs. Shown so the meeting can see they are pass-throughs, and
+    // so a change in either is visible in the same place as the consumption.
+    const lastWithFixed = [...water.rows].reverse().find((r) => r.sewerPerUnit != null || r.demandLevyPerUnit != null);
+    if (lastWithFixed) {
+      W.push(H2("Fixed water lines (memo — not part of the comparison above)"));
+      const fAligns = ["left", "right", "right"];
+      const fRows = [hrow(["Line", "Per unit / month", `${water.unitCount} units × 12 months`], fAligns)];
+      const annual = (v) => (v == null ? "" : money(round2(v * water.unitCount * 12)));
+      fRows.push(row(["Sewerage", lastWithFixed.sewerPerUnit == null ? "" : money(lastWithFixed.sewerPerUnit), annual(lastWithFixed.sewerPerUnit)], fAligns));
+      fRows.push(row(["Water demand levy", lastWithFixed.demandLevyPerUnit == null ? "" : money(lastWithFixed.demandLevyPerUnit), annual(lastWithFixed.demandLevyPerUnit)], fAligns));
+      W.push(tbl(fRows));
+      W.push(hint("Both are charged by CoJ per dwelling and billed on to each unit at the same figure, so they recover exactly and are excluded from the margin above. Rates shown are the latest captured in the year; where one rose mid-year, section 8 says when."));
+    }
+
+    // Everything that qualifies the numbers above, said plainly rather than
+    // left for someone to notice.
+    if (water.missingInvoicePeriods.length) {
+      W.push(hint(`No council invoice is captured for ${water.missingInvoicePeriods.join(", ")}. ${water.missingInvoicePeriods.length === 1 ? "That month is" : "Those months are"} shaded and excluded from the totals, so the margin is understated by whatever ${water.missingInvoicePeriods.length === 1 ? "it" : "they"} would have added. Capture the invoice on Utility bills and generate the report again.`));
+    }
+    if (water.missingReadingPeriods.length) {
+      W.push(hint(`No meter readings are captured for ${water.missingReadingPeriods.join(", ")}, so nothing can be priced for ${water.missingReadingPeriods.length === 1 ? "that month" : "those months"} and ${water.missingReadingPeriods.length === 1 ? "it is" : "they are"} excluded from the totals.`));
+    }
+    if (!water.cpCaptured) {
+      W.push(hint(`No Common Property Water line is captured on the FY ${fy} levy grid, so the provision recovered shows as R 0,00 and the margin is understated. Capture it on Levy breakdown.`));
+    }
+    if (water.overrideMonths) {
+      W.push(hint(`${water.overrideMonths} ${water.overrideMonths === 1 ? "month carries" : "months carry"} a manual statement override on water. The override is used here rather than the computed figure, so this section agrees with the statements that were actually sent.`));
+    }
+    W.push(hint("CoJ reading periods run 24 to 36 days and never line up with a calendar month, so any single month's difference is approximate — only the annual total ties out. The common-property provision is the figure captured on the levy grid and is billed as captured; the suggestion on Tariffs & rates is VAT-inclusive, so confirm the basis before reading the margin as exact to the cent."));
+  }
+
+  // ---------- Portrait E2: section 10 ----------
   const E2 = [];
-  E2.push(H1("9. Service notes"));
+  E2.push(H1("10. Service notes"));
   // Each note takes its recorded cost from its own line in section 1, so it
   // cannot contradict the statement and cannot go stale. The notes used to
   // assert WHERE a cost was recorded — "in the operating-expense log" — which
@@ -5420,7 +5632,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
   // ---------- Landscape F: section 10 ----------
   // Nine columns of rand amounts; landscape so no figure has to wrap.
   const F = [];
-  F.push(H1(`10. Levy split — proposed for FY ${nfy}`));
+  F.push(H1(`11. Levy split — proposed for FY ${nfy}`));
   if (levySplitIsCarriedOver) {
     F.push(hint(`No FY ${nfy} levy grid has been captured yet, so this table carries forward the FY ${fy} figures as a starting point. Adjust each line for the new year.`));
   }
@@ -5463,6 +5675,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage }) {
       { properties: landscape, children: Dsec },
       { properties: portrait, children: E },
       { properties: landscape, children: G },
+      { properties: landscape, children: W },
       { properties: portrait, children: E2 },
       { properties: landscape, children: F },
     ],
@@ -5573,6 +5786,162 @@ async function fetchUsageTrend(fy) {
     },
     provision: { water: cpWater, electricity: cpElec },
   };
+}
+
+// ---------- Water: charged by CoJ vs billed to owners ----------
+// Section 9 of the AGM report, and a permanent part of the template.
+//
+// The question it answers is the one the trustees are actually asked at the
+// meeting: for every rand of water CoJ charged the complex, how many rand did
+// the body corporate recover from owners? Two sides:
+//
+//   CHARGED — `council_invoices.bulk_water_rand`, the consumption line off the
+//     CoJ invoice, excluding VAT. Not the sewer charge and not the water demand
+//     levy: those are flat per-dwelling amounts that pass through to owners at
+//     cost and reconcile by construction, so they are reported as a separate
+//     memo rather than mixed into the margin.
+//   BILLED — metered unit water, priced exactly the way each statement priced
+//     it (a captured statement override wins over the computed figure, so this
+//     agrees with the statements that were actually sent), plus the
+//     common-property water provision recovered through the levy grid.
+//
+// A month missing either side is printed, flagged and left out of the totals.
+// Silently dropping it is what let the 2026-02 capture error sit unnoticed.
+async function fetchWaterReconciliation(fy) {
+  const client = await ensureSupabaseClient();
+  const { from, to } = fyBounds(fy);
+  const [inv, usage, overrides, bands, cpLevy, unitRows, vat] = await Promise.all([
+    client.from("council_invoices")
+      .select("period, bulk_water_kl, bulk_water_rand, sewer_charge_per_unit, water_demand_levy_per_unit")
+      .gte("period", from).lte("period", to),
+    client.from("monthly_usage")
+      .select("unit_id, period, water_current, water_previous")
+      .gte("period", from).lte("period", to),
+    client.from("statement_overrides")
+      .select("unit_id, period, water_due")
+      .gte("period", from).lte("period", to),
+    client.from("water_tariff_bands").select("band_label, from_kl, to_kl, rate_per_kl, effective_from"),
+    client.from("levy_manual_entries")
+      .select("unit_id, amount")
+      .eq("financial_year", fy).eq("item_label", "Common Property Water"),
+    client.from("units").select("id, unit_number"),
+    client.from("vat_rates").select("rate").order("effective_from", { ascending: false }).limit(1),
+  ]);
+  const failed = [inv, usage, overrides, bands, cpLevy, unitRows].find((r) => r.error);
+  if (failed) throw failed.error;
+
+  const bandRows = bands.data || [];
+  const invByPeriod = {};
+  (inv.data || []).forEach((r) => { invByPeriod[String(r.period).slice(0, 10)] = r; });
+
+  // A statement override is keyed on the database unit id, the same as the
+  // usage row it overrides, so no unit-number lookup is needed here.
+  const ovByKey = {};
+  (overrides.data || []).forEach((o) => {
+    if (o.water_due == null) return;
+    ovByKey[`${String(o.period).slice(0, 10)}|${o.unit_id}`] = Number(o.water_due);
+  });
+
+  const usageByPeriod = {};
+  (usage.data || []).forEach((r) => {
+    const p = String(r.period).slice(0, 10);
+    if (!usageByPeriod[p]) usageByPeriod[p] = [];
+    usageByPeriod[p].push(r);
+  });
+
+  // The common-property provision is a levy line, so what owners actually paid
+  // for it is what the levy grid says — a manual figure, not a derived one.
+  // Per unit per month, summed across units, times twelve for the year.
+  const cpMonthly = round2((cpLevy.data || []).reduce((s, r) => s + (Number(r.amount) || 0), 0));
+  const cpCaptured = (cpLevy.data || []).length > 0;
+  const unitCount = (unitRows.data || []).length || UNITS.length;
+  const vatRate = vat.data && vat.data[0] ? Number(vat.data[0].rate) : VAT_RATE_DEFAULT;
+
+  const periods = fyPeriods(fy);
+  const rows = periods.map((p) => {
+    const ci = invByPeriod[p];
+    const monthUsage = usageByPeriod[p] || [];
+    const priceBands = waterBandsAsOf(bandRows, p);
+    const statementPeriod = p.slice(0, 7);
+
+    let unitsKl = null, unitsRand = null, overrideCount = 0;
+    if (monthUsage.length) {
+      unitsKl = 0; unitsRand = 0;
+      monthUsage.forEach((r) => {
+        const use = round2(Number(r.water_current || 0) - Number(r.water_previous || 0));
+        unitsKl = round2(unitsKl + use);
+        const ov = ovByKey[`${p}|${r.unit_id}`];
+        if (ov != null) overrideCount += 1;
+        unitsRand = round2(unitsRand + (ov != null ? ov : individualWaterCost(use, priceBands, statementPeriod)));
+      });
+    }
+
+    const councilKl = ci && ci.bulk_water_kl != null ? Number(ci.bulk_water_kl) : null;
+    const councilRand = ci && ci.bulk_water_rand != null ? Number(ci.bulk_water_rand) : null;
+    // A month only counts towards the margin when both sides are real.
+    const comparable = councilRand != null && unitsRand != null;
+    const totalBilled = unitsRand == null ? null : round2(unitsRand + cpMonthly);
+
+    return {
+      period: p,
+      label: (() => { const [y, m] = p.split("-"); return `${MONTH_NAMES[parseInt(m, 10) - 1].slice(0, 3)} ${y.slice(2)}`; })(),
+      councilKl, councilRand, unitsKl, unitsRand,
+      cpRand: cpMonthly, totalBilled,
+      difference: comparable ? round2(totalBilled - councilRand) : null,
+      comparable,
+      missingInvoice: !ci,
+      missingReadings: monthUsage.length === 0,
+      overrideCount,
+      sewerPerUnit: ci && ci.sewer_charge_per_unit != null ? Number(ci.sewer_charge_per_unit) : null,
+      demandLevyPerUnit: ci && ci.water_demand_levy_per_unit != null ? Number(ci.water_demand_levy_per_unit) : null,
+    };
+  });
+
+  const compared = rows.filter((r) => r.comparable);
+  const sum = (key) => round2(compared.reduce((s, r) => s + (r[key] || 0), 0));
+  const totals = {
+    councilKl: sum("councilKl"), councilRand: sum("councilRand"),
+    unitsKl: sum("unitsKl"), unitsRand: sum("unitsRand"),
+    cpRand: round2(cpMonthly * compared.length),
+    totalBilled: sum("totalBilled"),
+  };
+  totals.margin = round2(totals.totalBilled - totals.councilRand);
+  totals.marginPct = totals.councilRand > 0 ? round2((totals.margin / totals.councilRand) * 100) : null;
+  totals.marginPerUnitPerMonth = compared.length && unitCount
+    ? round2(totals.margin / unitCount / compared.length) : null;
+  // The volume gap CoJ metered but no unit meter accounts for — common property
+  // use plus losses. Read against the provision, this is what says whether the
+  // 20 kL standard is anywhere near reality.
+  totals.commonPropertyKl = round2(totals.councilKl - totals.unitsKl);
+  totals.commonPropertyKlPerMonth = compared.length ? round2(totals.commonPropertyKl / compared.length) : null;
+
+  return {
+    rows, totals,
+    monthsCompared: compared.length,
+    monthsTotal: periods.length,
+    missingInvoicePeriods: rows.filter((r) => r.missingInvoice).map((r) => r.label),
+    missingReadingPeriods: rows.filter((r) => r.missingReadings).map((r) => r.label),
+    overrideMonths: rows.filter((r) => r.overrideCount > 0).length,
+    cpMonthly, cpCaptured, unitCount, vatRate,
+  };
+}
+
+// The water band set in force on a given date, in the shape calcWaterCost and
+// individualWaterCost expect. water_tariff_bands stores one row per band per
+// effective date; pricing a month means resolving to the latest set that had
+// started by then, which is the same rule the statement screen applies.
+function waterBandsAsOf(bandRows, dateStr) {
+  const effDates = [...new Set(bandRows.map((b) => b.effective_from))].sort();
+  if (!effDates.length) return WATER_BANDS_DEFAULT;
+  const active = [...effDates].reverse().find((d) => d <= dateStr) || effDates[0];
+  return bandRows
+    .filter((b) => b.effective_from === active)
+    .map((b) => ({
+      id: b.band_label, label: b.band_label,
+      from: Number(b.from_kl), to: b.to_kl == null ? null : Number(b.to_kl),
+      rate2025: Number(b.rate_per_kl) || 0, rate2024: 0,
+    }))
+    .sort((a, b) => a.from - b.from);
 }
 
 // Picks a readable y axis: a 1/2/2.5/5 x 10^n gridline step, then the smallest
