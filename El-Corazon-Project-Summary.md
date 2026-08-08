@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 8 August 2026, session 6 (supersedes the 7 August 2026 session 5 summary)
+Last updated: 8 August 2026, session 9 (supersedes the 8 August 2026 session 8 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,255 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 8 August 2026, session 9 — digital statements, and a parser bug they exposed
+
+Devon gave access to `C:\Users\devon\OneDrive\El Corazon Body Corp\Bank Statements`.
+All twelve FY 2025/2026 statements are there as **digital PDFs with a real text
+layer** (269–278 plus June and July 2026), one per month subfolder. These parse
+properly, unlike the scanned copies.
+
+### The parser dropped FNB's monthly service fee on 10 of 12 statements
+
+Running the app's own `BANK_LINE_RE` over the twelve real files found **ten
+unparsed lines** — one per statement, always the month-end service fee:
+
+```
+"31 Aug                    69.00            187,172.24 Cr"
+```
+
+**FNB leaves the description column empty on that line.** `(.+?)` requires at
+least one character, so the line failed the match and `parseBankStatementLines`
+dropped it — by design, since it drops anything that doesn't match. Every one of
+those ten statements came out short by exactly the fee: R69, R114, R24, R69, R24,
+R24, R24, R24, R24, R69 — **R465 across the year**.
+
+Fixed by making the description group optional: `(?:(.*?)\s+)?`. A blank
+description is then labelled from the statement's own Bank Charges box, which
+states the month's service fee — so where the amount agrees the line becomes
+"Service Fees" rather than staying anonymous. Anything else blank stays
+`(no description on statement)` and falls to needs-review, which is honest.
+
+After the fix: **12 of 12 statements parse with zero dropped lines and R0.00
+drift.**
+
+### Turnover added as a second, independent check
+
+`parseStatementHeader` now also reads "Turnover for Statement Period" — the bank's
+own count and total of credits and debits. The balance walk proves the running
+balances are internally consistent; **turnover proves the right number of lines
+were read**. A statement can pass one and fail the other, which is exactly what
+happened above: the walk would have caught the missing fee, but turnover names it
+as a count problem immediately.
+
+Zero-rand lines are excluded from the count, because FNB prints its interest-rate
+notice as a dated line with an amount of 0.00 and does not count it in turnover.
+Three statements carry one.
+
+### All 139 rows now carry a running balance — and the walk found a date error
+
+Backfilled from the digital PDFs by **UPDATE matched on (period, date, amount,
+direction)**, not delete-and-reinsert, so tagging survived. Confirmed after:
+**0 untagged debits, 127 reviewed flags, 85 unit matches, and the Cor 6
+applied-period retargeting all preserved.**
+
+> **One row would not match, and it was a real error.** The E Van Noord payment of
+> R2,427.33 was stored on **5 May 2026**; FNB statement 278 prints it on **6 May**.
+> The walk flagged it with a drift of exactly R2,427.33. Corrected, with the reason
+> recorded in `review_note`, and `applied_period` pinned explicitly so the
+> correction could not move which month the payment settles.
+
+**Final state: 12 statements, 0 rows missing a balance, 0 walk breaks across every
+period, all balances `balance_source = 'printed'`.**
+
+### The closing balance is now read, not derived
+
+| | |
+|---|---:|
+| Opening 31 July 2025 | R 207,203.65 |
+| **Closing 31 July 2026** | **R 210,844.15** |
+
+Last session this was rolled forward from transactions and flagged as needing
+confirmation. **It is now read off statement 280 and confirms the derived figure
+exactly.** The FY 2026/2027 budget has its opening cash.
+
+---
+
+## Done on 8 August 2026, session 8 — the scanned statements
+
+### The full-year bank audit: **every stored line ties to the bank's own figures**
+
+Devon supplied `El Corazon Bank Statements.pdf` — ten FNB statements (269–278,
+Aug 2025 – May 2026). Another Canon scan with no text layer, so OCR'd at 300 dpi.
+Three independent checks, all passed:
+
+1. **The balance chain holds.** Every statement's printed opening equals the
+   previous statement's printed closing, unbroken across all ten. A single
+   misread digit anywhere would break it — so the OCR is self-validating.
+2. **Each statement's own arithmetic holds.** Printed opening + printed credit
+   turnover − printed debit turnover = printed closing, on all ten.
+3. **The stored transactions match the printed turnover exactly** — transaction
+   counts *and* rand totals, on all ten. The original import dropped nothing.
+
+> **The one discrepancy was OCR, not data.** March 2026 read R18,379.38 credits
+> against R18,379.39 stored, and the debit total was illegible. The stored pair
+> reconciles the printed opening to the printed closing exactly
+> (199,849.28 + 18,379.39 − 15,649.64 = 202,579.03), so the database is right and
+> the scan was a cent out. Worth remembering: **on a blurry scan, trust the
+> figure that reconciles, not the figure that was read.**
+
+### Balances backfilled — all 12 statements now reconcile to R0.00
+
+Ten carry `balance_source = 'printed'`. June and July 2026 were not in the PDF, so
+their opening chains off May's printed closing and their closing is rolled forward
+from stored transactions — marked `'derived'`, and they need their own PDFs to
+confirm.
+
+| | |
+|---|---:|
+| 31 May 2026 closing, **printed** | **R 209,079.38** |
+| 30 June 2026 closing, derived | R 212,399.88 |
+| **31 July 2026 closing, derived** | **R 210,844.15** |
+
+**That last figure is the opening cash the FY 2026/2027 budget needed.** It is
+derived, not read — confirm it against the June and July statements before the
+budget is signed.
+
+### The parser now reads the printed Statement Balances box
+
+The real format, previously unavailable:
+
+```
+Tax Invoice/Statement Number : 278
+Money On Call : 61123184551
+Statement Period : 30 April 2026 to 31 May 2026
+Opening Balance   206,930.38 Cr
+Closing Balance   209,079.38 Cr
+```
+
+`parseStatementHeader()` reads opening, closing, period, statement number and
+account number. **The printed pair now wins over the derived pair** — and where the
+two disagree the preview says so, because that gap is exactly the size of what the
+parser missed. Deriving from the running-balance column remains the fallback, since
+it works on any layout while these patterns only work on this one.
+
+### Overdrawn balances now parse
+
+`BANK_LINE_RE` gained a `Dr` branch on the balance column and stores it negative.
+Flagged last session as a known limitation: such a line failed the match and was
+silently dropped. Also fixed in the header box.
+
+### Verified
+
+Parse and bundle clean. Tested against the real May 2026 statement (stmt 278):
+header box read correctly on all five fields, all 13 transaction lines parsed,
+credits R20,723.49 and debits R18,574.49 both matching the printed turnover, and
+opening + credits − debits landing on the printed closing with **R0.00 drift**.
+
+> **The cross-check caught an error in my own test data.** My first transcription
+> had one credit R10 low. The walk failed at line 1 — *expected R210,212.46, the
+> statement prints R210,222.46, out by R10* — which is precisely the behaviour the
+> whole design is for: one wrong digit, named at the exact line, rather than an
+> unexplained total at the bottom.
+
+Overdrawn cases confirmed: a `Dr` transaction line parses to −3,000.00 where it
+previously did not parse at all; `Closing Balance 1,234.56 Dr` reads as −1,234.56.
+
+### Still open — *both resolved in session 9 above*
+
+- ~~The app cannot parse these scans.~~ Digital PDFs supplied; all twelve parse.
+- ~~Confirm the June and July 2026 closing balances.~~ Both now read off their
+  statements and agreeing with the derived figures exactly.
+
+---
+
+## Done on 8 August 2026, session 7
+
+### "Bank reconciliation" renamed **Tenant recon**; new **Bank recon** module owns importing
+
+Nav order is now `… Invoice allocation · Tenant recon · Bank recon · Statement preview …`.
+All in-app copy that pointed at "the Bank reconciliation page" was repointed — five
+strings including two inside the AGM report's own hint text.
+
+**Bank recon** imports a statement and recreates it line for line: opening balance,
+every transaction with the running balance the bank printed against it, closing
+balance. **Tenant recon keeps the matching, tagging and reviewing UI but no longer
+imports** — its upload card is now a button through to Bank recon.
+
+> **Why one import path.** Two parsers writing `bank_transactions` is how the two
+> drift apart, and a fix to one silently leaves the other wrong. Same reasoning that
+> moved the insurance grid off Config in session 5. `saveBankStatementToDb` and the
+> `handleBankStatementUpload` handler in `App` are **deleted**; everything goes
+> through `saveBankStatementForPeriod(period, fileName, txns, balances)`.
+
+### The parser was already capturing the running balance and throwing it away
+
+`BANK_LINE_RE` has always matched the running-balance column as group 5. The
+destructure in `parseBankStatementLines` skipped it with a bare comma. That one
+character is the difference between an import you can verify and one you cannot.
+
+Now kept as `balanceAfter`, plus `lineNo` for statement order (not the same as date
+order once two movements share a day). `deriveStatementBalances()` turns those into
+an envelope, and the check that matters is **not** opening-plus-net-equals-closing —
+it is walking the ledger and asserting each printed balance follows from the one
+above it plus that line's movement. **A dropped line breaks the walk at exactly that
+line and the UI names it.** The naive total-only test would just report a number.
+The walk resyncs to the printed balance after each break so one bad line doesn't
+cascade into every line below it.
+
+### Opening/closing are DERIVED, and say so
+
+There is no sample FNB statement in the repo to write a header regex against, so
+closing = the last line's printed balance and opening = the first line's printed
+balance reversed by its own movement. Both are the bank's own figures, neither is
+read off the header, and `bank_statement_documents.balance_source` records
+`derived` / `printed` / `entered` / `unavailable` so a later reader is never misled.
+
+### `statementDateToIso` took the year from whatever period was selected
+
+Fine when only the current statement could be imported. **Bank recon can import any
+month**, so it now takes a `forPeriod` argument. It also handles the December
+statement carrying an early-January line — month rolls back to 01 while the
+statement's month is 12, so the line belongs to the *following* year. Corrected in
+both directions.
+
+### Migration `bank_recon_statement_balances.sql` (applied)
+
+`bank_statement_documents` + `opening_balance`, `closing_balance`, `balance_source`,
+`statement_from`, `statement_to`, `account_number`.
+`bank_transactions` + `balance_after`, `line_no`.
+
+Backfilled: `line_no` set on all 139 existing rows by date-then-created order; all
+12 stored documents marked `balance_source = 'unavailable'`.
+
+> **The 12 existing statements cannot be verified** — they were imported before the
+> balance column was kept, so there is nothing to check against. Bank recon shows
+> them "Cannot be verified" with a prompt to re-import. Re-importing each PDF is the
+> only fix, and it is worth doing before the AGM: it is what produces the closing
+> bank balance the budget needs.
+
+### Known limitation: an overdrawn balance will not parse
+
+`BANK_LINE_RE` allows an optional `Cr` on the balance but has no branch for `Dr`.
+A line printing an overdrawn balance is **silently skipped** — it fails the match and
+`parseBankStatementLines` drops non-matching lines by design. The account has never
+been overdrawn so nothing is wrong today, and the balance walk would now catch it if
+it happened. Worth fixing when a real statement is to hand.
+
+### Verified
+
+Parse and bundle clean. Logic harness against a synthetic FNB-format statement:
+4 lines parsed, opening R5,000.00 and closing R3,812.88 derived correctly, drift
+R0.00, accrued fee captured. **Dropping the third line makes the walk fail at line 3
+with a drift of exactly the missing R1,577.17.** No-balance input reports
+`unavailable`. Year rollover correct in all four directions (02 Jan on a Dec-2025
+statement → 2026-01-02; 29 Dec on a Jan-2026 statement → 2025-12-29).
+
+> Devon confirmed 8 August 2026: **no arrears at 31 July 2026** and **no reserve fund
+> exists**. The reserve fund answer engages the PMR 22 floor — see
+> `docs/data-needed-budget-and-maintenance-plan.md`.
 
 ---
 

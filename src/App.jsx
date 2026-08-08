@@ -205,7 +205,90 @@ async function extractPdfLines(pdf) {
 // Matches: "01 Jun <description> <amount> [Cr] <balance> [Cr] [accrued charge]"
 // pdf.js extracts "Cr"/"Dr" as a separate token with a space before it (e.g.
 // "3,103.25 Cr"), not glued to the amount — validated against the real FNB statement.
-const BANK_LINE_RE = /^(\d{2}\s+[A-Za-z]{3})\s+(.+?)\s+([\d,]+\.\d{2})\s?(Cr)?\s+([\d,]+\.\d{2})\s?(?:Cr)?(?:\s+(\d+\.\d{2}))?$/;
+// The description group is OPTIONAL, and that is not a nicety: FNB prints its
+// month-end service fee with an EMPTY description column —
+//
+//   "31 Aug                    69.00            187,172.24 Cr"
+//
+// Ten of the twelve FY 2025/2026 statements carry one. With `(.+?)` the line
+// failed the match and `parseBankStatementLines` dropped it, losing the fee and
+// leaving the statement out by exactly that amount. Found 8 August 2026 by
+// running this regex over the twelve real statements.
+const BANK_LINE_RE = /^(\d{2}\s+[A-Za-z]{3})\s+(?:(.*?)\s+)?([\d,]+\.\d{2})\s?(Cr)?\s+([\d,]+\.\d{2})\s?(Cr|Dr)?(?:\s+(\d+\.\d{2}))?$/;
+
+// The "Statement Balances" box FNB prints at the top of every statement:
+//
+//   Opening Balance   206,930.38 Cr
+//   Closing Balance   209,079.38 Cr
+//   Statement Period : 30 April 2026 to 31 May 2026
+//   Tax Invoice/Statement Number : 278
+//   Money On Call : 61123184551
+//
+// Written against the real statements supplied 8 August 2026. Before that there
+// was no sample to work from and the balances had to be derived from the
+// running-balance column — which is still the fallback, because it works on any
+// layout and these patterns only work on this one.
+const STMT_OPENING_RE = /Opening\s+Balance\s+([\d,]+\.\d{2})\s*(Cr|Dr)?/i;
+const STMT_CLOSING_RE = /Closing\s+Balance\s*:?\s+([\d,]+\.\d{2})\s*(Cr|Dr)?/i;
+const STMT_PERIOD_RE = /Statement\s+Period\s*:\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})\s+to\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})/i;
+const STMT_NUMBER_RE = /Statement\s+Number\s*:?\s*(\d+)/i;
+const STMT_ACCOUNT_RE = /Money\s+On\s+Call\s*:\s*(\d{6,})/i;
+// The Bank Charges box states the month's service fee. It is what lets the
+// blank-description line above be labelled rather than left anonymous.
+const STMT_SERVICE_FEES_RE = /Service\s+Fees\s+([\d,]+\.\d{2})\s*(?:Dr)?/i;
+// "Turnover for Statement Period" at the foot: the bank's own count and total of
+// credits and debits. A second, INDEPENDENT check — the balance walk proves the
+// running balances are internally consistent, while these prove the right number
+// of lines were read. A statement can pass one and fail the other.
+const TURNOVER_CR_RE = /No\.\s*Credit\s*Transactions\s*(\d+)\s+([\d,]+\.\d{2})/i;
+const TURNOVER_DR_RE = /No\.\s*Debit\s*Transactions\s*(\d+)\s+([\d,]+\.\d{2})/i;
+
+// "30 April 2026" -> "2026-04-30". Full month names, unlike the transaction
+// lines' three-letter abbreviations.
+function longStatementDateToIso(s) {
+  const m = String(s).match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/);
+  if (!m) return null;
+  const i = MONTH_NAMES.findIndex((n) => n.toLowerCase() === m[2].toLowerCase());
+  if (i < 0) return null;
+  return `${m[3]}-${String(i + 1).padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+}
+
+// Reads the header box. Returns nulls rather than throwing where a field is
+// absent, so a layout that doesn't carry one still produces the rest.
+function parseStatementHeader(lines) {
+  const text = lines.join("\n");
+  const num = (re) => {
+    const m = text.match(re);
+    if (!m) return null;
+    const v = parseFloat(m[1].replace(/,/g, ""));
+    if (!isFinite(v)) return null;
+    // An overdrawn balance prints "Dr". It is money owed, so it is negative.
+    return m[2] && /dr/i.test(m[2]) ? -v : v;
+  };
+  const per = text.match(STMT_PERIOD_RE);
+  const no = text.match(STMT_NUMBER_RE);
+  const acc = text.match(STMT_ACCOUNT_RE);
+  return {
+    opening: num(STMT_OPENING_RE),
+    closing: num(STMT_CLOSING_RE),
+    from: per ? longStatementDateToIso(per[1]) : null,
+    to: per ? longStatementDateToIso(per[2]) : null,
+    statementNumber: no ? no[1] : null,
+    accountNumber: acc ? acc[1] : null,
+    serviceFees: (() => {
+      const m = text.match(STMT_SERVICE_FEES_RE);
+      if (!m) return null;
+      const v = parseFloat(m[1].replace(/,/g, ""));
+      return isFinite(v) ? v : null;
+    })(),
+    turnover: (() => {
+      const c = text.match(TURNOVER_CR_RE), d = text.match(TURNOVER_DR_RE);
+      if (!c && !d) return null;
+      const pair = (m) => (m ? { count: Number(m[1]), total: parseFloat(m[2].replace(/,/g, "")) } : null);
+      return { credits: pair(c), debits: pair(d) };
+    })(),
+  };
+}
 
 // Categorises one bank transaction line. Every line gets a category — nothing is
 // silently dropped (per the execution plan's bank-ingestion rule).
@@ -233,22 +316,102 @@ function classifyBankTransaction(desc) {
 
 // Parses reconstructed PDF lines into transaction objects, deduping identical lines
 // (defends against a line appearing more than once across pages).
-function parseBankStatementLines(lines) {
+//
+// `balanceAfter` is the running balance printed against the line. It was always
+// matched by BANK_LINE_RE and then discarded by a hole in the destructure — the
+// Bank recon module needs it, because it is the only thing that can prove the
+// import dropped nothing. `lineNo` preserves statement order, which is not the
+// same as date order once two movements share a day.
+function parseBankStatementLines(lines, header) {
   const seen = new Set();
   const out = [];
   lines.forEach((line) => {
     const m = line.match(BANK_LINE_RE);
     if (!m) return;
-    const [, date, desc, amountRaw, crFlag, , accrued] = m;
+    const [, date, rawDesc, amountRaw, crFlag, balanceRaw, balanceSign, accrued] = m;
+    const amount = parseFloat(amountRaw.replace(/,/g, ""));
+    // A blank description is FNB's month-end service fee. The statement states
+    // that fee in its own Bank Charges box, so where the amount agrees the line
+    // is labelled from the statement rather than left anonymous — an inference,
+    // but one the document itself supports. Anything else blank stays blank and
+    // falls through to "needs review", which is the honest outcome.
+    let desc = (rawDesc || "").trim();
+    let labelledFromHeader = false;
+    if (!desc) {
+      if (header && header.serviceFees != null && Math.abs(round2(amount - header.serviceFees)) <= 0.005) {
+        desc = "Service Fees";
+        labelledFromHeader = true;
+      } else {
+        desc = "(no description on statement)";
+      }
+    }
     const key = date + "|" + desc + "|" + amountRaw;
     if (seen.has(key)) return;
     seen.add(key);
-    const amount = parseFloat(amountRaw.replace(/,/g, ""));
     const direction = crFlag ? "credit" : "debit";
     const cls = classifyBankTransaction(desc);
-    out.push({ date, desc, amount, direction, accruedCharge: accrued ? parseFloat(accrued) : 0, ref: desc, ...cls });
+    out.push({
+      date, desc, amount, direction, labelledFromHeader,
+      accruedCharge: accrued ? parseFloat(accrued) : 0,
+      // "Dr" on the balance column means the account was overdrawn at that
+      // point. Previously the regex had no Dr branch at all, so such a line
+      // failed the match and was silently dropped.
+      balanceAfter: balanceRaw
+        ? (balanceSign && /dr/i.test(balanceSign) ? -1 : 1) * parseFloat(balanceRaw.replace(/,/g, ""))
+        : null,
+      lineNo: out.length + 1,
+      ref: desc, ...cls,
+    });
   });
   return out;
+}
+
+// The statement envelope, derived from the transaction lines themselves.
+//
+// Deriving rather than reading the printed "Opening Balance" line is a deliberate
+// choice, made because there is no sample statement to write that regex against
+// and a wrong guess would be worse than an honest derivation. The closing balance
+// is the last line's printed running balance; the opening balance is the FIRST
+// line's running balance reversed by its own movement. Both come off figures the
+// bank printed, so neither is invented — but `balanceSource` says "derived" so a
+// later reader knows they were not read off the header.
+//
+// The check is the point: walking the lines and comparing each printed balance
+// against the previous one plus the movement catches a dropped or duplicated
+// line, which a simple opening-plus-net-equals-closing test cannot.
+function deriveStatementBalances(txns) {
+  const withBalance = txns.filter((t) => t.balanceAfter != null);
+  if (!withBalance.length) {
+    return { opening: null, closing: null, balanceSource: "unavailable", checks: [], ok: null,
+      reason: "No running balance column was found on any line — this statement layout is not the one the parser was built for." };
+  }
+  const first = withBalance[0], last = withBalance[withBalance.length - 1];
+  const signed = (t) => (t.direction === "credit" ? t.amount : -t.amount);
+  const opening = round2(first.balanceAfter - signed(first));
+  const closing = round2(last.balanceAfter);
+
+  // Line-by-line: does each printed balance follow from the one before it?
+  const checks = [];
+  let running = opening;
+  withBalance.forEach((t) => {
+    running = round2(running + signed(t));
+    const drift = round2(t.balanceAfter - running);
+    if (Math.abs(drift) > 0.005) checks.push({ lineNo: t.lineNo, date: t.date, desc: t.desc, expected: running, printed: t.balanceAfter, drift });
+    running = t.balanceAfter; // resync so one bad line doesn't cascade into every line after it
+  });
+
+  const credits = round2(txns.filter((t) => t.direction === "credit").reduce((s, t) => s + t.amount, 0));
+  const debits = round2(txns.filter((t) => t.direction === "debit").reduce((s, t) => s + t.amount, 0));
+  const net = round2(opening + credits - debits);
+  const totalDrift = round2(closing - net);
+
+  return {
+    opening, closing, credits, debits, net, totalDrift,
+    balanceSource: "derived",
+    linesWithoutBalance: txns.length - withBalance.length,
+    checks,
+    ok: checks.length === 0 && Math.abs(totalDrift) <= 0.005,
+  };
 }
 
 async function parseBankStatementPdf(file) {
@@ -256,7 +419,68 @@ async function parseBankStatementPdf(file) {
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
   const lines = await extractPdfLines(pdf);
-  return parseBankStatementLines(lines);
+  return parseBankStatementLines(lines, parseStatementHeader(lines));
+}
+
+// Same parse, plus the derived envelope. The Bank recon module uses this; the
+// Tenant recon page keeps calling parseBankStatementPdf, which is unchanged.
+async function parseBankStatementWithBalances(file) {
+  const pdfjsLib = await ensurePdfJsLoaded();
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const lines = await extractPdfLines(pdf);
+  const header = parseStatementHeader(lines);
+  const txns = parseBankStatementLines(lines, header);
+  const derived = deriveStatementBalances(txns);
+
+  // The printed figures win where they are present — they are the bank's own
+  // statement of the position, whereas the derived pair is reconstructed from
+  // the running-balance column. Where both exist and DISAGREE, that is a real
+  // finding: it means a transaction line was missed. It is reported, not hidden,
+  // and the printed figures are still the ones used.
+  const balances = { ...derived, header };
+  if (header.opening != null || header.closing != null) {
+    balances.balanceSource = "printed";
+    if (header.opening != null) {
+      balances.openingDerived = derived.opening;
+      balances.openingMismatch = derived.opening != null && Math.abs(round2(header.opening - derived.opening)) > 0.005;
+      balances.opening = header.opening;
+    }
+    if (header.closing != null) {
+      balances.closingDerived = derived.closing;
+      balances.closingMismatch = derived.closing != null && Math.abs(round2(header.closing - derived.closing)) > 0.005;
+      balances.closing = header.closing;
+    }
+    // Re-run the totals check against the printed pair.
+    balances.net = round2(balances.opening + (derived.credits || 0) - (derived.debits || 0));
+    balances.totalDrift = round2(balances.closing - balances.net);
+    balances.ok = (derived.checks || []).length === 0
+      && Math.abs(balances.totalDrift) <= 0.005
+      && !balances.openingMismatch && !balances.closingMismatch;
+  }
+
+  // Turnover cross-check. Zero-rand lines are excluded because FNB prints its
+  // interest-rate notice as a dated line with an amount of 0.00 and does NOT
+  // count it in the turnover — it is a notice, not a movement, and counting it
+  // would report a false mismatch on every statement that carries one.
+  if (header.turnover) {
+    const movements = txns.filter((t) => t.amount !== 0);
+    const side = (dir, printed) => {
+      if (!printed) return null;
+      const mine = movements.filter((t) => t.direction === dir);
+      const total = round2(mine.reduce((s, t) => s + t.amount, 0));
+      return {
+        printedCount: printed.count, parsedCount: mine.length,
+        printedTotal: round2(printed.total), parsedTotal: total,
+        ok: printed.count === mine.length && Math.abs(round2(printed.total - total)) <= 0.005,
+      };
+    };
+    balances.turnover = { credits: side("credit", header.turnover.credits), debits: side("debit", header.turnover.debits) };
+    balances.turnoverOk = ["credits", "debits"].every((k) => !balances.turnover[k] || balances.turnover[k].ok);
+    balances.ok = balances.ok && balances.turnoverOk;
+    balances.noticeLines = txns.length - movements.length;
+  }
+  return { txns, balances };
 }
 
 // ---------- Insurance schedule PDF parsing (client-side, via pdf.js) ----------
@@ -1426,52 +1650,89 @@ async function parseUtilityBillPdf(file, kind) {
 
 // Parser dates look like "01 Jun"; demo data is already ISO. Falls back to
 // the period itself if a date can't be made sense of.
-function statementDateToIso(raw) {
+//
+// `forPeriod` is the statement's own period and supplies the year the printed
+// day-and-month has to be resolved against. It defaults to ACTIVE_PAYMENT_PERIOD
+// for the Tenant recon path, which only ever imports the current one — but Bank
+// recon can import any month, and taking the year from whatever period happened
+// to be selected would file a December 2025 statement in December 2026.
+//
+// A December statement carrying an early-January line is the case that breaks a
+// naive year: the month rolls back to 01 while the statement's own month is 12,
+// so the line belongs to the FOLLOWING year. Detected by comparing months and
+// corrected in both directions.
+function statementDateToIso(raw, forPeriod) {
+  const base = forPeriod || ACTIVE_PAYMENT_PERIOD;
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
   const m = String(raw).match(/^(\d{1,2})\s+([A-Za-z]{3})/);
-  // Bank transactions belong to the payment-period month (the bank statement
-  // being reconciled), so fall back to and take the year from that period.
-  if (!m) return ACTIVE_PAYMENT_PERIOD;
+  if (!m) return base;
   const months = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06", jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
   const mm = months[m[2].toLowerCase()];
-  if (!mm) return ACTIVE_PAYMENT_PERIOD;
-  return `${ACTIVE_PAYMENT_PERIOD.slice(0, 4)}-${mm}-${m[1].padStart(2, "0")}`;
+  if (!mm) return base;
+  let year = Number(base.slice(0, 4));
+  const baseMonth = Number(base.slice(5, 7));
+  const lineMonth = Number(mm);
+  if (baseMonth === 12 && lineMonth === 1) year += 1;
+  else if (baseMonth === 1 && lineMonth === 12) year -= 1;
+  return `${year}-${mm}-${m[1].padStart(2, "0")}`;
 }
 
 // Persists a parsed statement wholesale for the period — re-uploading a
 // corrected PDF replaces the previous document and its transactions rather
 // than duplicating them.
-async function saveBankStatementToDb(fileName, txns) {
+// THE single write path for an imported statement, and now the only one — the
+// Tenant recon upload handler that used to call its own version was removed on
+// 8 August 2026 when Bank recon took ownership of importing. One parser, one
+// write path, one balance check.
+//
+// Re-importing a corrected PDF replaces that period's document and its
+// transactions rather than duplicating them.
+async function saveBankStatementForPeriod(period, fileName, txns, balances) {
   const client = await ensureSupabaseClient();
   const unitDbIdByAppId = Object.fromEntries(UNITS.filter((u) => u.dbId).map((u) => [u.id, u.dbId]));
 
   // Any trustee retargeting lives on rows the delete below is about to remove.
   // Capture it first and re-apply after the re-insert, or re-importing a
   // statement silently reverts the fix and the month quietly goes unpaid again.
-  const defaultApplied = prevPeriod(ACTIVE_PAYMENT_PERIOD);
+  const defaultApplied = prevPeriod(period);
   const { data: priorTxns } = await client
     .from("bank_transactions")
     .select("txn_date, amount, description_raw, applied_period")
-    .eq("period", ACTIVE_PAYMENT_PERIOD)
+    .eq("period", period)
     .eq("category", "resident_payment");
   const retargeted = (priorTxns || []).filter(
     (p) => p.applied_period && p.applied_period !== defaultApplied
   );
 
-  let { error } = await client.from("bank_transactions").delete().eq("period", ACTIVE_PAYMENT_PERIOD);
+  let { error } = await client.from("bank_transactions").delete().eq("period", period);
   if (error) throw error;
-  ({ error } = await client.from("bank_statement_documents").delete().eq("period", ACTIVE_PAYMENT_PERIOD));
+  ({ error } = await client.from("bank_statement_documents").delete().eq("period", period));
   if (error) throw error;
   const { data: doc, error: docErr } = await client
     .from("bank_statement_documents")
-    .insert({ period: ACTIVE_PAYMENT_PERIOD, file_name: fileName, parse_status: "parsed", transaction_count: txns.length })
+    .insert({
+      period: period, file_name: fileName, parse_status: "parsed", transaction_count: txns.length,
+      // Nulls where no balances were derived, so a statement imported by the
+      // older path is visibly un-verified rather than falsely showing R0.00.
+      opening_balance: balances && balances.opening != null ? balances.opening : null,
+      closing_balance: balances && balances.closing != null ? balances.closing : null,
+      balance_source: balances && balances.balanceSource ? balances.balanceSource : "unavailable",
+      // The statement's own printed period wins over the first and last
+      // transaction dates, which only bound the movements and miss a quiet
+      // start or end to the month.
+      statement_from: (balances && balances.header && balances.header.from)
+        || (txns.length ? statementDateToIso(txns[0].date, period) : null),
+      statement_to: (balances && balances.header && balances.header.to)
+        || (txns.length ? statementDateToIso(txns[txns.length - 1].date, period) : null),
+      account_number: (balances && balances.header && balances.header.accountNumber) || null,
+    })
     .select("id")
     .single();
   if (docErr) throw docErr;
   const rows = txns.map((t) => ({
     bank_statement_document_id: doc.id,
-    period: ACTIVE_PAYMENT_PERIOD,
-    txn_date: statementDateToIso(t.date),
+    period: period,
+    txn_date: statementDateToIso(t.date, period),
     description_raw: t.desc,
     amount: t.amount,
     direction: t.direction,
@@ -1480,6 +1741,8 @@ async function saveBankStatementToDb(fileName, txns) {
     matched_unit_id: t.matchedUnit ? unitDbIdByAppId[t.matchedUnit] || null : null,
     match_confidence: t.confidence,
     match_note: t.note,
+    balance_after: t.balanceAfter == null ? null : t.balanceAfter,
+    line_no: t.lineNo == null ? null : t.lineNo,
   }));
   ({ error } = await client.from("bank_transactions").insert(rows));
   if (error) throw error;
@@ -1492,7 +1755,7 @@ async function saveBankStatementToDb(fileName, txns) {
     const { error: upErr } = await client
       .from("bank_transactions")
       .update({ applied_period: o.applied_period })
-      .eq("period", ACTIVE_PAYMENT_PERIOD)
+      .eq("period", period)
       .eq("txn_date", o.txn_date)
       .eq("amount", o.amount)
       .eq("description_raw", o.description_raw);
@@ -2074,6 +2337,11 @@ export default function App() {
   // months that actually have data, newest first.
   const [selectedPeriod, setSelectedPeriod] = useState(CURRENT_PERIOD);
   const [periods, setPeriods] = useState([CURRENT_PERIOD]);
+  // Bank recon's own month. Defaults to the statement that carries the current
+  // period's levy payments — the month after it — which is the one a trustee
+  // reaches for. Kept separate from `selectedPeriod` so importing a historic
+  // statement doesn't drag the dashboard and statements back with it.
+  const [bankReconPeriod, setBankReconPeriod] = useState(nextPeriod(CURRENT_PERIOD));
   const [waterBands, setWaterBands] = useState(WATER_BANDS_DEFAULT);
   // Every saved water rate set, keyed by effective date. The Tariffs & rates
   // page works entirely off this; `waterBands` above stays period-scoped and is
@@ -2119,9 +2387,7 @@ export default function App() {
   // Payments the trustee recorded before the bank statement arrived. Ignored
   // automatically once a real bank line exists for the same unit and month.
   const [manualPayments, setManualPayments] = useState([]);
-  const [bankStatementMeta, setBankStatementMeta] = useState(null); // { fileName, parsedAt, count } | null
-  const [bankStatementStatus, setBankStatementStatus] = useState("idle"); // idle | parsing | done | error
-  const [bankStatementError, setBankStatementError] = useState(null);
+  const [bankStatementMeta, setBankStatementMeta] = useState(null); // { fileName, parsedAt, count } | null — read-only, filled from the DB
   // "mock" until the DB rows arrive, then "database"; "error" keeps the app
   // fully usable on the mock fallback if Supabase is unreachable.
   const [unitsSource, setUnitsSource] = useState("mock");
@@ -2246,27 +2512,11 @@ export default function App() {
     return () => { cancelled = true; };
   }, [session, selectedPeriod, dataVersion]);
 
-  const handleBankStatementUpload = async (file) => {
-    setBankStatementStatus("parsing");
-    setBankStatementError(null);
-    try {
-      const parsed = await parseBankStatementPdf(file);
-      setBankTxns(parsed);
-      setBankStatementMeta({ fileName: file.name, parsedAt: new Date().toLocaleString("en-ZA"), count: parsed.length });
-      try {
-        await saveBankStatementToDb(file.name, parsed);
-        setBankStatementStatus("done");
-      } catch (persistErr) {
-        console.error("Statement parsed but saving to the database failed:", persistErr);
-        setBankStatementError("Parsed OK, but saving to the database failed — see browser console. The transactions below are NOT persisted.");
-        setBankStatementStatus("error");
-      }
-    } catch (err) {
-      console.error("Bank statement parsing failed:", err);
-      setBankStatementError("Couldn't parse this PDF: " + (err.message || "Unknown error"));
-      setBankStatementStatus("error");
-    }
-  };
+  // The upload handler that used to live here moved to the Bank recon module on
+  // 8 August 2026, along with `saveBankStatementToDb`'s only caller. Bank recon
+  // owns the import so there is one parser, one write path and one balance
+  // check; this screen's `bankStatementMeta` is still loaded from the database
+  // for display and is set nowhere else.
 
   // Saves (or clears) the manual utility-line overrides for a unit's statement
   // in the selected period. `patch` carries the full desired state: waterDue /
@@ -2483,10 +2733,7 @@ export default function App() {
                 onChangeAppliedPeriod={changeAppliedPeriod}
                 onReviewTxn={updateTxnReview}
                 onTagTxn={updateTxnExpenseCategory}
-                onUploadStatement={handleBankStatementUpload}
-                statementMeta={bankStatementMeta}
-                statementStatus={bankStatementStatus}
-                statementError={bankStatementError}
+                onGoToBankRecon={() => setTab("bank-recon")}
               />
             )}
             {tab === "statement-preview" && (
@@ -2510,6 +2757,25 @@ export default function App() {
                 commonPropertyWaterKl={commonPropertyWaterKl}
                 setCommonPropertyWaterKl={setCommonPropertyWaterKl}
                 standardsMeta={standardsMeta}
+              />
+            )}
+            {/* Bank recon drives its own month rather than the app-wide period
+                bar: the statement being imported is the month AFTER the one
+                being reconciled, and importing a historic statement should not
+                move every other screen with it. `dataVersion` bumps on a
+                successful import so Tenant recon picks the new lines up. */}
+            {tab === "bank-recon" && (
+              <BankRecon
+                // Every statement month the app knows about, plus the one after
+                // the latest — a statement is imported before its own period has
+                // any other data, so the list must run one month ahead.
+                periods={(() => {
+                  const set = new Set([...periods, ...periods.map(nextPeriod), bankReconPeriod]);
+                  return [...set].sort().reverse();
+                })()}
+                period={bankReconPeriod}
+                setPeriod={setBankReconPeriod}
+                onImported={() => setDataVersion((v) => v + 1)}
               />
             )}
             {tab === "rate-history" && <RateHistory />}
@@ -2651,7 +2917,8 @@ function SideNav({ tab, setTab }) {
     ["additional-charges", "Additional charges"],
     ["ops-expenses", "Body corp expenses"],
     ["allocation", "Invoice allocation"],
-    ["reconciliation", "Bank reconciliation"],
+    ["reconciliation", "Tenant recon"],
+    ["bank-recon", "Bank recon"],
     ["statement-preview", "Statement preview"],
     ["analytics", "Financial dashboard"],
     ["tariffs", "Tariffs & rates"],
@@ -2806,7 +3073,7 @@ function Dashboard({ alloc, setTab, setSelectedUnit, bankTxns, period = CURRENT_
     ci.bulkWaterRand + ci.bulkElecRand + ci.sewerage +
     ci.refuse + ci.fixedBasic;
   const totalDue = alloc.rows.reduce((s, r) => s + r.total, 0);
-  // Same reconciliation source of truth as the Bank reconciliation page, so the
+  // Same reconciliation source of truth as the Tenant recon page, so the
   // two stay in sync — expected nets out approved deductions, settled lines
   // (paid within tolerance or a reviewed variance) count as reconciled.
   const matches = reconcileUnits(alloc.rows, bankTxns, remittanceDeductions, {}, period, manualPayments);
@@ -3641,7 +3908,7 @@ function OpsExpenses({ opsExpenses, setOpsExpenses, period = CURRENT_PERIOD }) {
       <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
         Costs the Body Corp pays directly. Never billed to a unit; tracked here for the analytics dashboard and the September annual report.
         <br />
-        <strong>Log only expenses that never went through the bank account</strong> — anything on a bank statement is captured (and tagged) on the Bank reconciliation page, and anything a resident paid personally is captured on their deduction claim. Rows that duplicate either are greyed out below and excluded from every total.
+        <strong>Log only expenses that never went through the bank account</strong> — anything on a bank statement is captured on the Bank recon page and tagged on the Tenant recon page, and anything a resident paid personally is captured on their deduction claim. Rows that duplicate either are greyed out below and excluded from every total.
       </p>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 18 }}>
@@ -4529,7 +4796,7 @@ function buildFinancialYearReport({
   });
   if ((expenseRows.find((r) => r.label === UNCLASSIFIED)?.total || 0) > 0) {
     note(UNCLASSIFIED,
-      `Expenditure with no category assigned yet. Tag the relevant debits on the Bank reconciliation page — and any untagged deduction claims below them — to move this onto the right lines.`);
+      `Expenditure with no category assigned yet. Tag the relevant debits on the Tenant recon page — and any untagged deduction claims below them — to move this onto the right lines.`);
   }
   if (!chaserImported && chaserMonth) {
     note("__surplus__",
@@ -5262,7 +5529,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     rows.push(row(["Total", "", money(reported), ""], aligns, true, BAND));
     out.push(tbl(rows));
     if (Math.abs(reported - itemised) > 0.005) {
-      out.push(hint(`The total shown is the ${reportLabel} line from section 1 (${money(reported)}); the rows above itemise ${money(itemised)}. The ${money(round2(Math.abs(reported - itemised)))} difference means an item is tagged ${reportLabel} somewhere the itemisation doesn't reach — check the Bank reconciliation and Body corp expenses pages before the meeting.`));
+      out.push(hint(`The total shown is the ${reportLabel} line from section 1 (${money(reported)}); the rows above itemise ${money(itemised)}. The ${money(round2(Math.abs(reported - itemised)))} difference means an item is tagged ${reportLabel} somewhere the itemisation doesn't reach — check the Tenant recon and Body corp expenses pages before the meeting.`));
     }
     return out;
   };
@@ -5339,7 +5606,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
       : "Carried by the Body Corp and paid directly by a unit, then recovered by levy deduction against proof of payment — so it shows at R 0.00 on the levy statement.",
     { size: 20 }));
   if (bwReported != null && Math.abs(round2(bwReported - blockwatch.actualTotal)) > 0.005) {
-    E.push(hint(`The total shown is the BlockWatch line from section 1 (${money(bwReported)}); itemising the operating expenses, bank debits and approved deductions tagged BlockWatch gives ${money(blockwatch.actualTotal)}. Check the Bank reconciliation and Body corp expenses pages before the meeting.`));
+    E.push(hint(`The total shown is the BlockWatch line from section 1 (${money(bwReported)}); itemising the operating expenses, bank debits and approved deductions tagged BlockWatch gives ${money(blockwatch.actualTotal)}. Check the Tenant recon and Body corp expenses pages before the meeting.`));
   } else if (blockwatch.monthCount && blockwatch.monthCount < 12) {
     E.push(hint(`Recorded over ${blockwatch.monthCount} of the year's 12 months — the remaining ${12 - blockwatch.monthCount} carry no BlockWatch expense, bank debit or approved deduction. If the fee was paid in those months it hasn't been captured.`));
   }
@@ -7278,10 +7545,9 @@ function ManualPaymentControls({ match, period, onAdd, onRemove }) {
 function Reconciliation({
   alloc, period, remittanceDeductions, setRemittanceDeductions, remittanceAdvices,
   bankTxns, manualPayments = [], onAddManualPayment, onRemoveManualPayment, onChangeAppliedPeriod,
-  onReviewTxn, onTagTxn, onUploadStatement, statementMeta, statementStatus, statementError,
+  onReviewTxn, onTagTxn, onGoToBankRecon,
 }) {
   const categoryNames = useExpenseCategoryNames();
-  const fileInputRef = useRef(null);
 
   const approve = async (unitId) => {
     const ded = remittanceDeductions[unitId];
@@ -7348,33 +7614,26 @@ function Reconciliation({
 
   return (
     <>
-      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Bank reconciliation — {periodLabel(period)} statements</h1>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Tenant recon — {periodLabel(period)} statements</h1>
       <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
         {periodLabel(period)} levies are paid the following month, so these statements are matched against the <strong>{periodLabel(nextPeriod(period))} bank statement</strong>, by payment reference (Cor/Unit + number) against submitted remittance advices. Approved Body Corp expense deductions reduce the expected payment before comparing. Any "needs review" line or variance can be noted and marked resolved below.
       </p>
 
+      {/* Importing moved to Bank recon on 8 August 2026. Two upload paths writing
+          one table is how the two drift apart — Bank recon owns the import and
+          verifies it against the statement's own balances; this page consumes
+          what it produced and does the matching. */}
       <Card style={{ marginBottom: 16 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="application/pdf"
-            style={{ display: "none" }}
-            onChange={(e) => { const f = e.target.files[0]; if (f) onUploadStatement(f); e.target.value = ""; }}
-          />
-          <button style={primaryBtn} onClick={() => fileInputRef.current && fileInputRef.current.click()} disabled={statementStatus === "parsing"}>
-            {statementStatus === "parsing" ? "Parsing…" : "Upload bank statement PDF"}
+          <button style={primaryBtn} onClick={() => onGoToBankRecon && onGoToBankRecon()}>
+            Go to Bank recon
           </button>
           <div style={{ fontSize: 12.5, color: "#64748B" }}>
-            {statementStatus === "idle" && `Upload the ${periodLabel(nextPeriod(period))} bank statement (where ${periodLabel(period)}'s levies are paid).`}
-            {statementStatus === "parsing" && "Extracting and classifying transactions…"}
-            {statementStatus === "done" && statementMeta && (
-              <span style={{ color: "#2F5D50", fontWeight: 600 }}>
-                ✓ {statementMeta.count} transactions parsed from "{statementMeta.fileName}" ({statementMeta.parsedAt})
-              </span>
-            )}
-            {statementStatus === "error" && (
-              <span style={{ color: "#B5651D", fontWeight: 600 }}>{statementError}</span>
+            Bank statements are imported on <strong>Bank recon</strong>, which checks the import against the statement's own opening and closing balances before it is saved. This page reads what it imported.
+            {bankTxns && bankTxns.length ? (
+              <span style={{ color: "#2F5D50", fontWeight: 600 }}>{" "}✓ {bankTxns.length} transactions loaded for {periodLabel(nextPeriod(period))}.</span>
+            ) : (
+              <span style={{ color: "#B5651D", fontWeight: 600 }}>{" "}No transactions loaded for {periodLabel(nextPeriod(period))} — import that statement first.</span>
             )}
           </div>
         </div>
@@ -8421,5 +8680,338 @@ function ResidentPortal({
       </div>
       )}
     </main>
+  );
+}
+
+// ---------- Bank recon ----------
+// Added 8 August 2026. Owns statement import; Tenant recon consumes what this
+// produces and does the matching.
+//
+// Its whole job is to reproduce a statement faithfully and then prove it did.
+// The proof is arithmetic and comes from the bank's own figures: every line
+// carries the running balance the bank printed against it, so the module can
+// walk the ledger and assert that each printed balance follows from the one
+// above it plus that line's movement. If a line were dropped, duplicated or
+// misread, the walk breaks at exactly that line and says which.
+//
+// Opening and closing balances are DERIVED from that same column rather than
+// read off the statement header — there was no sample statement to write a
+// header regex against, and a wrong guess is worse than an honest derivation.
+// `balance_source` records this so a later reader is never misled.
+
+// One statement's saved state, rebuilt from the database.
+async function fetchBankStatement(period) {
+  const client = await ensureSupabaseClient();
+  const [doc, txns] = await Promise.all([
+    client.from("bank_statement_documents").select("*").eq("period", period).limit(1),
+    client.from("bank_transactions")
+      .select("id, txn_date, description_raw, amount, direction, accrued_bank_charge, category, balance_after, line_no, expense_category, matched_unit_id")
+      .eq("period", period)
+      .order("line_no", { ascending: true, nullsFirst: false })
+      .order("txn_date", { ascending: true }),
+  ]);
+  const failed = [doc, txns].find((r) => r.error);
+  if (failed) throw failed.error;
+  return { doc: (doc.data || [])[0] || null, txns: txns.data || [] };
+}
+
+// The same arithmetic as deriveStatementBalances, but over rows already saved.
+// Re-checking on read rather than trusting a stored flag means a statement that
+// was edited in the database afterwards still reports honestly.
+function verifySavedStatement(doc, txns) {
+  if (!txns.length) return { state: "empty" };
+  const withBalance = txns.filter((t) => t.balance_after != null);
+  if (!withBalance.length) {
+    return { state: "unverifiable", reason: "No running balances were captured for this statement — it was imported before Bank recon existed. Re-import the PDF to verify it." };
+  }
+  const signed = (t) => (t.direction === "credit" ? Number(t.amount) : -Number(t.amount));
+  const opening = doc && doc.opening_balance != null
+    ? Number(doc.opening_balance)
+    : round2(Number(withBalance[0].balance_after) - signed(withBalance[0]));
+  const closing = Number(withBalance[withBalance.length - 1].balance_after);
+
+  const breaks = [];
+  let running = opening;
+  withBalance.forEach((t) => {
+    running = round2(running + signed(t));
+    const drift = round2(Number(t.balance_after) - running);
+    if (Math.abs(drift) > 0.005) breaks.push({ ...t, expected: running, drift });
+    running = Number(t.balance_after);
+  });
+
+  const credits = round2(txns.filter((t) => t.direction === "credit").reduce((s, t) => s + Number(t.amount), 0));
+  const debits = round2(txns.filter((t) => t.direction === "debit").reduce((s, t) => s + Number(t.amount), 0));
+  const net = round2(opening + credits - debits);
+  const totalDrift = round2(closing - net);
+
+  return {
+    state: breaks.length === 0 && Math.abs(totalDrift) <= 0.005 ? "ok" : "broken",
+    opening, closing, credits, debits, net, totalDrift, breaks,
+    missingBalances: txns.length - withBalance.length,
+  };
+}
+
+function BankRecon({ periods, period, setPeriod, onImported }) {
+  const fileRef = useRef(null);
+  const [status, setStatus] = useState("idle");   // idle | parsing | review | saving | error
+  const [error, setError] = useState(null);
+  const [preview, setPreview] = useState(null);   // { fileName, txns, balances }
+  const [saved, setSaved] = useState(null);       // { doc, txns }
+  const [loading, setLoading] = useState(true);
+
+  const reload = async (p) => {
+    setLoading(true);
+    try { setSaved(await fetchBankStatement(p)); }
+    catch (err) { console.error("Loading the saved statement failed:", err); setSaved(null); }
+    setLoading(false);
+  };
+  useEffect(() => { reload(period); /* eslint-disable-next-line */ }, [period]);
+
+  const onFile = async (file) => {
+    setStatus("parsing"); setError(null); setPreview(null);
+    try {
+      const { txns, balances } = await parseBankStatementWithBalances(file);
+      if (!txns.length) throw new Error("No transaction lines were recognised in this PDF. Check it is an FNB statement and not a scan.");
+      setPreview({ fileName: file.name, txns, balances });
+      setStatus("review");
+    } catch (err) {
+      console.error("Bank statement parsing failed:", err);
+      setError("Couldn't parse this PDF: " + (err.message || "Unknown error"));
+      setStatus("error");
+    }
+  };
+
+  // Nothing is written until the trustee has seen the preview and the balance
+  // check — the same rule the insurance and utility-bill parsers follow. A
+  // mis-parse must never silently replace a month that was correct.
+  const commit = async () => {
+    if (!preview) return;
+    setStatus("saving"); setError(null);
+    try {
+      await saveBankStatementForPeriod(period, preview.fileName, preview.txns, preview.balances);
+      setPreview(null); setStatus("idle");
+      await reload(period);
+      if (onImported) onImported();
+    } catch (err) {
+      console.error("Saving the statement failed:", err);
+      setError("Parsed OK, but saving failed — see browser console. Nothing was written.");
+      setStatus("error");
+    }
+  };
+
+  const money = (n) => (n == null ? "—" : `R ${Number(n).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  const check = saved && saved.txns.length ? verifySavedStatement(saved.doc, saved.txns) : null;
+
+  const Pill = ({ tone, children }) => (
+    <span style={{
+      display: "inline-block", padding: "3px 10px", borderRadius: 999, fontSize: 11.5, fontWeight: 700,
+      background: tone === "ok" ? "#E3EFE9" : tone === "warn" ? "#FBEEE0" : "#F4E7E7",
+      color: tone === "ok" ? "#2F5D50" : tone === "warn" ? "#B5651D" : "#9B2C2C",
+    }}>{children}</span>
+  );
+
+  const th = { padding: "6px 8px", textAlign: "left" };
+  const td = { padding: "6px 8px", borderTop: "1px solid #F0EADC" };
+  const tdR = { ...td, textAlign: "right", fontFamily: "'IBM Plex Mono', ui-monospace, monospace" };
+
+  return (
+    <>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Bank recon — {periodLabel(period)}</h1>
+      <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
+        Imports a bank statement and recreates it line for line — opening balance, every transaction with the running balance the bank printed against it, and the closing balance. The import is only worth trusting if it reconciles, so every line is checked against the one above it before anything is saved. This is the single place a statement enters the system; <strong>Tenant recon</strong> reads what lands here.
+      </p>
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+          <label style={{ fontSize: 12.5, color: "#64748B", fontWeight: 600 }}>Statement month</label>
+          <select value={period} onChange={(e) => { setPreview(null); setStatus("idle"); setPeriod(e.target.value); }} style={inputStyle}>
+            {periods.map((p) => <option key={p} value={p}>{periodLabel(p)}</option>)}
+          </select>
+          <input ref={fileRef} type="file" accept="application/pdf" style={{ display: "none" }}
+            onChange={(e) => { const f = e.target.files[0]; if (f) onFile(f); e.target.value = ""; }} />
+          <button style={primaryBtn} onClick={() => fileRef.current && fileRef.current.click()} disabled={status === "parsing" || status === "saving"}>
+            {status === "parsing" ? "Parsing…" : "Import statement PDF"}
+          </button>
+          {error && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{error}</span>}
+        </div>
+        <div style={{ fontSize: 12, color: "#94A0AC", marginTop: 8 }}>
+          Importing replaces whatever is stored for {periodLabel(period)}. Trustee retargeting of a payment's applied period is preserved across a re-import.
+        </div>
+      </Card>
+
+      {/* ---- Preview: shown before anything is written ---- */}
+      {preview && (
+        <Card style={{ marginBottom: 16, borderColor: preview.balances.ok ? "#B9D4C6" : "#E0B48A" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
+            <div style={{ fontWeight: 700, fontSize: 14 }}>
+              Preview — {preview.txns.length} lines from "{preview.fileName}"
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              {preview.balances.ok
+                ? <Pill tone="ok">Balances reconcile</Pill>
+                : <Pill tone="bad">Does not reconcile</Pill>}
+              <button style={secondaryBtn} onClick={() => { setPreview(null); setStatus("idle"); }}>Discard</button>
+              <button style={primaryBtn} onClick={commit} disabled={status === "saving"}>
+                {status === "saving" ? "Saving…" : `Save to ${periodLabel(period)}`}
+              </button>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap", fontSize: 13 }}>
+            <div>Opening <strong>{money(preview.balances.opening)}</strong></div>
+            <div>Credits <strong style={{ color: "#2F5D50" }}>{money(preview.balances.credits)}</strong></div>
+            <div>Debits <strong style={{ color: "#9B2C2C" }}>{money(preview.balances.debits)}</strong></div>
+            <div>Closing <strong>{money(preview.balances.closing)}</strong></div>
+          </div>
+          {!preview.balances.ok && (
+            <div style={{ marginTop: 10, fontSize: 12.5, color: "#B5651D" }}>
+              {preview.balances.checks && preview.balances.checks.length
+                ? `${preview.balances.checks.length} line(s) don't follow from the balance above them — first at line ${preview.balances.checks[0].lineNo} (${preview.balances.checks[0].desc}), printed ${money(preview.balances.checks[0].printed)} against an expected ${money(preview.balances.checks[0].expected)}. A line was probably missed or misread.`
+                : `Opening plus credits less debits gives ${money(preview.balances.net)}, but the last line's balance is ${money(preview.balances.closing)} — out by ${money(preview.balances.totalDrift)}.`}
+              {" "}Saving anyway is allowed, but the discrepancy will keep showing below until it is resolved.
+            </div>
+          )}
+          {preview.balances.turnover && (
+            <div style={{ marginTop: 8, fontSize: 12, color: preview.balances.turnoverOk ? "#94A0AC" : "#B5651D" }}>
+              {preview.balances.turnoverOk ? (
+                <>Turnover check: the bank counts {preview.balances.turnover.credits ? `${preview.balances.turnover.credits.printedCount} credits` : ""}{preview.balances.turnover.credits && preview.balances.turnover.debits ? " and " : ""}{preview.balances.turnover.debits ? `${preview.balances.turnover.debits.printedCount} debits` : ""} — the same lines and the same totals were read.
+                {preview.balances.noticeLines ? ` ${preview.balances.noticeLines} zero-rand notice line(s) sit outside the count, as they do on the statement.` : ""}</>
+              ) : (
+                <><strong>The line count disagrees with the bank's own turnover.</strong>{" "}
+                {["credits", "debits"].map((k) => {
+                  const t = preview.balances.turnover[k];
+                  if (!t || t.ok) return null;
+                  return `${k}: bank says ${t.printedCount} totalling ${money(t.printedTotal)}, ${t.parsedCount} totalling ${money(t.parsedTotal)} were read. `;
+                })}
+                A line was missed or read twice.</>
+              )}
+            </div>
+          )}
+          {preview.balances.balanceSource === "printed" && (
+            <div style={{ marginTop: 8, fontSize: 12, color: (preview.balances.openingMismatch || preview.balances.closingMismatch) ? "#B5651D" : "#94A0AC" }}>
+              {preview.balances.openingMismatch || preview.balances.closingMismatch ? (
+                <>
+                  <strong>The statement's printed balances disagree with its own transaction lines.</strong>{" "}
+                  {preview.balances.openingMismatch && `Printed opening ${money(preview.balances.opening)} against ${money(preview.balances.openingDerived)} implied by the lines. `}
+                  {preview.balances.closingMismatch && `Printed closing ${money(preview.balances.closing)} against ${money(preview.balances.closingDerived)} implied by the lines. `}
+                  That gap is the size of what the parser missed — a line was almost certainly not read. The printed figures are the ones saved.
+                </>
+              ) : (
+                <>Opening and closing read off the statement's own Statement Balances box, and both agree with the transaction lines.
+                {preview.balances.header && preview.balances.header.statementNumber ? ` Statement ${preview.balances.header.statementNumber}.` : ""}</>
+              )}
+            </div>
+          )}
+          {preview.balances.linesWithoutBalance > 0 && (
+            <div style={{ marginTop: 6, fontSize: 12, color: "#94A0AC" }}>
+              {preview.balances.linesWithoutBalance} line(s) carry no running balance and are excluded from the walk.
+            </div>
+          )}
+        </Card>
+      )}
+
+      {/* ---- The saved statement ---- */}
+      {loading ? (
+        <Card><div style={{ fontSize: 13, color: "#64748B" }}>Loading {periodLabel(period)}…</div></Card>
+      ) : !saved || !saved.txns.length ? (
+        <Card>
+          <div style={{ fontSize: 13.5, fontWeight: 600, marginBottom: 4 }}>Nothing imported for {periodLabel(period)} yet.</div>
+          <div style={{ fontSize: 12.5, color: "#64748B" }}>Import the PDF above. Until then Tenant recon has no transactions to match against for this month.</div>
+        </Card>
+      ) : (
+        <>
+          <Card style={{ marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+              <div style={{ fontWeight: 700, fontSize: 13.5 }}>Reconciliation</div>
+              {check.state === "ok" && <Pill tone="ok">✓ Reconciles to the cent</Pill>}
+              {check.state === "broken" && <Pill tone="bad">Does not reconcile</Pill>}
+              {check.state === "unverifiable" && <Pill tone="warn">Cannot be verified</Pill>}
+            </div>
+            {check.state === "unverifiable" ? (
+              <div style={{ fontSize: 12.5, color: "#B5651D" }}>{check.reason}</div>
+            ) : (
+              <>
+                <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", maxWidth: 460 }}>
+                  <tbody>
+                    <tr><td style={td}>Opening balance</td><td style={tdR}>{money(check.opening)}</td></tr>
+                    <tr><td style={td}>Plus credits ({saved.txns.filter((t) => t.direction === "credit").length})</td><td style={{ ...tdR, color: "#2F5D50" }}>{money(check.credits)}</td></tr>
+                    <tr><td style={td}>Less debits ({saved.txns.filter((t) => t.direction === "debit").length})</td><td style={{ ...tdR, color: "#9B2C2C" }}>{money(check.debits)}</td></tr>
+                    <tr><td style={{ ...td, fontWeight: 700 }}>Expected closing</td><td style={{ ...tdR, fontWeight: 700 }}>{money(check.net)}</td></tr>
+                    <tr><td style={{ ...td, fontWeight: 700 }}>Closing balance per statement</td><td style={{ ...tdR, fontWeight: 700 }}>{money(check.closing)}</td></tr>
+                    <tr style={{ background: Math.abs(check.totalDrift) > 0.005 ? "#F4E7E7" : "#E3EFE9" }}>
+                      <td style={{ ...td, fontWeight: 700 }}>Difference</td>
+                      <td style={{ ...tdR, fontWeight: 700 }}>{money(check.totalDrift)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                {check.state === "broken" && check.breaks.length > 0 && (
+                  <div style={{ marginTop: 10, fontSize: 12.5, color: "#B5651D" }}>
+                    {check.breaks.length} line(s) break the running balance. First: <strong>{check.breaks[0].description_raw}</strong> on {check.breaks[0].txn_date} — the statement prints {money(check.breaks[0].balance_after)} where {money(check.breaks[0].expected)} follows from the line above. Re-import the PDF; if it persists, the parser missed a line in this layout.
+                  </div>
+                )}
+                {check.missingBalances > 0 && (
+                  <div style={{ marginTop: 8, fontSize: 12, color: "#94A0AC" }}>
+                    {check.missingBalances} line(s) have no running balance stored and sit outside the walk.
+                  </div>
+                )}
+                {saved.doc && saved.doc.balance_source === "derived" && (
+                  <div style={{ marginTop: 8, fontSize: 12, color: "#94A0AC" }}>
+                    Opening and closing are derived from the running-balance column the bank prints against each line, not read off the statement header. Both are the bank's own figures.
+                  </div>
+                )}
+              </>
+            )}
+          </Card>
+
+          <Card>
+            <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Statement, line for line</div>
+            <div style={{ fontSize: 12, color: "#94A0AC", marginBottom: 10 }}>
+              In statement order. "{saved.doc ? saved.doc.file_name : "—"}"
+              {saved.doc && saved.doc.statement_from ? ` · ${saved.doc.statement_from} to ${saved.doc.statement_to}` : ""}
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse", minWidth: 760 }}>
+                <thead>
+                  <tr style={{ color: "#64748B", fontSize: 11, textTransform: "uppercase" }}>
+                    <th style={th}>#</th><th style={th}>Date</th><th style={th}>Description</th>
+                    <th style={{ ...th, textAlign: "right" }}>Debit</th>
+                    <th style={{ ...th, textAlign: "right" }}>Credit</th>
+                    <th style={{ ...th, textAlign: "right" }}>Balance</th>
+                    <th style={{ ...th, textAlign: "right" }}>Fee</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr style={{ background: "#F6F1E7", fontWeight: 700 }}>
+                    <td style={td} /><td style={td} /><td style={td}>Opening balance</td>
+                    <td style={tdR} /><td style={tdR} />
+                    <td style={tdR}>{money(check.opening)}</td><td style={tdR} />
+                  </tr>
+                  {saved.txns.map((t, i) => {
+                    const broken = check.breaks && check.breaks.some((b) => b.id === t.id);
+                    return (
+                      <tr key={t.id} style={broken ? { background: "#F4E7E7" } : undefined}>
+                        <td style={{ ...td, color: "#94A0AC" }}>{t.line_no == null ? i + 1 : t.line_no}</td>
+                        <td style={td}>{t.txn_date}</td>
+                        <td style={td}>{t.description_raw}</td>
+                        <td style={{ ...tdR, color: "#9B2C2C" }}>{t.direction === "debit" ? money(t.amount) : ""}</td>
+                        <td style={{ ...tdR, color: "#2F5D50" }}>{t.direction === "credit" ? money(t.amount) : ""}</td>
+                        <td style={tdR}>{t.balance_after == null ? "—" : money(t.balance_after)}</td>
+                        <td style={{ ...tdR, color: "#94A0AC" }}>{Number(t.accrued_bank_charge) ? money(t.accrued_bank_charge) : ""}</td>
+                      </tr>
+                    );
+                  })}
+                  <tr style={{ background: "#F6F1E7", fontWeight: 700 }}>
+                    <td style={td} /><td style={td} /><td style={td}>Closing balance</td>
+                    <td style={tdR}>{money(check.debits)}</td>
+                    <td style={tdR}>{money(check.credits)}</td>
+                    <td style={tdR}>{money(check.closing)}</td>
+                    <td style={tdR} />
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
+    </>
   );
 }
