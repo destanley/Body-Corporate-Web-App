@@ -75,6 +75,61 @@ Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 20
 
 ## Done on 8 August 2026, session 6
 
+### The levy grid is VAT-INCLUSIVE — and §9 was comparing it against VAT-exclusive council charges
+
+Found while modelling the FY 2026/2027 projection, and it is the kind of thing that
+would have gone unnoticed for years. `levy_manual_entries` holds Common Property Water
+at **R81.07/unit/month** for FY 2025/2026 — R567.49 across seven units. The option-D
+document used R5,921.52/year, being 20 kL on the tariff table. **R493.46 × 1.15 =
+R567.48**: same number with VAT on it.
+
+The convention holds across the whole grid — sewerage captured at R890.66 against a
+council charge of R774.48 (×1.15 = R890.65), water demand levy at R123.90 against
+R107.74 (×1.15 = R123.90). Both exact VAT-inclusive pass-throughs.
+
+`bulk_water_rand` and `individualWaterCost` are both **exclusive**. So §9 as first
+written compared an inclusive recovery against an exclusive charge and **overstated
+the margin by R888.25 a year**. `fetchWaterReconciliation` now de-VATs the provision
+(`cpMonthly = cpMonthlyIncVat / (1 + vatRate)`) and returns both; the section prints
+the exclusive figure in the comparison and names the inclusive one in a note, so the
+adjustment is visible rather than silent.
+
+> **Convention worth remembering:** anything from the levy grid is VAT-inclusive;
+> anything from `council_invoices` or the water/electricity cost functions is
+> VAT-exclusive. Never add one to the other without saying which basis you are on.
+
+### Option-D's "current rule" column was the NEW rule, not what was actually billed
+
+Option-D §4 shows FY 2025/2026 metered water at **R17,327.53**. That prices every month
+on the flat-minimum rule adopted in session 5. Every FY 2025/2026 statement predates it
+(`WATER_MINIMUM_CHARGE_FROM = "2026-08"`, and the FY runs Aug 2025 – Jul 2026), so they
+all used the superseded merged-band rule, which bills sub-6 kL months harder.
+
+**Actual metered water billed was R18,238.88** — R911.35 more, all of it on U2 (R524.29
+not R353.01), U4 (R1,258.82 not R764.95) and U7 (R594.69 not R348.53). The real margin
+is bigger than option D reported. §9 prints the actual figure because it prices each
+month on the rule in force that month.
+
+### `docs/water-projection-FY2026-2027.md` — new
+
+Answers what removing the common-property provision would do, and projects next year.
+Headline: **metered billing alone over-recovers.** Projected FY 2026/2027 metered water
+is R19,493.07 against a projected CoJ charge of R15,935.33 — **R3,557.74 of surplus
+before the provision is counted at all**. Removing the provision takes R7,660.80/year
+(5.1% of levy grid income, R91.20/unit/month) out of the budget but creates **no water
+shortfall**. It is a funding decision, not a water one.
+
+Also in there: the FY 2026/2027 tariff is **+12.50%** on every band the complex reaches,
+yet metered billing rises only **6.9%** and U2, U4 and U7 pay *less* in cash — the rule
+change hands back more to light users than the tariff takes.
+
+### FY 2026/2027 levy grid IS captured (corrects an outstanding item)
+
+`levy_manual_entries` has a full 2026/2027 grid (R12,501.33/month, R150,015.96/year) and
+`levy_rates` has a 2026/2027 row. **Still missing: `levy_rates.water_demand_levy` is null**
+for 2026/2027, so AGM report §8 will show that one New cell blank even though the grid
+carries R123.90/unit.
+
 ### AGM report §9 — "Water: charged by CoJ vs billed to owners" (now permanent in the template)
 
 The AGM report had no place where the meeting could see what the scheme recovers on water

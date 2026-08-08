@@ -5600,7 +5600,10 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     if (water.overrideMonths) {
       W.push(hint(`${water.overrideMonths} ${water.overrideMonths === 1 ? "month carries" : "months carry"} a manual statement override on water. The override is used here rather than the computed figure, so this section agrees with the statements that were actually sent.`));
     }
-    W.push(hint("CoJ reading periods run 24 to 36 days and never line up with a calendar month, so any single month's difference is approximate — only the annual total ties out. The common-property provision is the figure captured on the levy grid and is billed as captured; the suggestion on Tariffs & rates is VAT-inclusive, so confirm the basis before reading the margin as exact to the cent."));
+    W.push(hint(`CoJ reading periods run 24 to 36 days and never line up with a calendar month, so any single month's difference is approximate — only the annual total ties out.`));
+    if (water.cpCaptured) {
+      W.push(hint(`Every figure above excludes VAT. The levy grid is billed VAT-inclusive, so the common-property provision — captured at ${money(water.cpPerUnitIncVat)} per unit per month, ${money(water.cpMonthlyIncVat)} across the ${water.unitCount} units — is shown here at ${money(water.cpMonthly)} a month, being that figure less VAT at ${nb(`${round2(water.vatRate * 100)}%`)}. Comparing it inclusive against a council charge that excludes VAT would overstate the margin.`));
+    }
   }
 
   // ---------- Portrait E2: section 10 ----------
@@ -5852,10 +5855,19 @@ async function fetchWaterReconciliation(fy) {
   // The common-property provision is a levy line, so what owners actually paid
   // for it is what the levy grid says — a manual figure, not a derived one.
   // Per unit per month, summed across units, times twelve for the year.
-  const cpMonthly = round2((cpLevy.data || []).reduce((s, r) => s + (Number(r.amount) || 0), 0));
-  const cpCaptured = (cpLevy.data || []).length > 0;
+  //
+  // VAT: the levy grid is billed VAT-INCLUSIVE by convention. `bulk_water_rand`
+  // off the council invoice and `individualWaterCost` are both EXCLUSIVE. Left
+  // alone, this section would compare an inclusive recovery against an exclusive
+  // charge and overstate the margin by the VAT on the provision — about R888 a
+  // year at 15%. The comparison therefore uses the de-VATed figure and the note
+  // prints the inclusive one alongside, so the transformation is visible rather
+  // than silent.
   const unitCount = (unitRows.data || []).length || UNITS.length;
   const vatRate = vat.data && vat.data[0] ? Number(vat.data[0].rate) : VAT_RATE_DEFAULT;
+  const cpMonthlyIncVat = round2((cpLevy.data || []).reduce((s, r) => s + (Number(r.amount) || 0), 0));
+  const cpMonthly = round2(cpMonthlyIncVat / (1 + vatRate));
+  const cpCaptured = (cpLevy.data || []).length > 0;
 
   const periods = fyPeriods(fy);
   const rows = periods.map((p) => {
@@ -5922,7 +5934,8 @@ async function fetchWaterReconciliation(fy) {
     missingInvoicePeriods: rows.filter((r) => r.missingInvoice).map((r) => r.label),
     missingReadingPeriods: rows.filter((r) => r.missingReadings).map((r) => r.label),
     overrideMonths: rows.filter((r) => r.overrideCount > 0).length,
-    cpMonthly, cpCaptured, unitCount, vatRate,
+    cpMonthly, cpMonthlyIncVat, cpCaptured, unitCount, vatRate,
+    cpPerUnitIncVat: unitCount ? round2(cpMonthlyIncVat / unitCount) : null,
   };
 }
 
