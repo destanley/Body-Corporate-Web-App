@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 8 August 2026, session 11 (supersedes the 8 August 2026 session 10 summary)
+Last updated: 8 August 2026, session 12 (supersedes the 8 August 2026 session 11 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,79 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 8 August 2026, session 12 — the budget, as a module and a report section
+
+### `docs/budget-FY2026-2027.md` — the projected budget, built at last
+
+Devon asked where it was, and the honest answer was that it did not exist: I had
+called the budget "95% buildable" without building it. Now built from the FY
+2025/2026 actuals, the captured FY 2026/2027 tariffs and the water projection.
+
+| | FY 2026/2027 |
+|---|---:|
+| Income | R 276,926.87 |
+| Administrative expenditure | R 270,617.34 |
+| **Operating surplus** | **R 6,309.53** |
+| Statutory reserve contribution | R 40,592.60 |
+| **After the reserve** | **−R 34,283.07** |
+
+**The budget balances on operations and fails on the reserve.** The way through
+costs nobody anything: the scheme holds R210,844.15 with no stated purpose, so
+designating R60,000 as the opening reserve clears the 25% threshold and the 15%
+floor stops applying. No levy increase, no cash movement — the reserve is
+notional. Flagged for CSOS or attorney confirmation, since PMR 22 speaks of a
+*budgeted contribution* and whether a designation of accumulated surplus
+qualifies is a legal question, not one I can answer.
+
+> **Worth saying at the meeting: only 18% of the water bill is water.** Sewerage
+> alone is R59,146.57 against R14,441.22 of consumption — a flat per-dwelling
+> charge nothing the scheme does can reduce. Owners reliably assume the water
+> bill is about usage.
+
+Owners pay **+10.0%** billed-to-billed, against council tariffs up 8.9–12.5%.
+
+### Migration `budget_lines_and_meta.sql` (applied) + new Budget module
+
+`budget_lines` (one row per line, with `basis` and `is_assumption`) and
+`budget_meta` (opening cash, approval record). Both RLS-protected. FY 2026/2027
+seeded with all 15 lines from the document — 6 flagged as assumptions, and
+**every line carries a basis**, because a budget line without one is a number
+nobody can challenge or defend.
+
+The Budget module makes every value editable: label, amount, basis and the
+estimate flag, plus add and remove lines. **Totals move as you type** — a budget
+you have to save before you can see the effect of is a budget nobody iterates on.
+
+### AGM report — section 14, Budget
+
+> **The design decision worth remembering.** Section 14 **prints what is stored
+> and never recomputes**. That is the opposite of sections 3, 10 and 13, which
+> are computed live. Those report *facts*, and a fact should always be current.
+> A budget is a *decision*, and a decision has to be pinned: what is tabled at
+> the meeting must be what the trustees agreed, not what a formula produced at
+> the moment the document was generated.
+
+The section covers income, expenditure, the result, cash, and names the
+assumption lines as the ones most worth challenging. It reports the budget for
+the year **ahead** (`nextFY(fy)`) since the report reviews one year and asks the
+meeting to approve the next. The signature line moved here — everything before
+this reports what happened; this is the only section that asks for approval, so
+it closes the document.
+
+**The reserve contribution is excluded from the cash projection on purpose.** It
+is a designation of existing funds, not a payment out, so the cash stays in the
+account either way. Showing it as an outflow would understate the closing balance
+by R40,592.60.
+
+### Verified
+
+`no-undef` clean, bundle clean. Round-trip checked in the database: stored rows
+total R276,926.87 income, R270,617.34 expenditure, R40,592.60 reserve, operating
+R6,309.53, after-reserve −R34,283.07, closing cash R217,153.68 — every figure
+matching the document, 6 assumption lines, and **0 lines without a basis**.
 
 ---
 

@@ -2779,6 +2779,7 @@ export default function App() {
               />
             )}
             {tab === "maintenance" && <MaintenancePlan />}
+            {tab === "budget" && <Budget />}
             {tab === "rate-history" && <RateHistory />}
             {tab === "levy-setup" && (
               <LevySetup
@@ -2921,6 +2922,7 @@ function SideNav({ tab, setTab }) {
     ["reconciliation", "Tenant recon"],
     ["bank-recon", "Bank recon"],
     ["maintenance", "Maintenance plan"],
+    ["budget", "Budget"],
     ["statement-preview", "Statement preview"],
     ["analytics", "Financial dashboard"],
     ["tariffs", "Tariffs & rates"],
@@ -4894,7 +4896,7 @@ function Analytics({ expenseCategories }) {
       // Usage is fetched here rather than read off the rendered charts so the
       // report doesn't depend on the trends card having finished loading, and
       // a failure there costs the section rather than the whole document.
-      const [prevReport, extras, usage, water, bank, plan] = await Promise.all([
+      const [prevReport, extras, usage, water, bank, plan, budget] = await Promise.all([
         loadFyReport(previousFY(fy), expenseCategories).catch(() => null),
         fetchAgmExtras(fy),
         fetchUsageTrend(fy).catch((err) => { console.warn("Loading usage for the AGM report failed:", err); return null; }),
@@ -4903,6 +4905,9 @@ function Analytics({ expenseCategories }) {
         fetchWaterReconciliation(fy).catch((err) => { console.warn("Loading water charged-vs-billed for the AGM report failed:", err); return null; }),
         fetchBankAccountSummary(fy).catch((err) => { console.warn("Loading the bank account summary for the AGM report failed:", err); return null; }),
         fetchMaintenancePlan(fy).catch((err) => { console.warn("Loading the maintenance plan for the AGM report failed:", err); return null; }),
+        // The budget is for the year AHEAD — the report reviews fy and asks the
+        // meeting to approve nfy.
+        fetchBudget(nextFY(fy)).catch((err) => { console.warn("Loading the budget for the AGM report failed:", err); return null; }),
       ]);
       // The PMR 22 floor needs figures from three places at once: the reserve
       // ledger, the year's levy income, and next year's administrative budget.
@@ -4914,7 +4919,7 @@ function Analytics({ expenseCategories }) {
       const floor = plan && leviesCollected != null
         ? { ...reserveFundFloor({ reserveBalance: plan.reserve.balance, leviesCollected, adminBudget: report.totalExpense }), leviesCollected }
         : null;
-      await exportAgmReportDocx({ fy, report, prevReport, extras, usage, water, bank, plan, floor });
+      await exportAgmReportDocx({ fy, report, prevReport, extras, usage, water, bank, plan, floor, budget });
       setAgmStatus("idle");
     } catch (err) {
       console.error("Generating the AGM report failed:", err);
@@ -5403,7 +5408,7 @@ async function fetchAgmExtras(fy) {
 // Builds and downloads the AGM annual report as an editable .docx. Sections the
 // database can fill are filled; the rest render as tables with empty cells so
 // the figures can be typed straight into Word before the meeting.
-async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, water, bank, plan, floor }) {
+async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, water, bank, plan, floor, budget }) {
   const D = await ensureDocxLoaded();
   const {
     Document, Packer, Paragraph, TextRun, HeadingLevel,
@@ -6151,6 +6156,76 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     }
   }
 
+  // ---------- Portrait BG: section 14, the budget ----------
+  // Everything before this reports what happened. This is the only section that
+  // asks the meeting to approve something, so it closes the document.
+  const BG = [];
+  BG.push(H1(`14. Budget — FY ${nfy}`));
+  if (!budget || !budget.hasData) {
+    BG.push(hint(`No budget has been captured for FY ${nfy}. Build it on the Budget page — it seeds from this year's actuals and the captured tariffs, and every line stays editable. This section prints what is saved there.`));
+  } else {
+    BG.push(para(
+      "Every figure below is as captured on the Budget page — this section prints the budget, it does not recompute it, so what is tabled here is exactly what the trustees agreed. All amounts include VAT.",
+      { size: 20 }));
+
+    const bAligns = ["left", "right", "left"];
+    const secTable = (rows, heading, totalLabel, totalValue) => {
+      const t = [hrow([heading, "Amount", "Basis"], bAligns, WIDE)];
+      rows.forEach((r) => t.push(row([
+        r.label + (r.is_assumption ? " *" : ""),
+        amt(r.amount),
+        r.basis || "",
+      ], bAligns, false, undefined, WIDE)));
+      t.push(row([totalLabel, amt(totalValue), ""], bAligns, true, BAND, WIDE));
+      return tbl(t);
+    };
+
+    BG.push(H2("Income"));
+    BG.push(secTable(budget.income, "Line", "Total income", budget.totalIncome));
+
+    BG.push(H2("Administrative expenditure"));
+    BG.push(secTable(budget.expenditure, "Line", "Total expenditure", budget.totalExpenditure));
+
+    BG.push(H2("Result"));
+    const rAligns = ["left", "right"];
+    const rr = [hrow(["", `FY ${nfy}`], rAligns)];
+    rr.push(row(["Total income", money(budget.totalIncome)], rAligns));
+    rr.push(row(["Total administrative expenditure", money(budget.totalExpenditure)], rAligns));
+    rr.push(row(["Operating surplus / (deficit)", money(budget.operatingSurplus)], rAligns, true, BAND));
+    if (budget.reserve.length) {
+      budget.reserve.forEach((r) => rr.push(row([r.label, money(r.amount)], rAligns)));
+      rr.push(row(["Position after the reserve contribution", money(budget.afterReserve)], rAligns, true, BAND));
+    }
+    BG.push(tbl(rr));
+
+    if (budget.reserve.length && budget.afterReserve < 0 && budget.operatingSurplus >= 0) {
+      BG.push(para(
+        `The budget balances on operations and fails on the reserve: a surplus of ${money(budget.operatingSurplus)} becomes a shortfall of ${money(Math.abs(budget.afterReserve))} once the statutory reserve contribution of ${money(budget.totalReserve)} is added. Section 13 sets out why that contribution is a regulatory floor rather than a proposal. It does not follow that levies must rise — the contribution is a designation, and the scheme's accumulated cash is discussed below.`,
+        { size: 20 }));
+    }
+
+    if (budget.openingCash != null) {
+      BG.push(H2("Cash"));
+      const cAligns = ["left", "right"];
+      const cc = [hrow(["", `FY ${nfy}`], cAligns)];
+      cc.push(row(["Opening cash", money(budget.openingCash)], cAligns));
+      cc.push(row(["Operating surplus / (deficit)", money(budget.operatingSurplus)], cAligns));
+      cc.push(row(["Projected closing cash", money(budget.closingCash)], cAligns, true, BAND));
+      BG.push(tbl(cc));
+      BG.push(hint("The reserve contribution does not appear here. It is a designation of existing funds, not a payment out — the cash stays in the account either way, and showing it as an outflow would understate the closing balance by that amount."));
+    }
+
+    if (budget.assumptions.length) {
+      BG.push(hint(`* ${budget.assumptions.join(", ")} ${budget.assumptions.length === 1 ? "is an estimate" : "are estimates"} rather than a captured rate or a known cost. ${budget.assumptions.length === 1 ? "It is" : "They are"} the line${budget.assumptions.length === 1 ? "" : "s"} most worth challenging at the meeting.`));
+    }
+    if (budget.meta && budget.meta.approved_on) {
+      BG.push(hint(`Approved ${budget.meta.approved_on}${budget.meta.approved_by ? ` by ${budget.meta.approved_by}` : ""}.`));
+    }
+    if (budget.meta && budget.meta.notes) {
+      BG.push(para(budget.meta.notes, { size: 18, italics: true }));
+    }
+  }
+
   // Signature line. The names come from Config so the document doesn't have to
   // be edited in Word every year just to change who checked it; with none
   // captured it falls back to the generic trustee wording.
@@ -6159,7 +6234,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     settings.preparedBy ? `${settings.preparedBy}` : "El Corazon Body Corporate finance trustee",
     settings.checkedBy ? `Checked by ${settings.checkedBy}` : null,
   ].filter(Boolean).join("; ");
-  MP.push(new Paragraph({ spacing: { before: 300 }, children: [new TextRun({ text: `Prepared ${preparedDate} · ${who}`, italics: true, size: 18, color: "94A0AC" })] }));
+  BG.push(new Paragraph({ spacing: { before: 300 }, children: [new TextRun({ text: `Prepared ${preparedDate} · ${who}`, italics: true, size: 18, color: "94A0AC" })] }));
 
   const portrait = { page: { size: { orientation: PageOrientation.PORTRAIT } } };
   const landscape = { page: { size: { orientation: PageOrientation.LANDSCAPE } } };
@@ -6177,6 +6252,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
       { properties: portrait, children: E2 },
       { properties: landscape, children: F },
       { properties: landscape, children: MP },
+      { properties: portrait, children: BG },
     ],
   });
   const blob = await Packer.toBlob(doc);
@@ -6635,6 +6711,49 @@ async function fetchMaintenancePlan(fy, opts = {}) {
     schedule, beyondWindow: beyond.length,
     beyondWindowCost: round2(beyond.reduce((s, r) => s + (r.inflatedCost || 0), 0)),
     snapshot: (snapshot.data || [])[0] || null,
+  };
+}
+
+// ---------- Budget ----------
+// Section 14 of the AGM report and the Budget page read the same rows. The
+// report NEVER recomputes a line — it prints what is stored, so the document
+// tabled at the meeting is exactly what the trustee agreed and saved. That is
+// the opposite of sections 3, 10 and 13, which are computed on the fly because
+// they report facts; a budget is a decision, and a decision has to be pinned.
+async function fetchBudget(fy) {
+  const client = await ensureSupabaseClient();
+  const [lines, meta] = await Promise.all([
+    client.from("budget_lines").select("*").eq("financial_year", fy).order("section").order("sort_order"),
+    client.from("budget_meta").select("*").eq("financial_year", fy).limit(1),
+  ]);
+  const failed = [lines, meta].find((r) => r.error);
+  if (failed) throw failed.error;
+
+  const all = lines.data || [];
+  const bySection = (s) => all.filter((r) => r.section === s)
+    .map((r) => ({ ...r, amount: Number(r.amount) }))
+    .sort((a, b) => a.sort_order - b.sort_order);
+  const income = bySection("income"), expenditure = bySection("expenditure"), reserve = bySection("reserve");
+  const total = (rows) => round2(rows.reduce((s, r) => s + r.amount, 0));
+
+  const totalIncome = total(income), totalExpenditure = total(expenditure), totalReserve = total(reserve);
+  const m = (meta.data || [])[0] || null;
+  const openingCash = m && m.opening_cash != null ? Number(m.opening_cash) : null;
+  const operatingSurplus = round2(totalIncome - totalExpenditure);
+
+  return {
+    fy, income, expenditure, reserve,
+    totalIncome, totalExpenditure, totalReserve,
+    operatingSurplus,
+    afterReserve: round2(operatingSurplus - totalReserve),
+    openingCash,
+    // The reserve contribution is a designation, not a payment — the cash stays
+    // in the account either way, so it does not move the projected closing
+    // balance. Getting this wrong understates cash by the contribution.
+    closingCash: openingCash == null ? null : round2(openingCash + operatingSurplus),
+    assumptions: all.filter((r) => r.is_assumption).map((r) => r.label),
+    meta: m,
+    hasData: all.length > 0,
   };
 }
 
@@ -9734,6 +9853,268 @@ function InspectionForm({ onSave, saving }) {
       <div style={{ flex: 1, minWidth: 180 }}><div style={{ fontSize: 11, color: "#64748B" }}>Notes</div>
         <input style={{ ...inp, width: "100%", boxSizing: "border-box" }} value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} /></div>
       <button style={primaryBtn} onClick={() => onSave(f)} disabled={saving}>{saving ? "Saving…" : "Record"}</button>
+    </div>
+  );
+}
+
+// ---------- Budget ----------
+// Added 8 August 2026. Section 14 of the AGM report prints exactly what is saved
+// here — it does not recompute. A budget is a decision rather than a fact, so
+// what the meeting sees has to be what the trustee agreed, not what a formula
+// produced at the moment the document was generated.
+const BUDGET_SECTIONS = [
+  ["income", "Income"],
+  ["expenditure", "Administrative expenditure"],
+  ["reserve", "Reserve fund contribution"],
+];
+
+function Budget() {
+  const nfy = nextFY(FY_ACTIVE);
+  const [fy, setFy] = useState(nfy);
+  const [data, setData] = useState(null);
+  const [status, setStatus] = useState("loading"); // loading | ready | error
+  const [edits, setEdits] = useState({});   // id -> { amount, basis, label, is_assumption }
+  const [meta, setMeta] = useState({ opening_cash: "", approved_on: "", approved_by: "", notes: "" });
+  const [metaDirty, setMetaDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState(null);
+  const [adding, setAdding] = useState(null); // section key
+
+  const load = async (year) => {
+    setStatus("loading"); setEdits({}); setMetaDirty(false);
+    try {
+      const b = await fetchBudget(year);
+      setData(b);
+      setMeta({
+        opening_cash: b.openingCash == null ? "" : String(b.openingCash),
+        approved_on: b.meta && b.meta.approved_on ? String(b.meta.approved_on).slice(0, 10) : "",
+        approved_by: b.meta && b.meta.approved_by ? b.meta.approved_by : "",
+        notes: b.meta && b.meta.notes ? b.meta.notes : "",
+      });
+      setStatus("ready");
+    } catch (err) {
+      console.error("Loading the budget failed:", err);
+      setStatus("error");
+    }
+  };
+  useEffect(() => { load(fy); }, [fy]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const patch = (id, field, value) => setEdits((e) => ({ ...e, [id]: { ...(e[id] || {}), [field]: value } }));
+  const dirty = Object.keys(edits).length || metaDirty;
+
+  // Live totals reflect unsaved edits, so the surplus moves as you type. A
+  // budget you have to save before you can see the effect of is a budget nobody
+  // iterates on.
+  const liveAmount = (r) => {
+    const e = edits[r.id];
+    return e && "amount" in e ? parseAmount(e.amount) : r.amount;
+  };
+  const sectionTotal = (key) => (data ? round2((data[key === "income" ? "income" : key === "expenditure" ? "expenditure" : "reserve"] || [])
+    .filter((r) => !(edits[r.id] || {})._deleted)
+    .reduce((s, r) => s + liveAmount(r), 0)) : 0);
+  const tIncome = sectionTotal("income"), tExp = sectionTotal("expenditure"), tRes = sectionTotal("reserve");
+  const operating = round2(tIncome - tExp);
+  const afterReserve = round2(operating - tRes);
+  const openingCash = meta.opening_cash === "" ? null : parseAmount(meta.opening_cash);
+  const closingCash = openingCash == null ? null : round2(openingCash + operating);
+
+  const save = async () => {
+    setSaving(true); setNotice(null);
+    try {
+      const client = await ensureSupabaseClient();
+      for (const [id, p] of Object.entries(edits)) {
+        if (p._deleted) {
+          const { error } = await client.from("budget_lines").delete().eq("id", id);
+          if (error) throw error;
+          continue;
+        }
+        const row = { updated_at: new Date().toISOString() };
+        if ("label" in p) row.label = p.label;
+        if ("amount" in p) row.amount = parseAmount(p.amount);
+        if ("basis" in p) row.basis = p.basis || null;
+        if ("is_assumption" in p) row.is_assumption = Boolean(p.is_assumption);
+        const { error } = await client.from("budget_lines").update(row).eq("id", id);
+        if (error) throw error;
+      }
+      if (metaDirty) {
+        const { error } = await client.from("budget_meta").upsert({
+          financial_year: fy,
+          opening_cash: meta.opening_cash === "" ? null : parseAmount(meta.opening_cash),
+          approved_on: meta.approved_on || null,
+          approved_by: meta.approved_by || null,
+          notes: meta.notes || null,
+          updated_at: new Date().toISOString(),
+        }, { onConflict: "financial_year" });
+        if (error) throw error;
+      }
+      setNotice("Saved. Section 14 of the AGM report now prints these figures.");
+      await load(fy);
+    } catch (err) {
+      console.error("Saving the budget failed:", err);
+      setNotice("Saving failed — see browser console. Nothing was written.");
+    }
+    setSaving(false);
+  };
+
+  const addLine = async (section, label) => {
+    if (!label || !label.trim()) return;
+    setSaving(true); setNotice(null);
+    try {
+      const client = await ensureSupabaseClient();
+      const existing = (data[section] || []);
+      const { error } = await client.from("budget_lines").insert({
+        financial_year: fy, section, label: label.trim(), amount: 0,
+        sort_order: existing.length ? Math.max(...existing.map((r) => r.sort_order)) + 10 : 10,
+        is_assumption: true,
+        basis: "Added manually — record how this figure was arrived at.",
+      });
+      if (error) throw error;
+      setAdding(null);
+      await load(fy);
+    } catch (err) {
+      console.error("Adding the line failed:", err);
+      setNotice("Adding the line failed — a line with that name may already exist for this year.");
+    }
+    setSaving(false);
+  };
+
+  const money = (n) => (n == null ? "—" : `R ${Number(n).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  const th = { padding: "6px 8px", textAlign: "left", fontSize: 11, textTransform: "uppercase", color: "#64748B" };
+  const td = { padding: "5px 8px", borderTop: "1px solid #F0EADC", fontSize: 12.5 };
+  const inp = { ...inputStyle, padding: "4px 6px", fontSize: 12.5, width: "100%", boxSizing: "border-box" };
+
+  if (status === "loading") return <Card><div style={{ fontSize: 13, color: "#64748B" }}>Loading the FY {fy} budget…</div></Card>;
+  if (status === "error") return <Card><div style={{ fontSize: 13, color: "#B5651D" }}>Could not load the budget — see browser console.</div></Card>;
+
+  const years = [...new Set([nfy, FY_ACTIVE, fy])].sort().reverse();
+  const val = (r, field) => {
+    const e = edits[r.id] || {};
+    return field in e ? e[field] : (r[field] == null ? "" : r[field]);
+  };
+
+  const SectionTable = ({ sectionKey, title, rows, total }) => (
+    <Card style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 12, flexWrap: "wrap" }}>
+        <div style={{ fontWeight: 700, fontSize: 13.5 }}>{title}</div>
+        <div style={{ fontWeight: 700, fontSize: 14 }}>{money(total)}</div>
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
+          <thead><tr>
+            <th style={{ ...th, width: "26%" }}>Line</th>
+            <th style={{ ...th, width: "14%" }}>Amount</th>
+            <th style={th}>Basis</th>
+            <th style={{ ...th, width: 90, textAlign: "center" }}>Estimate</th>
+            <th style={{ ...th, width: 40 }} />
+          </tr></thead>
+          <tbody>
+            {rows.filter((r) => !(edits[r.id] || {})._deleted).map((r) => (
+              <tr key={r.id}>
+                <td style={td}><input style={inp} value={val(r, "label")} onChange={(e) => patch(r.id, "label", e.target.value)} /></td>
+                <td style={td}><input style={{ ...inp, textAlign: "right", fontFamily: "'IBM Plex Mono', ui-monospace, monospace" }}
+                  inputMode="decimal" value={val(r, "amount")} onChange={(e) => patch(r.id, "amount", e.target.value)} /></td>
+                <td style={td}><input style={inp} value={val(r, "basis")} onChange={(e) => patch(r.id, "basis", e.target.value)} placeholder="How was this figure arrived at?" /></td>
+                <td style={{ ...td, textAlign: "center" }}>
+                  <input type="checkbox" checked={Boolean(val(r, "is_assumption"))} onChange={(e) => patch(r.id, "is_assumption", e.target.checked)} />
+                </td>
+                <td style={td}>
+                  <button style={{ ...secondaryBtn, padding: "2px 7px", fontSize: 11 }} title="Remove this line"
+                    onClick={() => patch(r.id, "_deleted", true)}>×</button>
+                </td>
+              </tr>
+            ))}
+            {!rows.length && <tr><td colSpan={5} style={{ ...td, color: "#94A0AC" }}>No lines yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {adding === sectionKey ? (
+        <AddLine onAdd={(label) => addLine(sectionKey, label)} onCancel={() => setAdding(null)} saving={saving} />
+      ) : (
+        <button style={{ ...secondaryBtn, marginTop: 10, padding: "5px 11px", fontSize: 12 }} onClick={() => setAdding(sectionKey)}>+ Add a line</button>
+      )}
+    </Card>
+  );
+
+  return (
+    <>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16, flexWrap: "wrap" }}>
+        <div>
+          <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Budget — FY {fy}</h1>
+          <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18, maxWidth: 720 }}>
+            Every figure is editable and every figure is printed. <strong>Section 14 of the AGM report prints exactly what is saved here</strong> — it does not recompute, so what is tabled at the meeting is what you agreed. Totals below move as you type; nothing is written until you save.
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <select value={fy} onChange={(e) => setFy(e.target.value)} style={inputStyle}>
+            {years.map((y) => <option key={y} value={y}>FY {y}</option>)}
+          </select>
+          <button style={{ ...primaryBtn, opacity: dirty ? 1 : 0.5 }} onClick={save} disabled={!dirty || saving}>
+            {saving ? "Saving…" : dirty ? "Save budget" : "Saved"}
+          </button>
+        </div>
+      </div>
+
+      {notice && (
+        <Card style={{ marginBottom: 14, borderColor: "#B9D4C6" }}>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: "#2F5D50" }}>{notice}</div>
+        </Card>
+      )}
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 28, flexWrap: "wrap", fontSize: 13 }}>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>INCOME</div><strong>{money(tIncome)}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>EXPENDITURE</div><strong>{money(tExp)}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>OPERATING</div>
+            <strong style={{ color: operating >= 0 ? "#2F5D50" : "#9B2C2C" }}>{money(operating)}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>RESERVE</div><strong>{money(tRes)}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>AFTER RESERVE</div>
+            <strong style={{ color: afterReserve >= 0 ? "#2F5D50" : "#9B2C2C" }}>{money(afterReserve)}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>PER UNIT / MONTH</div>
+            <strong>{money(round2(tExp / 7 / 12))}</strong></div>
+        </div>
+      </Card>
+
+      {BUDGET_SECTIONS.map(([key, title]) => (
+        <SectionTable key={key} sectionKey={key} title={title}
+          rows={data[key] || []} total={key === "income" ? tIncome : key === "expenditure" ? tExp : tRes} />
+      ))}
+
+      <Card>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>Cash and approval</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div><div style={{ fontSize: 11, color: "#64748B" }}>Opening cash</div>
+            <input style={{ ...inp, width: 150 }} inputMode="decimal" value={meta.opening_cash}
+              onChange={(e) => { setMeta({ ...meta, opening_cash: e.target.value }); setMetaDirty(true); }} /></div>
+          <div><div style={{ fontSize: 11, color: "#64748B" }}>Approved on</div>
+            <input type="date" style={{ ...inp, width: 150 }} value={meta.approved_on}
+              onChange={(e) => { setMeta({ ...meta, approved_on: e.target.value }); setMetaDirty(true); }} /></div>
+          <div><div style={{ fontSize: 11, color: "#64748B" }}>Approved by</div>
+            <input style={{ ...inp, width: 180 }} value={meta.approved_by}
+              onChange={(e) => { setMeta({ ...meta, approved_by: e.target.value }); setMetaDirty(true); }} /></div>
+          <div style={{ flex: 1, minWidth: 220 }}><div style={{ fontSize: 11, color: "#64748B" }}>Note (printed under the budget)</div>
+            <input style={inp} value={meta.notes}
+              onChange={(e) => { setMeta({ ...meta, notes: e.target.value }); setMetaDirty(true); }} /></div>
+        </div>
+        <div style={{ marginTop: 12, fontSize: 13 }}>
+          Projected closing cash: <strong>{money(closingCash)}</strong>
+        </div>
+        <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 4 }}>
+          Opening cash plus the operating surplus. The reserve contribution is excluded on purpose — it is a designation of existing funds, not a payment out, so the cash stays in the account either way.
+        </div>
+      </Card>
+    </>
+  );
+}
+
+function AddLine({ onAdd, onCancel, saving }) {
+  const [label, setLabel] = useState("");
+  return (
+    <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
+      <input autoFocus style={{ ...inputStyle, padding: "4px 6px", fontSize: 12.5, width: 260 }}
+        placeholder="Line name" value={label} onChange={(e) => setLabel(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") onAdd(label); if (e.key === "Escape") onCancel(); }} />
+      <button style={{ ...primaryBtn, padding: "5px 11px", fontSize: 12 }} onClick={() => onAdd(label)} disabled={saving || !label.trim()}>Add</button>
+      <button style={{ ...secondaryBtn, padding: "5px 11px", fontSize: 12 }} onClick={onCancel}>Cancel</button>
     </div>
   );
 }
