@@ -73,6 +73,65 @@ Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 20
 
 ---
 
+## Done on 11 August 2026, session 16 — user management
+
+### Approval cadences: already correct, now legible
+
+Devon asked for levy breakdown and insurance to be approved once per FY and only the statement preview monthly. **The scoping already worked that way** — `approvalScopeFor()` resolves the two annual subjects to the financial year and the two monthly ones to the period — so nothing needed changing. Meter readings stays a monthly sign-off, confirmed.
+
+What did need fixing was that you couldn't *tell*. A tick-box on a screen with a month selector above it reads as monthly unless it says otherwise, and the annual ones cover all twelve months. So:
+
+- the annual checkboxes now say **"Approving covers every month of FY …; it is not asked again next month"**;
+- the release banner splits outstanding items into what's owed **for the year** (done once, then clears) and what's owed **for this month**.
+
+### User management
+
+New finance-only screen. Register and remove users, reset passwords, set roles, and choose which screens each person sees.
+
+**Creating and deleting auth users cannot be done from the browser.** They need the admin API and therefore the service role key, which bypasses every RLS policy in the schema and must never be shipped to a client. So there is now an Edge Function, `manage-trustees` (`supabase/functions/manage-trustees/index.ts`, deployed with `verify_jwt = true`), holding that key.
+
+**Authorisation is inside the function, not at the call site.** The client hiding the page from non-finance trustees is a convenience; the function resolving the caller from their own JWT and looking them up in `trustees` is the control. A caller cannot assert who they are.
+
+Two guards in it worth knowing about:
+
+- **Creating rolls back.** If the `trustees` insert fails after the auth user is made, the auth user is deleted. Otherwise you get a login that reaches the app and then fails every policy — which looks like a bug, not a half-finished creation.
+- **The last finance trustee cannot be deleted**, and nobody can delete themselves. Otherwise the scheme ends up with no one who can manage users or write a levy figure, and no way back in through the app.
+
+**Password resets are split on purpose.** The email link goes through `resetPasswordForEmail` **client-side** — no admin rights needed, and the password only ever exists between Supabase and the user. That's the default. Setting a temporary password goes through the function, for when email isn't practical.
+
+### Page permissions — and what they are not
+
+`trustees.allowed_pages text[]`, with `NULL` meaning "use this role's defaults". Two reasons that default matters:
+
+- a trustee added without a list behaves as the role-based nav did, rather than seeing an empty menu;
+- **a screen added to the app later appears automatically for everyone on the defaults.** An explicit list is a snapshot and won't contain a page that didn't exist when it was saved. The screen says so where the list is edited.
+
+`NAV_PAGES` is now a single module-level list feeding both the side nav and the management screen. Two lists would drift, and a page missing from the management list is a page nobody can grant.
+
+Two entries are not the page list's to decide: **Config is always shown** (it carries the user's own password, so removing it would lock someone out of it) and **User management is finance-only** whatever is ticked.
+
+> **This governs the side nav only. It is not a security boundary.** Read access is open to every trustee by policy, so hiding a page does not stop the data behind it being fetched through the API. What someone can *write* is decided by their role in RLS. Recorded plainly because a page list that looks like permissions invites being trusted as permissions.
+
+### Verified
+`esbuild` parse clean. Role resolution, page fallback and write permission tested against the **three real accounts**, each impersonated as `authenticated` with a real `auth.uid()` — 15 assertions, all correct:
+
+| | devon (finance) | margi (approver) | ivana (maintenance) |
+|---|---|---|---|
+| `my_trustee_profile()` role | finance ✓ | approver ✓ | maintenance ✓ |
+| `allowed_pages` | null → role defaults ✓ | null → role defaults ✓ | null → role defaults ✓ |
+| may manage users (the function's own check) | allowed ✓ | **denied** ✓ | **denied** ✓ |
+| read trustee list | yes ✓ | yes ✓ | yes ✓ |
+| write trustee list | allowed ✓ | **denied** ✓ | **denied** ✓ |
+
+The first attempt at this test returned nothing and looked like a pass — the loop read `trustees` *after* switching to `authenticated`, so RLS returned no rows and the body never ran. Worth remembering: **a permissions test that finds nothing to test is not a passing test.** Fixed by reading the list as owner first.
+
+> **`npm run build` still has to be run locally** — the sandbox can't, `node_modules` carries the Windows rollup binary.
+
+### Note
+Devon created both logins in the Supabase dashboard before this session ran, so the manual step from session 15 is done: `margi.hutchinson@gmail.com` is the approver and `ivanajacobs55@gmail.com` maintenance. Further users can now be added from the app.
+
+---
+
 ## Done on 11 August 2026, session 15 — the levy figure, the reserve fund, and three trustees
 
 ### 1. "Levies collected" included bank interest

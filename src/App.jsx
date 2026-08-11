@@ -2003,7 +2003,7 @@ async function signOutOfApp() {
 // the UI can disable what the server would refuse anyway. Hiding a control the
 // user cannot use is kinder than letting them fill in a form and then showing
 // them a policy violation, but it is not the control itself.
-const TRUSTEE_ROLE_DEFAULT = { role: null, loading: true };
+const TRUSTEE_ROLE_DEFAULT = { role: null, allowedPages: null, displayName: null, loading: true };
 const TrusteeRoleContext = React.createContext(TRUSTEE_ROLE_DEFAULT);
 const useTrusteeRole = () => React.useContext(TrusteeRoleContext);
 // Finance is the fallback for a signed-in user with no trustees row, matching
@@ -2018,11 +2018,16 @@ const ROLE_LABELS = {
   maintenance: "Maintenance trustee",
 };
 
-async function fetchTrusteeRole() {
+async function fetchTrusteeProfile() {
   const client = await ensureSupabaseClient();
-  const { data, error } = await client.rpc("trustee_role");
+  const { data, error } = await client.rpc("my_trustee_profile");
   if (error) throw error;
-  return data || null;
+  const row = (data || [])[0] || {};
+  return {
+    role: row.role || null,
+    allowedPages: row.allowed_pages || null,
+    displayName: row.display_name || null,
+  };
 }
 
 // Lets a signed-in trustee set their own password. Supabase handles the hash
@@ -2143,7 +2148,13 @@ function ApprovalCheckbox({ subject, period = ACTIVE_PERIOD, hint }) {
           {approved && row.approved_by_email && (
             <> Signed off by <b>{row.approved_by_email}</b> on {String(row.approved_at).slice(0, 10)}.</>
           )}
-          {!approved && <> Statements for this month cannot be generated until all four sign-offs are in.</>}
+          {/* Say the cadence out loud on the annual ones. A tick-box sitting on
+              a screen with a month selector above it reads as monthly unless
+              it says otherwise — and this one covers all twelve. */}
+          {meta.scopeKind === "fy" && (
+            <> {approved ? "This covers" : "Approving covers"} every month of FY {scope}; it is not asked again next month.</>
+          )}
+          {!approved && meta.scopeKind === "period" && <> Statements for this month are held until this is signed off.</>}
           {hint && <div style={{ marginTop: 4, color: "#94A0AC" }}>{hint}</div>}
           {!canApprove && (
             <div style={{ marginTop: 4, color: "#94A0AC" }}>
@@ -2211,11 +2222,27 @@ function StatementReleaseGate({ gate, period }) {
       </Card>
     );
   }
+  // Split the outstanding list by cadence. An annual sign-off missing in
+  // August is a different job from a monthly one missing this month — the
+  // first is done once and clears the rest of the year.
+  const annual = APPROVAL_SUBJECTS.filter((s) => s.scopeKind === "fy" && !gate.approvals[s.key]);
+  const monthly = APPROVAL_SUBJECTS.filter((s) => s.scopeKind === "period" && !gate.approvals[s.key]);
   return (
     <Card style={{ marginBottom: 16, background: "#FBF3E9", border: "1px solid #E3C9A8" }}>
       <div style={{ fontSize: 12.5, color: "#8A5A1E", lineHeight: 1.7 }}>
         <b>Statements are held for {periodLabel(period)}.</b> Producing or sending is blocked until the approving
-        trustee has signed off all four. Still outstanding: <b>{gate.outstanding.join(", ")}</b>.
+        trustee has signed everything off.
+        {annual.length > 0 && (
+          <div style={{ marginTop: 4 }}>
+            Outstanding for <b>FY {periodToFY(period)}</b> — approved once, then not asked again this year:{" "}
+            <b>{annual.map((s) => s.label).join(", ")}</b>.
+          </div>
+        )}
+        {monthly.length > 0 && (
+          <div style={{ marginTop: 4 }}>
+            Outstanding for <b>{periodLabel(period)}</b>: <b>{monthly.map((s) => s.label).join(", ")}</b>.
+          </div>
+        )}
         <div style={{ marginTop: 4, color: "#94A0AC" }}>
           The preview below is live and can be checked — it just cannot leave the building yet.
         </div>
@@ -2783,17 +2810,20 @@ export default function App() {
   // database enforces the same thing on every write, so a stale value here can
   // only ever show a control that then refuses, never grant one.
   const [roleState, setRoleState] = useState(TRUSTEE_ROLE_DEFAULT);
+  // Bumped by User management after a change, so an edit to your own row takes
+  // effect without a reload.
+  const [profileVersion, setProfileVersion] = useState(0);
   useEffect(() => {
-    if (!session) { setRoleState({ role: null, loading: false }); return; }
+    if (!session) { setRoleState({ ...TRUSTEE_ROLE_DEFAULT, loading: false }); return; }
     let cancelled = false;
-    fetchTrusteeRole()
-      .then((role) => { if (!cancelled) setRoleState({ role, loading: false }); })
+    fetchTrusteeProfile()
+      .then((p) => { if (!cancelled) setRoleState({ ...p, loading: false }); })
       .catch((err) => {
-        console.error("Could not read the trustee role — treating as finance:", err);
-        if (!cancelled) setRoleState({ role: null, loading: false });
+        console.error("Could not read the trustee profile — treating as finance:", err);
+        if (!cancelled) setRoleState({ ...TRUSTEE_ROLE_DEFAULT, loading: false });
       });
     return () => { cancelled = true; };
-  }, [session]);
+  }, [session, profileVersion]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3205,6 +3235,7 @@ export default function App() {
                 <ReserveFund />
               </>
             )}
+            {tab === "users" && <UserManagement onProfileChanged={() => setProfileVersion((v) => v + 1)} />}
             {tab === "config" && (
               <Config expenseCategories={expenseCategories} setExpenseCategories={setExpenseCategories} />
             )}
@@ -3317,38 +3348,58 @@ function MeterMark() {
   );
 }
 
+// Every trustee screen, in nav order, with the roles it defaults to. ONE list,
+// shared by the side nav and the User management page — two lists would drift,
+// and a page missing from the management list is a page nobody can grant.
+//
+//   alwaysOn  — cannot be taken away. Config carries "Your login", so removing
+//               it would lock somebody out of their own password.
+//   financeOnly — the screen manages other users, so only the finance trustee
+//               can ever see it, whatever the page list says.
+const NAV_PAGES = [
+  { key: "dashboard", label: "Dashboard", roles: ["finance", "approver", "maintenance"] },
+  { key: "readings", label: "Meter readings", roles: ["finance", "approver"] },
+  { key: "levy-setup", label: "Levy breakdown (AGM)", roles: ["finance", "approver"] },
+  { key: "insurance", label: "Insurance", roles: ["finance", "approver"] },
+  { key: "additional-charges", label: "Additional charges", roles: ["finance"] },
+  { key: "ops-expenses", label: "Body corp expenses", roles: ["finance"] },
+  { key: "allocation", label: "Invoice allocation", roles: ["finance"] },
+  { key: "reconciliation", label: "Tenant recon", roles: ["finance"] },
+  { key: "bank-recon", label: "Bank recon", roles: ["finance"] },
+  { key: "maintenance", label: "Maintenance plan", roles: ["finance", "maintenance"] },
+  { key: "budget", label: "Budget", roles: ["finance"] },
+  { key: "statement-preview", label: "Statement preview", roles: ["finance", "approver"] },
+  { key: "analytics", label: "Financial dashboard", roles: ["finance", "approver", "maintenance"] },
+  { key: "tariffs", label: "Tariffs & rates", roles: ["finance"] },
+  { key: "rate-history", label: "Rate history", roles: ["finance"] },
+  { key: "users", label: "User management", roles: ["finance"], financeOnly: true },
+  { key: "config", label: "Config", roles: ["finance", "approver", "maintenance"], alwaysOn: true },
+];
+
+const defaultPagesForRole = (role) =>
+  NAV_PAGES.filter((p) => p.roles.includes(role || "finance")).map((p) => p.key);
+
+// `allowedPages` null means "use the role's defaults" — which is what a
+// trustee added without a list gets, and what stops a screen ADDED to the app
+// later from being invisible to everyone who already has an explicit list.
+// An explicit list overrides, except for the two rules that are not the page
+// list's to decide.
+function visibleNavPages(role, allowedPages) {
+  const granted = Array.isArray(allowedPages) && allowedPages.length
+    ? allowedPages
+    : defaultPagesForRole(role);
+  return NAV_PAGES
+    .filter((p) => {
+      if (p.financeOnly && !(role == null || role === "finance")) return false;
+      if (p.alwaysOn) return true;
+      return granted.includes(p.key);
+    })
+    .map((p) => [p.key, p.label]);
+}
+
 function SideNav({ tab, setTab }) {
-  const { role } = useTrusteeRole();
-  // Every screen, with who has business on it. Read access is open to all
-  // trustees by policy, so this is about not presenting a wall of screens
-  // somebody has no reason to open — not about hiding data.
-  //
-  //   all         — everyone
-  //   approve     — the four screens the approving trustee signs off, which
-  //                 they must be able to READ to approve
-  //   finance     — the finance trustee's working screens
-  //   maintenance — the register
-  const all = ["finance", "approver", "maintenance"];
-  const items = [
-    ["dashboard", "Dashboard", all],
-    ["readings", "Meter readings", ["finance", "approver"]],
-    ["levy-setup", "Levy breakdown (AGM)", ["finance", "approver"]],
-    ["insurance", "Insurance", ["finance", "approver"]],
-    ["additional-charges", "Additional charges", ["finance"]],
-    ["ops-expenses", "Body corp expenses", ["finance"]],
-    ["allocation", "Invoice allocation", ["finance"]],
-    ["reconciliation", "Tenant recon", ["finance"]],
-    ["bank-recon", "Bank recon", ["finance"]],
-    ["maintenance", "Maintenance plan", ["finance", "maintenance"]],
-    ["budget", "Budget", ["finance"]],
-    ["statement-preview", "Statement preview", ["finance", "approver"]],
-    ["analytics", "Financial dashboard", all],
-    ["tariffs", "Tariffs & rates", ["finance"]],
-    ["rate-history", "Rate history", ["finance"]],
-    // Config carries "Your login", so nobody can be shut out of their own
-    // password.
-    ["config", "Config", all],
-  ].filter(([, , roles]) => role == null || roles.includes(role));
+  const { role, allowedPages } = useTrusteeRole();
+  const items = visibleNavPages(role, allowedPages);
   return (
     <nav style={{ width: 210, borderRight: "1px solid #D8D0BE", padding: "24px 12px", minHeight: "calc(100vh - 65px)" }}>
       {items.map(([key, label]) => (
@@ -7708,6 +7759,321 @@ function UsageTrends({ fy }) {
 // the change cascades to bank transactions, ops expenses, additional charges and
 // resident deduction claims in one transaction — a plain UPDATE here would leave
 // historic records pointing at a name that no longer exists.
+// ---------- User management (finance trustee only) ----------
+// Creating, deleting and setting a password go through the `manage-trustees`
+// Edge Function: those need the service role key, which must never be in the
+// browser. Role, page list and display name are ordinary table writes, already
+// restricted to the finance trustee by the trustees_write policy.
+async function callManageTrustees(action, payload = {}) {
+  const client = await ensureSupabaseClient();
+  const { data, error } = await client.functions.invoke("manage-trustees", {
+    body: { action, ...payload },
+  });
+  // The function returns its reason in the body; supabase-js turns a non-2xx
+  // into a generic FunctionsHttpError, so read the response before falling
+  // back to it or the user gets "Edge Function returned a non-2xx status code".
+  if (error) {
+    let detail = null;
+    try { detail = await error.context?.json?.(); } catch { /* body already read or empty */ }
+    throw new Error((detail && detail.error) || error.message || "The request failed.");
+  }
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+
+function UserManagement({ onProfileChanged }) {
+  const canWriteFinance = useCanWriteFinance();
+  const [rows, setRows] = useState([]);
+  const [status, setStatus] = useState("loading"); // loading | ready | error
+  const [busy, setBusy] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [error, setError] = useState(null);
+  const [meId, setMeId] = useState(null);
+  const [expanded, setExpanded] = useState(null); // user_id whose pages are open
+  const [draftPages, setDraftPages] = useState([]);
+  const [invite, setInvite] = useState({ email: "", display_name: "", role: "approver", password: "" });
+
+  const load = async () => {
+    setStatus("loading");
+    try {
+      const client = await ensureSupabaseClient();
+      const [{ data: u }, res] = await Promise.all([
+        client.auth.getUser(),
+        client.from("trustees").select("*").order("added_at"),
+      ]);
+      if (res.error) throw res.error;
+      setMeId(u && u.user ? u.user.id : null);
+      setRows(res.data || []);
+      setStatus("ready");
+    } catch (err) {
+      console.error("Loading trustees failed:", err);
+      setStatus("error");
+    }
+  };
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const run = async (key, fn, msg) => {
+    setBusy(key); setError(null); setNotice(null);
+    try {
+      await fn();
+      if (msg) setNotice(msg);
+      await load();
+      // A change to your OWN row alters your nav, so the app has to re-read it.
+      if (onProfileChanged) onProfileChanged();
+    } catch (err) {
+      console.error("User management action failed:", err);
+      setError(err.message || "Something went wrong — see browser console.");
+    }
+    setBusy(null);
+  };
+
+  const addUser = () => run("add", async () => {
+    const email = invite.email.trim().toLowerCase();
+    if (!email) throw new Error("Enter an email address.");
+    if (rows.some((r) => (r.email || "").toLowerCase() === email)) {
+      throw new Error(`${email} is already a trustee.`);
+    }
+    const res = await callManageTrustees("create", {
+      email,
+      display_name: invite.display_name.trim() || null,
+      role: invite.role,
+      password: invite.password || null,
+      allowed_pages: defaultPagesForRole(invite.role),
+    });
+    setInvite({ email: "", display_name: "", role: "approver", password: "" });
+    setNotice(res && res.invited
+      ? `Invited ${email}. They'll get an email to set their own password.`
+      : `Created ${email}. Give them the password you set — they can change it on Config → Your login.`);
+  });
+
+  const removeUser = (r) => {
+    const who = r.display_name || r.email;
+    if (!window.confirm(
+      `Remove ${who}?\n\nTheir login is deleted and they lose access immediately. `
+      + `Anything they approved stays on record — approvals reference the user, so the record survives them.`
+    )) return;
+    run(`del-${r.user_id}`, () => callManageTrustees("delete", { user_id: r.user_id }), `Removed ${who}.`);
+  };
+
+  // Two ways, because the safe one is useless if they can't get the email.
+  const emailReset = (r) => run(`mail-${r.user_id}`, async () => {
+    const client = await ensureSupabaseClient();
+    const { error: e } = await client.auth.resetPasswordForEmail(r.email, {
+      redirectTo: window.location.origin,
+    });
+    if (e) throw e;
+  }, `Reset link sent to ${r.email}.`);
+
+  const setPassword = (r) => {
+    const pw = window.prompt(
+      `Set a temporary password for ${r.display_name || r.email}.\n\n`
+      + `At least 8 characters. They can change it themselves on Config → Your login.`);
+    if (pw == null) return;
+    if (pw.length < 8) { setError("Use at least 8 characters."); return; }
+    run(`pw-${r.user_id}`, () => callManageTrustees("set_password", { user_id: r.user_id, password: pw }),
+      `Password set for ${r.display_name || r.email}. Pass it on, and ask them to change it.`);
+  };
+
+  const changeRole = (r, role) => run(`role-${r.user_id}`, async () => {
+    const client = await ensureSupabaseClient();
+    // Changing role resets the page list to that role's defaults unless one
+    // was set deliberately — otherwise a demoted user keeps a nav full of
+    // screens their new role has no business on.
+    const patch = { role };
+    if (!r.allowed_pages || !r.allowed_pages.length) patch.allowed_pages = null;
+    const { error: e } = await client.from("trustees").update(patch).eq("user_id", r.user_id);
+    if (e) throw e;
+  }, "Role updated.");
+
+  const openPages = (r) => {
+    setExpanded(expanded === r.user_id ? null : r.user_id);
+    setDraftPages(r.allowed_pages && r.allowed_pages.length ? r.allowed_pages : defaultPagesForRole(r.role));
+  };
+
+  const savePages = (r) => run(`pages-${r.user_id}`, async () => {
+    const client = await ensureSupabaseClient();
+    const { error: e } = await client.from("trustees")
+      .update({ allowed_pages: draftPages }).eq("user_id", r.user_id);
+    if (e) throw e;
+    setExpanded(null);
+  }, "Pages updated.");
+
+  const resetPagesToRole = (r) => run(`pages-${r.user_id}`, async () => {
+    const client = await ensureSupabaseClient();
+    const { error: e } = await client.from("trustees")
+      .update({ allowed_pages: null }).eq("user_id", r.user_id);
+    if (e) throw e;
+    setExpanded(null);
+  }, "Pages back to the role defaults.");
+
+  const th = { padding: "6px 8px", textAlign: "left", fontSize: 11, textTransform: "uppercase", color: "#64748B" };
+  const td = { padding: "7px 8px", borderTop: "1px solid #F0EADC", fontSize: 12.5, verticalAlign: "top" };
+  const inp = { ...inputStyle, padding: "4px 6px", fontSize: 12.5, textAlign: "left", fontFamily: "inherit" };
+  const smallBtn = { ...secondaryBtn, padding: "3px 9px", fontSize: 11.5 };
+
+  // Belt and braces. The nav already hides this screen, the trustees table
+  // refuses writes from anyone but finance, and the Edge Function checks the
+  // caller's role itself — this only stops the page rendering if the tab is
+  // reached some other way.
+  if (!canWriteFinance) {
+    return (
+      <Card>
+        <div style={{ fontSize: 13, color: "#64748B" }}>
+          User management is the finance trustee's. You can change your own password on <b>Config → Your login</b>.
+        </div>
+      </Card>
+    );
+  }
+  if (status === "loading") return <Card><div style={{ fontSize: 13, color: "#64748B" }}>Loading trustees…</div></Card>;
+  if (status === "error") return <Card><div style={{ fontSize: 13, color: "#B5651D" }}>Could not load the trustee list — see browser console.</div></Card>;
+
+  return (
+    <>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>User management</h1>
+      <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
+        Who can sign in, what they may change, and which screens they see.
+        <br />
+        <b>Role decides what someone can write</b> and is enforced by the database on every save.
+        The page list only decides what appears in their side menu — it is a tidiness setting, not a lock,
+        so never rely on it to keep figures out of someone's hands.
+      </p>
+
+      {notice && <Card style={{ marginBottom: 14, borderColor: "#B9D4C6" }}><div style={{ fontSize: 12.5, fontWeight: 600, color: "#2F5D50" }}>{notice}</div></Card>}
+      {error && <Card style={{ marginBottom: 14, borderColor: "#E3C9A8" }}><div style={{ fontSize: 12.5, fontWeight: 600, color: "#B5651D" }}>{error}</div></Card>}
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>Register a user</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ flex: 2, minWidth: 200 }}>
+            <div style={{ fontSize: 11, color: "#64748B" }}>Email</div>
+            <input style={{ ...inp, width: "100%", boxSizing: "border-box" }} type="email" value={invite.email}
+                   onChange={(e) => setInvite({ ...invite, email: e.target.value })} />
+          </div>
+          <div style={{ flex: 1, minWidth: 150 }}>
+            <div style={{ fontSize: 11, color: "#64748B" }}>Name</div>
+            <input style={{ ...inp, width: "100%", boxSizing: "border-box" }} value={invite.display_name}
+                   onChange={(e) => setInvite({ ...invite, display_name: e.target.value })} />
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: "#64748B" }}>Role</div>
+            <select style={{ ...inp, width: 170 }} value={invite.role}
+                    onChange={(e) => setInvite({ ...invite, role: e.target.value })}>
+              {Object.entries(ROLE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+            </select>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: "#64748B" }}>Password (optional)</div>
+            <input style={{ ...inp, width: 170 }} type="text" placeholder="blank = email an invite"
+                   value={invite.password} onChange={(e) => setInvite({ ...invite, password: e.target.value })} />
+          </div>
+          <button style={primaryBtn} onClick={addUser} disabled={busy === "add"}>
+            {busy === "add" ? "Creating…" : "Register user"}
+          </button>
+        </div>
+        <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 8, lineHeight: 1.6 }}>
+          Leave the password blank and they get an email to set their own — better, because then nobody but them ever knows it.
+          Set one only when email isn't practical.
+        </div>
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 10 }}>Trustees</div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
+            <thead><tr>
+              <th style={th}>User</th><th style={th}>Role</th><th style={th}>Pages</th><th style={th}>Password</th><th style={th} />
+            </tr></thead>
+            <tbody>
+              {rows.map((r) => {
+                const isMe = r.user_id === meId;
+                const custom = Array.isArray(r.allowed_pages) && r.allowed_pages.length > 0;
+                const pageCount = custom ? r.allowed_pages.length : defaultPagesForRole(r.role).length;
+                return (
+                  <React.Fragment key={r.user_id}>
+                    <tr>
+                      <td style={td}>
+                        <div style={{ fontWeight: 600 }}>{r.display_name || r.email}{isMe && <span style={{ color: "#94A0AC", fontWeight: 400 }}> — you</span>}</div>
+                        {r.display_name && <div style={{ fontSize: 11, color: "#94A0AC" }}>{r.email}</div>}
+                      </td>
+                      <td style={td}>
+                        <select style={{ ...inp, width: 165 }} value={r.role} disabled={busy === `role-${r.user_id}`}
+                                onChange={(e) => changeRole(r, e.target.value)}>
+                          {Object.entries(ROLE_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                        </select>
+                      </td>
+                      <td style={td}>
+                        <button style={smallBtn} onClick={() => openPages(r)}>
+                          {pageCount} page{pageCount === 1 ? "" : "s"}{custom ? "" : " (role default)"}
+                        </button>
+                      </td>
+                      <td style={td}>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                          <button style={smallBtn} onClick={() => emailReset(r)} disabled={busy === `mail-${r.user_id}`}>
+                            {busy === `mail-${r.user_id}` ? "Sending…" : "Email reset"}
+                          </button>
+                          <button style={smallBtn} onClick={() => setPassword(r)} disabled={busy === `pw-${r.user_id}`}>
+                            Set one
+                          </button>
+                        </div>
+                      </td>
+                      <td style={td}>
+                        {!isMe && (
+                          <button
+                            style={{ ...smallBtn, color: "#B5651D" }}
+                            onClick={() => removeUser(r)}
+                            disabled={busy === `del-${r.user_id}`}
+                          >{busy === `del-${r.user_id}` ? "Removing…" : "Remove"}</button>
+                        )}
+                      </td>
+                    </tr>
+                    {expanded === r.user_id && (
+                      <tr><td colSpan={5} style={{ ...td, background: "#F6F1E7" }}>
+                        <div style={{ fontSize: 12, color: "#64748B", marginBottom: 8, lineHeight: 1.6 }}>
+                          Screens {r.display_name || r.email} sees in the side menu.
+                          {" "}<b>Config is always shown</b> — it carries their own password, so it cannot be taken away.
+                          {" "}User management is finance-only whatever is ticked here.
+                        </div>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: "4px 18px" }}>
+                          {NAV_PAGES.map((p) => {
+                            const fixed = p.alwaysOn || p.financeOnly;
+                            const on = fixed ? (p.alwaysOn || r.role === "finance") : draftPages.includes(p.key);
+                            return (
+                              <label key={p.key} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: fixed ? "#94A0AC" : "#1B2A38" }}>
+                                <input
+                                  type="checkbox" checked={on} disabled={fixed}
+                                  onChange={(e) => setDraftPages((prev) => (
+                                    e.target.checked ? [...prev, p.key] : prev.filter((k) => k !== p.key)
+                                  ))}
+                                />
+                                {p.label}{p.alwaysOn && " (always)"}{p.financeOnly && " (finance only)"}
+                              </label>
+                            );
+                          })}
+                        </div>
+                        <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                          <button style={primaryBtn} onClick={() => savePages(r)} disabled={busy === `pages-${r.user_id}`}>
+                            {busy === `pages-${r.user_id}` ? "Saving…" : "Save pages"}
+                          </button>
+                          <button style={secondaryBtn} onClick={() => resetPagesToRole(r)} disabled={busy === `pages-${r.user_id}`}>
+                            Back to role defaults
+                          </button>
+                          <span style={{ fontSize: 11.5, color: "#94A0AC" }}>
+                            On the defaults, a screen added to the app later appears automatically. A custom list will not include it until you tick it.
+                          </span>
+                        </div>
+                      </td></tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </>
+  );
+}
+
 // ---------- Your login ----------
 // Self-service password change for whoever is signed in. Deliberately not a
 // trustee-management screen: nobody sets anybody else's password, so there is
