@@ -44,6 +44,43 @@ $$;
 grant execute on function public.my_trustee_profile() to authenticated;
 
 -- ---------------------------------------------------------------------------
+-- Landing page (migration: trustee_landing_page)
+-- ---------------------------------------------------------------------------
+-- Which screen a trustee opens on at sign-in.
+--
+-- Deliberately plain text with no foreign key or check constraint against the
+-- page list. The page keys live in the app (NAV_PAGES), not the database, so a
+-- constraint here would need migrating every time a screen is added or renamed,
+-- and a rename would fail the migration against existing rows.
+--
+-- The cost of that choice is that this column can name a page the user cannot
+-- see, or one that no longer exists — after a role change, a page-list edit, or
+-- a screen being removed. So THE APP TREATS THIS AS A HINT, not an instruction:
+-- resolveLandingPage() honours it only if it is among the pages that user can
+-- actually see, and otherwise falls back to their first visible page. Landing
+-- someone on a blank screen because of a stale preference would be worse than
+-- ignoring the preference.
+--
+-- NULL means "no preference" and is the default.
+alter table public.trustees
+  add column if not exists landing_page text;
+
+-- Adding a column to the return type changes the row type, so this had to be
+-- dropped and recreated rather than replaced (`create or replace` errors with
+-- "cannot change return type of existing function").
+drop function if exists public.my_trustee_profile();
+
+create function public.my_trustee_profile()
+returns table (role text, allowed_pages text[], display_name text, landing_page text)
+language sql stable security definer set search_path to 'public' as $$
+  select t.role, t.allowed_pages, t.display_name, t.landing_page
+  from public.trustees t
+  where t.user_id = auth.uid();
+$$;
+
+grant execute on function public.my_trustee_profile() to authenticated;
+
+-- ---------------------------------------------------------------------------
 -- Edge Function: manage-trustees
 -- ---------------------------------------------------------------------------
 -- Deployed with verify_jwt = true. Actions: create, delete, set_password.

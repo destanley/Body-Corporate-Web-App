@@ -73,6 +73,48 @@ Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 20
 
 ---
 
+## Done on 11 August 2026, session 17 — landing pages, a password page, and less chrome
+
+### Each user gets a landing page
+
+`trustees.landing_page`, set from a dropdown on User management that offers **only the pages that user can actually see**, so you can't pick a screen they'd be bounced off. `my_trustee_profile()` returns it and the app opens there at sign-in.
+
+**It is stored as a hint, not an instruction.** No foreign key or check constraint: the page keys live in `NAV_PAGES` in the app, not the database, so a constraint would need migrating every time a screen is added or renamed. The price is that the column can name a page the user has since lost — after a role change or a page-list edit — so `resolveLandingPage()` honours it only if it's among their visible pages and otherwise falls back to their first one. **Landing someone on a blank screen because of a stale preference is worse than ignoring the preference.** Where a stored choice has been stranded, the User management row says so rather than leaving a dropdown that quietly does nothing.
+
+Applied **once per sign-in**, guarded by a ref. Without that guard the effect would drag you back to your landing page every time the profile is re-read — which User management does after each edit — so a finance trustee landing on the Dashboard couldn't stay on User management long enough to make a second change.
+
+### Password management is its own page
+
+Moved off the bottom of Config. It's now the single `alwaysOn` page — nobody can be denied it, because a user who can't reach their own password has to ask the finance trustee to set it for them, which is the thing the screen exists to prevent.
+
+**Consequence worth noting:** Config was `alwaysOn` *because* it carried the password card. With that gone, **Config is now an ordinary page the finance trustee can grant or withhold.** A non-finance trustee who still has it sees only the "maintained by the finance trustee" note.
+
+### Removed
+- **The trustee/resident view switch** in the top bar. Residents don't reach the app that way — they arrive on a per-unit token link (`?unit=<token>`), which is the real resident experience and the one worth testing. `ResidentPortal` is untouched and still renders there.
+- **The period selector** on User management and Password management, via a `noPeriod` flag on `NAV_PAGES`. The month is dropped from the header on those pages too. A user list under "August 2026" invites the reader to think the list is somehow scoped to August.
+
+### Also fixed
+Unticking every page and saving looked like it removed someone's pages but silently restored the role defaults — an empty list and a missing list both read as "use the defaults" everywhere. It now refuses and points at "Back to role defaults", which is the button that actually means that.
+
+### Verified
+`esbuild` parse clean. The landing-page and nav logic was tested by **slicing the real `NAV_PAGES` / `visibleNavPages` / `resolveLandingPage` source out of `App.jsx` and importing it** — testing the shipped code rather than a copy that could drift. 20 assertions, all passing, including every fallback:
+
+| Case | Result |
+|---|---|
+| no preference, each of the three roles | Dashboard |
+| maintenance → Maintenance plan | honoured |
+| maintenance → Bank recon (can't see it) | falls back to Dashboard |
+| approver → User management (finance-only) | falls back to Dashboard |
+| a page key that no longer exists | falls back to Dashboard |
+| custom page list, preference outside it | falls back to first in list |
+| exactly one `alwaysOn` page | Password management |
+
+Checked against the live rows too: Ivana's stored list is `{maintenance, config}`, so she sees Maintenance plan, Config and Password management, and lands on Maintenance plan — including if her landing page were set to something she can't see.
+
+> **`npm run build` still has to be run locally.**
+
+---
+
 ## Done on 11 August 2026, session 16 — user management
 
 ### Approval cadences: already correct, now legible

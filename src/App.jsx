@@ -2002,7 +2002,7 @@ async function signInWithPassword(email, password) {
 // which is what a Sign out button is normally understood to mean.
 //
 // The global behaviour is still worth having, but as a decision the user makes
-// on purpose — see "Sign out everywhere else" on Config → Your login.
+// on purpose — see "Sign out everywhere else" on Password management.
 async function signOutOfApp() {
   const client = await ensureSupabaseClient();
   await client.auth.signOut({ scope: "local" });
@@ -2023,7 +2023,7 @@ async function signOutOtherSessions() {
 // the UI can disable what the server would refuse anyway. Hiding a control the
 // user cannot use is kinder than letting them fill in a form and then showing
 // them a policy violation, but it is not the control itself.
-const TRUSTEE_ROLE_DEFAULT = { role: null, allowedPages: null, displayName: null, loading: true };
+const TRUSTEE_ROLE_DEFAULT = { role: null, allowedPages: null, displayName: null, landingPage: null, loading: true };
 const TrusteeRoleContext = React.createContext(TRUSTEE_ROLE_DEFAULT);
 const useTrusteeRole = () => React.useContext(TrusteeRoleContext);
 // Finance is the fallback for a signed-in user with no trustees row, matching
@@ -2047,6 +2047,7 @@ async function fetchTrusteeProfile() {
     role: row.role || null,
     allowedPages: row.allowed_pages || null,
     displayName: row.display_name || null,
+    landingPage: row.landing_page || null,
   };
 }
 
@@ -2734,7 +2735,6 @@ async function notifyTrusteeOfRemittance(payload) {
 
 // ---------- Shell ----------
 export default function App() {
-  const [role, setRole] = useState("trustee");
   const [tab, setTab] = useState("dashboard");
   const [selectedUnit, setSelectedUnit] = useState("U1");
   // The month the whole trustee app is looking at. Defaults to the latest
@@ -2833,14 +2833,28 @@ export default function App() {
   // Bumped by User management after a change, so an edit to your own row takes
   // effect without a reload.
   const [profileVersion, setProfileVersion] = useState(0);
+  // The landing page is applied ONCE per sign-in. Without this guard the effect
+  // would yank the user back to their landing page every time the profile is
+  // re-read (which User management does after any edit) — so a finance trustee
+  // whose landing page is the Dashboard could not stay on User management long
+  // enough to make a second change.
+  const landingApplied = React.useRef(false);
+  useEffect(() => { if (!session) landingApplied.current = false; }, [session]);
   useEffect(() => {
     if (!session) { setRoleState({ ...TRUSTEE_ROLE_DEFAULT, loading: false }); return; }
     let cancelled = false;
     fetchTrusteeProfile()
-      .then((p) => { if (!cancelled) setRoleState({ ...p, loading: false }); })
+      .then((p) => {
+        if (cancelled) return;
+        setRoleState({ ...p, loading: false });
+        if (!landingApplied.current) {
+          landingApplied.current = true;
+          setTab(resolveLandingPage(p.role, p.allowedPages, p.landingPage));
+        }
+      })
       .catch((err) => {
         console.error("Could not read the trustee profile — treating as finance:", err);
-        if (!cancelled) setRoleState({ ...TRUSTEE_ROLE_DEFAULT, loading: false });
+        if (!cancelled) { landingApplied.current = true; setRoleState({ ...TRUSTEE_ROLE_DEFAULT, loading: false }); }
       });
     return () => { cancelled = true; };
   }, [session, profileVersion]);
@@ -3125,19 +3139,23 @@ export default function App() {
   }
   if (!session) return <LoginScreen />;
 
+  // The trustee/resident view switch was removed from the top bar on 11 August
+  // 2026. It let a trustee preview the resident portal, but residents do not
+  // reach the app that way — they arrive on a per-unit token link, handled by
+  // the RESIDENT_TOKEN branch above, which is the real resident experience and
+  // is what should be tested. ResidentPortal is still live; it renders there.
   return (
-    // NB: `role` on TopBar below is the trustee/resident VIEW switch and has
-    // nothing to do with the trustee role in this provider — they were named
-    // the same by accident of history.
     <TrusteeRoleContext.Provider value={roleState}>
     <div className="f-body" style={{ minHeight: "100vh", background: "#EFEAE0", color: "#1B2A38" }}>
       {FONT_IMPORT}
-      <TopBar role={role} setRole={setRole} setTab={setTab} unitsSource={unitsSource} onSignOut={signOutOfApp} period={selectedPeriod} />
-      {role === "trustee" ? (
+      <TopBar unitsSource={unitsSource} onSignOut={signOutOfApp} period={pageHasPeriod(tab) ? selectedPeriod : null} />
         <div style={{ display: "flex" }}>
           <SideNav tab={tab} setTab={setTab} />
           <main style={{ flex: 1, padding: "28px 32px", maxWidth: 1100 }}>
-            <PeriodBar periods={periods} selectedPeriod={selectedPeriod} setSelectedPeriod={setSelectedPeriod} />
+            {/* No month selector on a screen that isn't about a month. */}
+            {pageHasPeriod(tab) && (
+              <PeriodBar periods={periods} selectedPeriod={selectedPeriod} setSelectedPeriod={setSelectedPeriod} />
+            )}
             {tab === "dashboard" && <Dashboard alloc={alloc} setTab={setTab} setSelectedUnit={setSelectedUnit} bankTxns={bankTxns} period={selectedPeriod} remittanceDeductions={remittanceDeductions} manualPayments={manualPayments} />}
             {tab === "readings" && (
               <>
@@ -3259,21 +3277,18 @@ export default function App() {
             {tab === "config" && (
               <Config expenseCategories={expenseCategories} setExpenseCategories={setExpenseCategories} />
             )}
+            {tab === "password" && <PasswordManagement />}
           </main>
         </div>
-      ) : (
-        <ResidentPortal
-          alloc={alloc} period={selectedPeriod} selectedUnit={selectedUnit} setSelectedUnit={setSelectedUnit}
-          remittanceDeductions={remittanceDeductions} setRemittanceDeductions={setRemittanceDeductions}
-          setRemittanceAdvices={setRemittanceAdvices}
-        />
-      )}
     </div>
     </TrusteeRoleContext.Provider>
   );
 }
 
-function TopBar({ role, setRole, setTab, unitsSource, onSignOut, period }) {
+// `period` is null on screens that aren't about a month (see NAV_PAGES.noPeriod)
+// — the subtitle then just omits it rather than showing a month the page
+// ignores.
+function TopBar({ unitsSource, onSignOut, period }) {
   const sourceBadge = {
     mock: { label: "Loading units…", bg: "#24374A", color: "#B9C4CE" },
     database: { label: "● Live database", bg: "#2F5D50", color: "#E4EFEA" },
@@ -3297,7 +3312,7 @@ function TopBar({ role, setRole, setTab, unitsSource, onSignOut, period }) {
             El Corazon
           </div>
           <div style={{ fontSize: 11, color: "#B9C4CE", letterSpacing: 1, textTransform: "uppercase" }}>
-            Body Corporate · 7 Units · {periodLabel(period)}
+            Body Corporate · 7 Units{period ? ` · ${periodLabel(period)}` : ""}
           </div>
         </div>
       </div>
@@ -3305,26 +3320,6 @@ function TopBar({ role, setRole, setTab, unitsSource, onSignOut, period }) {
         <span style={{ background: sourceBadge.bg, color: sourceBadge.color, fontSize: 10.5, fontWeight: 700, padding: "4px 10px", borderRadius: 20, letterSpacing: 0.4, whiteSpace: "nowrap" }}>
           {sourceBadge.label}
         </span>
-      <div style={{ display: "flex", background: "#24374A", borderRadius: 8, padding: 4 }}>
-        {["trustee", "resident"].map((r) => (
-          <button
-            key={r}
-            onClick={() => { setRole(r); setTab("dashboard"); }}
-            style={{
-              padding: "7px 16px",
-              borderRadius: 6,
-              border: "none",
-              fontSize: 13,
-              fontWeight: 600,
-              cursor: "pointer",
-              background: role === r ? "#F6F1E7" : "transparent",
-              color: role === r ? "#1B2A38" : "#B9C4CE",
-            }}
-          >
-            {r === "trustee" ? "Trustee view" : "Resident view"}
-          </button>
-        ))}
-      </div>
         <button
           onClick={onSignOut}
           style={{ background: "transparent", border: "1px solid #3A4E63", color: "#B9C4CE", padding: "7px 14px", borderRadius: 7, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}
@@ -3369,13 +3364,21 @@ function MeterMark() {
 }
 
 // Every trustee screen, in nav order, with the roles it defaults to. ONE list,
-// shared by the side nav and the User management page — two lists would drift,
-// and a page missing from the management list is a page nobody can grant.
+// shared by the side nav, the User management page and the landing-page picker
+// — separate lists would drift, and a page missing from the management list is
+// a page nobody can grant.
 //
-//   alwaysOn  — cannot be taken away. Config carries "Your login", so removing
-//               it would lock somebody out of their own password.
+//   alwaysOn  — cannot be taken away. Password management is the only one:
+//               removing it would lock somebody out of their own password.
+//               (Config used to carry that and so used to be alwaysOn; since
+//               the password screen moved out on 11 August 2026, Config is an
+//               ordinary grantable page.)
 //   financeOnly — the screen manages other users, so only the finance trustee
 //               can ever see it, whatever the page list says.
+//   noPeriod  — the screen has nothing to do with a month, so the period
+//               selector and the month in the header are hidden on it. Showing
+//               "August 2026" above a user list invites the reader to think the
+//               list is somehow scoped to August.
 const NAV_PAGES = [
   { key: "dashboard", label: "Dashboard", roles: ["finance", "approver", "maintenance"] },
   { key: "readings", label: "Meter readings", roles: ["finance", "approver"] },
@@ -3392,9 +3395,13 @@ const NAV_PAGES = [
   { key: "analytics", label: "Financial dashboard", roles: ["finance", "approver", "maintenance"] },
   { key: "tariffs", label: "Tariffs & rates", roles: ["finance"] },
   { key: "rate-history", label: "Rate history", roles: ["finance"] },
-  { key: "users", label: "User management", roles: ["finance"], financeOnly: true },
-  { key: "config", label: "Config", roles: ["finance", "approver", "maintenance"], alwaysOn: true },
+  { key: "users", label: "User management", roles: ["finance"], financeOnly: true, noPeriod: true },
+  { key: "config", label: "Config", roles: ["finance", "approver", "maintenance"] },
+  { key: "password", label: "Password management", roles: ["finance", "approver", "maintenance"], alwaysOn: true, noPeriod: true },
 ];
+
+const NAV_PAGE_BY_KEY = Object.fromEntries(NAV_PAGES.map((p) => [p.key, p]));
+const pageHasPeriod = (key) => !(NAV_PAGE_BY_KEY[key] || {}).noPeriod;
 
 const defaultPagesForRole = (role) =>
   NAV_PAGES.filter((p) => p.roles.includes(role || "finance")).map((p) => p.key);
@@ -3415,6 +3422,20 @@ function visibleNavPages(role, allowedPages) {
       return granted.includes(p.key);
     })
     .map((p) => [p.key, p.label]);
+}
+
+// Which page to open on at sign-in.
+//
+// The stored preference is a HINT, not an instruction — see the note on
+// trustees.landing_page. It can name a page the user has since lost access to,
+// or one that no longer exists, and landing someone on a blank screen because
+// of a stale preference is worse than ignoring the preference. So it is only
+// honoured if it is in the list of pages they can actually see; otherwise the
+// first visible page, which for every current role is the Dashboard.
+function resolveLandingPage(role, allowedPages, landingPage) {
+  const visible = visibleNavPages(role, allowedPages).map(([key]) => key);
+  if (landingPage && visible.includes(landingPage)) return landingPage;
+  return visible[0] || "dashboard";
 }
 
 function SideNav({ tab, setTab }) {
@@ -7863,7 +7884,7 @@ function UserManagement({ onProfileChanged }) {
     setInvite({ email: "", display_name: "", role: "approver", password: "" });
     setNotice(res && res.invited
       ? `Invited ${email}. They'll get an email to set their own password.`
-      : `Created ${email}. Give them the password you set — they can change it on Config → Your login.`);
+      : `Created ${email}. Give them the password you set — they can change it on Password management.`);
   });
 
   const removeUser = (r) => {
@@ -7887,12 +7908,23 @@ function UserManagement({ onProfileChanged }) {
   const setPassword = (r) => {
     const pw = window.prompt(
       `Set a temporary password for ${r.display_name || r.email}.\n\n`
-      + `At least 8 characters. They can change it themselves on Config → Your login.`);
+      + `At least 8 characters. They can change it themselves on Password management.`);
     if (pw == null) return;
     if (pw.length < 8) { setError("Use at least 8 characters."); return; }
     run(`pw-${r.user_id}`, () => callManageTrustees("set_password", { user_id: r.user_id, password: pw }),
       `Password set for ${r.display_name || r.email}. Pass it on, and ask them to change it.`);
   };
+
+  // Only offers pages that user can actually see, so a landing page cannot be
+  // set to a screen they'd be bounced off. Changing their pages afterwards can
+  // still strand it — resolveLandingPage() falls back at sign-in rather than
+  // showing them a blank screen.
+  const changeLanding = (r, value) => run(`land-${r.user_id}`, async () => {
+    const client = await ensureSupabaseClient();
+    const { error: e } = await client.from("trustees")
+      .update({ landing_page: value || null }).eq("user_id", r.user_id);
+    if (e) throw e;
+  }, "Landing page updated.");
 
   const changeRole = (r, role) => run(`role-${r.user_id}`, async () => {
     const client = await ensureSupabaseClient();
@@ -7911,6 +7943,16 @@ function UserManagement({ onProfileChanged }) {
   };
 
   const savePages = (r) => run(`pages-${r.user_id}`, async () => {
+    // An empty list is indistinguishable from "no list" everywhere it is read
+    // — both mean "use the role defaults", which is the safe reading of a
+    // missing value. So saving nothing ticked would quietly restore the
+    // defaults rather than do what it looks like it does. Say so instead.
+    if (!draftPages.length) {
+      throw new Error(
+        "Nothing is ticked. An empty list means \"role defaults\", so this wouldn't remove their pages — "
+        + "use \"Back to role defaults\" if that's what you want, or tick at least one page."
+      );
+    }
     const client = await ensureSupabaseClient();
     const { error: e } = await client.from("trustees")
       .update({ allowed_pages: draftPages }).eq("user_id", r.user_id);
@@ -7939,7 +7981,7 @@ function UserManagement({ onProfileChanged }) {
     return (
       <Card>
         <div style={{ fontSize: 13, color: "#64748B" }}>
-          User management is the finance trustee's. You can change your own password on <b>Config → Your login</b>.
+          User management is the finance trustee's. Your own password is on <b>Password management</b>.
         </div>
       </Card>
     );
@@ -7954,8 +7996,8 @@ function UserManagement({ onProfileChanged }) {
         Who can sign in, what they may change, and which screens they see.
         <br />
         <b>Role decides what someone can write</b> and is enforced by the database on every save.
-        The page list only decides what appears in their side menu — it is a tidiness setting, not a lock,
-        so never rely on it to keep figures out of someone's hands.
+        The page list and landing page only decide what appears in their side menu and which screen opens first —
+        tidiness settings, not locks, so never rely on either to keep figures out of someone's hands.
       </p>
 
       {notice && <Card style={{ marginBottom: 14, borderColor: "#B9D4C6" }}><div style={{ fontSize: 12.5, fontWeight: 600, color: "#2F5D50" }}>{notice}</div></Card>}
@@ -8001,13 +8043,19 @@ function UserManagement({ onProfileChanged }) {
         <div style={{ overflowX: "auto" }}>
           <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
             <thead><tr>
-              <th style={th}>User</th><th style={th}>Role</th><th style={th}>Pages</th><th style={th}>Password</th><th style={th} />
+              <th style={th}>User</th><th style={th}>Role</th><th style={th}>Pages</th>
+              <th style={th}>Opens on</th><th style={th}>Password</th><th style={th} />
             </tr></thead>
             <tbody>
               {rows.map((r) => {
                 const isMe = r.user_id === meId;
                 const custom = Array.isArray(r.allowed_pages) && r.allowed_pages.length > 0;
                 const pageCount = custom ? r.allowed_pages.length : defaultPagesForRole(r.role).length;
+                // The pages this user can actually see — the only sensible
+                // choices for where they land.
+                const theirPages = visibleNavPages(r.role, r.allowed_pages);
+                const landingResolved = resolveLandingPage(r.role, r.allowed_pages, r.landing_page);
+                const landingStranded = r.landing_page && r.landing_page !== landingResolved;
                 return (
                   <React.Fragment key={r.user_id}>
                     <tr>
@@ -8025,6 +8073,27 @@ function UserManagement({ onProfileChanged }) {
                         <button style={smallBtn} onClick={() => openPages(r)}>
                           {pageCount} page{pageCount === 1 ? "" : "s"}{custom ? "" : " (role default)"}
                         </button>
+                      </td>
+                      <td style={td}>
+                        <select
+                          style={{ ...inp, width: 175 }} value={r.landing_page || ""}
+                          disabled={busy === `land-${r.user_id}`}
+                          onChange={(e) => changeLanding(r, e.target.value)}
+                        >
+                          <option value="">First page ({(theirPages[0] || ["", "—"])[1]})</option>
+                          {theirPages.map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+                        </select>
+                        {landingStranded && (
+                          // Their stored choice is a page they can no longer
+                          // see. Nothing breaks — they land on {landingResolved}
+                          // — but say so, because silently ignoring a setting
+                          // that is still displayed is how people lose trust in
+                          // the screen.
+                          <div style={{ fontSize: 11, color: "#B5651D", marginTop: 3, lineHeight: 1.5 }}>
+                            Set to a page they can't see — they'll open on{" "}
+                            {(NAV_PAGE_BY_KEY[landingResolved] || {}).label || landingResolved}.
+                          </div>
+                        )}
                       </td>
                       <td style={td}>
                         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -8047,10 +8116,10 @@ function UserManagement({ onProfileChanged }) {
                       </td>
                     </tr>
                     {expanded === r.user_id && (
-                      <tr><td colSpan={5} style={{ ...td, background: "#F6F1E7" }}>
+                      <tr><td colSpan={6} style={{ ...td, background: "#F6F1E7" }}>
                         <div style={{ fontSize: 12, color: "#64748B", marginBottom: 8, lineHeight: 1.6 }}>
                           Screens {r.display_name || r.email} sees in the side menu.
-                          {" "}<b>Config is always shown</b> — it carries their own password, so it cannot be taken away.
+                          {" "}<b>Password management is always shown</b> — it carries their own password, so it cannot be taken away.
                           {" "}User management is finance-only whatever is ticked here.
                         </div>
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: "4px 18px" }}>
@@ -8098,6 +8167,23 @@ function UserManagement({ onProfileChanged }) {
 // Self-service password change for whoever is signed in. Deliberately not a
 // trustee-management screen: nobody sets anybody else's password, so there is
 // no path here for one trustee to take over another's approval rights.
+// Its own page since 11 August 2026 (it was a card at the bottom of Config).
+// This is the one page nobody can be denied — see NAV_PAGES.alwaysOn — because
+// a user who cannot reach their own password has no way to change it without
+// asking the finance trustee to set it for them, which is the exact thing this
+// screen exists to avoid.
+function PasswordManagement() {
+  return (
+    <>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Password management</h1>
+      <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 4 }}>
+        Your own password, and any sessions you have open elsewhere. Every trustee has this page.
+      </p>
+      <YourLogin />
+    </>
+  );
+}
+
 function YourLogin() {
   const { role, loading } = useTrusteeRole();
   const [email, setEmail] = useState("");
@@ -8317,17 +8403,22 @@ function Config({ expenseCategories, setExpenseCategories }) {
   const th = { padding: "6px 8px", color: "#64748B", fontSize: 10.5, textTransform: "uppercase", textAlign: "left" };
   const linkBtn = { background: "none", border: "none", padding: 0, fontSize: 11.5, fontWeight: 700, color: "#2A3E7A", cursor: "pointer", textDecoration: "underline" };
 
-  // The approving and maintenance trustees reach Config only for their own
-  // password. Showing them a category editor the database would refuse every
-  // write from would be an invitation to a policy error.
+  // Showing a non-finance trustee a category editor the database would refuse
+  // every write from would be an invitation to a policy error.
+  //
+  // Config used to be everyone's page because it carried the password card.
+  // That moved to Password management on 11 August 2026, so Config is now an
+  // ordinary page the finance trustee can grant or withhold — and for anyone
+  // who still has it without finance rights, this is all there is.
   if (!canWriteFinance) {
     return (
       <>
         <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Config</h1>
         <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
           Expense categories, AGM report figures and the other scheme settings are maintained by the finance trustee.
+          <br />
+          Your own password is on <b>Password management</b>.
         </p>
-        <YourLogin />
       </>
     );
   }
@@ -8405,7 +8496,6 @@ function Config({ expenseCategories, setExpenseCategories }) {
       </Card>
 
       <AgmReportSettings />
-      <YourLogin />
     </>
   );
 }
