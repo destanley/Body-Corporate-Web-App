@@ -1992,9 +1992,29 @@ async function signInWithPassword(email, password) {
   return error ? error.message : null;
 }
 
+// scope: "local" is deliberate and matters.
+//
+// supabase-js defaults signOut() to scope "global", which destroys EVERY
+// refresh token that user holds — on every device and browser they are signed
+// in on, not just this one. So a trustee signing off on the clubhouse PC also
+// drops themselves on their phone, and if two people are sharing an account
+// they drop each other. "local" ends this session and leaves the rest alone,
+// which is what a Sign out button is normally understood to mean.
+//
+// The global behaviour is still worth having, but as a decision the user makes
+// on purpose — see "Sign out everywhere else" on Config → Your login.
 async function signOutOfApp() {
   const client = await ensureSupabaseClient();
-  await client.auth.signOut();
+  await client.auth.signOut({ scope: "local" });
+}
+
+// The deliberate version: end every OTHER session and keep this one. For "I
+// left myself signed in somewhere I shouldn't have", which is the real reason
+// to want the global behaviour.
+async function signOutOtherSessions() {
+  const client = await ensureSupabaseClient();
+  const { error } = await client.auth.signOut({ scope: "others" });
+  return error ? error.message : null;
 }
 
 // ---------- Trustee roles ----------
@@ -8084,6 +8104,7 @@ function YourLogin() {
   const [pw, setPw] = useState("");
   const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
+  const [busyOthers, setBusyOthers] = useState(false);
   const [notice, setNotice] = useState(null);
   const [error, setError] = useState(null);
 
@@ -8120,6 +8141,10 @@ function YourLogin() {
         <br />
         Set your own password here. Nobody else can set it for you, and changing it does not sign you out.
       </p>
+      <div style={{ fontSize: 12, color: "#94A0AC", marginBottom: 14, lineHeight: 1.6 }}>
+        Changing your password <b>does not</b> end sessions already open elsewhere.
+        If you're changing it because someone may have had the old one, sign the other sessions out too.
+      </div>
       <form onSubmit={submit} style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
         {/* Helps password managers associate the entry with this account. */}
         <input type="email" value={email} autoComplete="username" readOnly hidden />
@@ -8139,6 +8164,36 @@ function YourLogin() {
       </form>
       {notice && <div style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600, marginTop: 12 }}>{notice}</div>}
       {error && <div style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600, marginTop: 12 }}>{error}</div>}
+
+      {/* Signing out normally only ends THIS session. This is the deliberate
+          way to reach the other ones — a phone, or a shared computer you left
+          signed in. It keeps the session you are using, so it cannot lock you
+          out by accident. */}
+      <div style={{ borderTop: "1px solid #F0EADC", marginTop: 18, paddingTop: 14 }}>
+        <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 4 }}>Other sessions</div>
+        <p style={{ fontSize: 12, color: "#94A0AC", marginTop: 0, marginBottom: 10, lineHeight: 1.6 }}>
+          Signs you out everywhere except here — another browser, a phone, a computer you left logged in.
+          This session stays open, so you can't lock yourself out.
+        </p>
+        <button
+          style={secondaryBtn}
+          disabled={busyOthers}
+          onClick={async () => {
+            if (!window.confirm(
+              "Sign out of every other session?\n\n"
+              + "Anywhere else you're signed in as this user will need the password again. "
+              + "This browser stays signed in."
+            )) return;
+            setBusyOthers(true); setNotice(null); setError(null);
+            const err = await signOutOtherSessions();
+            if (err) setError(err);
+            else setNotice("Signed out everywhere else. This session is still open.");
+            setBusyOthers(false);
+          }}
+        >
+          {busyOthers ? "Signing out…" : "Sign out everywhere else"}
+        </button>
+      </div>
     </Card>
   );
 }

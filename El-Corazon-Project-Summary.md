@@ -127,6 +127,18 @@ The first attempt at this test returned nothing and looked like a pass — the l
 
 > **`npm run build` still has to be run locally** — the sandbox can't, `node_modules` carries the Windows rollup binary.
 
+### Signing out was ending everyone's session
+
+Devon spotted that signing out appeared to log out other people too. It did, and the cause is a default worth knowing about:
+
+> **`supabase.auth.signOut()` defaults to `scope: "global"`** — it destroys *every* refresh token that user holds, on every device and browser, not just the current one. ([docs](https://supabase.com/docs/guides/auth/signout))
+
+So one trustee signing off on the clubhouse PC also dropped themselves on their phone — and while everyone was sharing the one login, it dropped each other. Now `{ scope: "local" }`, which ends this session and leaves the rest alone. That is what a Sign out button is normally taken to mean.
+
+The global behaviour is still worth having, but as something chosen on purpose, so **Config → Your login** gained **"Sign out everywhere else"** (`scope: "others"` — keeps the current session, so it can't lock you out by accident). Also noted there, because it isn't obvious: **changing your password does not end sessions already open elsewhere.** If you're changing it because someone may have had the old one, the password change alone doesn't shut them out.
+
+**One case this does not fix, and cannot.** Two *different* people signed into the same browser profile at once is not possible — supabase-js keeps the session in `localStorage`, which is shared by every tab of that origin, so the profile holds one session and signing out in any tab ends it in all of them. Per-tab sessions (`sessionStorage`) would trade that for logging in again in every new tab and losing the session on restart, which is a bad deal for a scheme where people check things occasionally. **Separate people need separate browser profiles, separate browsers, or separate machines** — which is the normal arrangement now that everyone has their own login.
+
 ### Note
 Devon created both logins in the Supabase dashboard before this session ran, so the manual step from session 15 is done: `margi.hutchinson@gmail.com` is the approver and `ivanajacobs55@gmail.com` maintenance. Further users can now be added from the app.
 
