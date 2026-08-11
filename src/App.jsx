@@ -6102,12 +6102,34 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
   } = extras;
   const prev = prevReport && prevReport.hasData ? prevReport : null;
 
-  // en-ZA formats money as "R 1 234,56" — spaces separate thousands. Every one
-  // of those becomes a non-breaking space so an amount can never be split
-  // across two lines inside a narrow table cell.
-  const nb = (s) => String(s).replace(/\s/g, " ");
-  const money = (n) => (n == null || n === "" ? "" : nb("R " + round2(Number(n) || 0).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })));
-  const dec = (n) => round2(Number(n) || 0).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  // ---------- Money format for the whole report: "R 123 123 123.12" ----------
+  // Trustee's house style, 11 August 2026: a space after the R, spaces between
+  // thousands, and a FULL STOP for the decimal.
+  //
+  // Formatted by hand rather than through `toLocaleString("en-ZA")`, which is
+  // what produced the old "R123 123 123,12". en-ZA is a comma-decimal locale,
+  // so the separator could not be changed without post-processing the string
+  // anyway, and the space it emits between thousands varies by engine (plain,
+  // no-break and narrow no-break have all been seen in the wild). Building the
+  // digits ourselves makes the output identical wherever the report is run.
+  //
+  // Every space is a non-breaking space, written as an escape, so an amount can
+  // never be split across two lines inside a narrow table cell. That was the
+  // reason `nb()` existed and it still holds.
+  const NBSP = "\u00A0";
+  const nb = (s) => String(s).replace(/\s/g, NBSP);
+  // Unsigned digits — "123 123 123.12". Never called directly; both formatters
+  // below add the sign themselves, so neither can drop one.
+  const digits = (n) => {
+    const [whole, frac] = Math.abs(round2(Number(n) || 0)).toFixed(2).split(".");
+    return `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, NBSP)}.${frac}`;
+  };
+  const sign = (n) => (round2(Number(n) || 0) < 0 ? "-" : "");
+  // No R prefix — for the wide grids that carry an "all figures in rand" note
+  // instead. These hold expenses and differences, so the sign matters.
+  const dec = (n) => `${sign(n)}${digits(n)}`;
+  // The minus sits before the R, never between it and the digits: "-R 1 234.56".
+  const money = (n) => (n == null || n === "" ? "" : `${sign(n)}R${NBSP}${digits(n)}`);
   // "2027-01-01" -> "01-January-2027", the form the template uses for the
   // increase and bonus dates. Parsed off the string rather than through Date,
   // which would shift the day in a negative-offset timezone.

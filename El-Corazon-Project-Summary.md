@@ -114,6 +114,33 @@ The same `.replace(",", ".")` shape exists in other components. Only `AgmReportS
 this session; **the others are worth auditing** — a table using it for meter readings would corrupt
 a reading rather than blank a config field.
 
+### AGM report money format — "R 123 123 123.12"
+
+Trustee's house style: a space after the R, spaces between thousands, and a **full stop** for the
+decimal. It was `R123 123 123,12`.
+
+`toLocaleString("en-ZA")` cannot produce it — en-ZA is a comma-decimal locale, so the separator
+would need post-processing anyway, and the space it emits between thousands **varies by engine**
+(plain, no-break and narrow no-break have all been seen). The three formatters in
+`exportAgmReportDocx` now build the digits by hand, so the output is identical wherever the report
+is generated:
+
+- `digits()` — unsigned, grouped, dot decimal. Never called directly.
+- `dec()` — signed, no R prefix; the wide grids that carry an "all figures in rand" note.
+- `money()` — signed, `R` + non-breaking space + digits.
+
+**A bug caught before it shipped:** the first version had `dec()` built on `Math.abs`, which
+silently dropped the minus. `dec()` feeds `amt()`, used 26 times across the I&E grids where
+expenses and differences are routinely negative. Both formatters now take their sign from one
+shared helper, so neither can lose one. Verified: `-1234.56` → `-R 1 234.56` and `-1 234.56`.
+
+Every space is a non-breaking space, written as an escape, so an amount can never wrap mid-figure —
+the reason `nb()` existed, still true. **Only the AGM template changed**; the four on-screen `money`
+helpers are untouched.
+
+> **Watch for this:** the source file is full of *literal* U+00A0 characters (`nb()` itself was one),
+> which is why a plain-text search using an escape sequence will not match them. Search by escape or by line number.
+
 ### Removing the water section broke the AGM report — and how it got past me
 
 `exportAgmReportDocx` was still being **called** with `water` and still **destructured** it, after
