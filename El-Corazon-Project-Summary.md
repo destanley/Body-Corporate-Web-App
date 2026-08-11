@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 11 August 2026, session 19 (supersedes the 11 August 2026 session 18 summary)
+Last updated: 11 August 2026, session 20 (supersedes the 11 August 2026 session 19 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,90 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 11 August 2026, session 20 — reserve fund plan (PLANNING ONLY, nothing built)
+
+**Read `docs/reserve-fund-implementation-plan.md` before doing anything here.** This session
+produced a plan and verified the law against primary sources. **No code was written and no data was
+changed.** The reserve fund still does not exist.
+
+### The legal position, verified from the Acts themselves
+
+Not from summaries — from [Regulation 2](https://source.acts.co.za/sectional-titles-schemes-management-act-2011/r1231_2__minimum_amounts_for_r.php)
+and [STSMA s3](https://source.acts.co.za/sectional-titles-schemes-management-act-2011/3_functions_of_bodies_corporate.php).
+
+| Reserve at prior year end | Minimum contribution for the year budgeted |
+|---|---|
+| **< 25%** of prior year's *actual* admin contributions | **15% of the budgeted** admin contribution |
+| more than 25% – less than 100% | at least the R&M **budgeted to be spent from the administrative fund** on common property |
+| ≥ 100% | none |
+
+**Three traps, all of which I fell into before checking the source:**
+
+1. **Tier 2 is not "what you plan to spend from the reserve".** It is what you budget to spend **from
+   the administrative fund** on repairs and maintenance. For FY 2026/2027 that is the **R 8,000**
+   R&M line — small, but not nil.
+2. **Exactly 25% is in a drafting gap.** Para (a) is "less than 25%", para (c) is "more than 25%".
+   A balance of precisely 25% is caught by neither. Never land on the line.
+3. **The threshold and the 15% use different bases.** Threshold = last year's *actual* contributions;
+   the 15% = next year's *budgeted* contributions.
+
+### The unresolved question: what counts as a "contribution"?
+
+Regulation 2 says 15% of "the total budgeted contribution to the administrative fund" and does not
+define it. **s3(1)(f) says contributions are levied "in proportion to the quotas of their respective
+sections".** El Corazon's metered water and electricity are billed on meter readings, not on PQ — so
+on a strict reading they are a cost recovery, not a contribution, and the basis is the levy grid
+alone. Against that, s3(1)(a)(ii) puts the council bill squarely in the administrative fund.
+
+| Basis | Amount | 15% |
+|---|---:|---:|
+| Levy grid only | R 150,015.96 | R 22,502.39 |
+| All owner contributions (excl. interest) | R 266,789.56 | R 40,018.43 |
+
+**Unresolved — for the accountant.** The recommendation below is designed so the meeting does not
+have to wait for the answer. Note the levy grid **already contains** the fixed utility charges
+(sewerage, demand levy, common-property water and electricity); only *metered* consumption is in
+dispute.
+
+### Where the scheme actually stands
+
+Reserve balance **R 0.00**, ledger entries **0**, asset register **24 components with zero
+replacement costs**, no inspections, no plan snapshot. Cash held **R 210,844.15**. The FY 2026/2027
+budget already carries a reserve line of R 40,592.60 — which is 15% of *total budgeted expenditure*,
+the wrong quantity from the wrong year.
+
+### Recommendation: designate R 70,000 from cash
+
+**No owner pays anything.** The scheme holds nearly a year of running costs undesignated; this
+relabels part of it. R 70,000 was chosen because it clears 25% under **both** readings
+(26.2% broad, 46.7% levy-only), avoids the exactly-25% gap, and drops FY 2027/2028 to tier 2 either
+way. Admin cash left R 140,844.15 — 6.2 months of cover, down from 9.3.
+
+**Trustee decisions taken this session:** track the reserve **notionally** against the single FNB
+account and state the PMR 26(1)(b) separate-account gap openly rather than mask it. Funding approach
+**recommended but not yet confirmed by Devon**.
+
+### The floor is not the target
+
+Reg 2 sets a minimum; s3(1)(b) requires the fund be *reasonably sufficient*. **Costing the 24
+components is the only work that answers the real question** — until then R 40,000 is a number
+chosen by regulation rather than by the roof.
+
+### Not built — the phase 2 backlog
+
+- **`reserveFundFloor()` is wrong twice over.** It takes `adminBudget: report.totalExpense` —
+  prior-year *expenditure*, where the regulation wants next year's *budgeted contributions*.
+- **It implements tier 1 only**, returning `null` above 25%, which reads as "no obligation" exactly
+  when tier 2 starts to bite.
+- Reserve page: show the tier, the 25%/100% thresholds and the distance to the next one.
+- Standing PMR 26(1)(b) note on the Reserve page and in the AGM pack.
+- Record the opening designation as a `contribution` entry describing where it came from.
+
+The ledger UI and `reserve_fund_entries` already exist and work; nothing new is needed to *record*
+entries, only to compute and present the obligation correctly.
 
 ---
 
