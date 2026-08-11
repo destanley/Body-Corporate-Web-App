@@ -114,6 +114,33 @@ The same `.replace(",", ".")` shape exists in other components. Only `AgmReportS
 this session; **the others are worth auditing** — a table using it for meter readings would corrupt
 a reading rather than blank a config field.
 
+### Removing the water section broke the AGM report — and how it got past me
+
+`exportAgmReportDocx` was still being **called** with `water` and still **destructured** it, after
+session 18 deleted the variable. Every generation threw `ReferenceError: water is not defined`,
+which the `try/catch` turned into "Couldn't generate the AGM report — see browser console."
+
+`esbuild` cannot catch this: it parses, it does not resolve identifiers. The verification claimed
+in session 18 — "esbuild clean" — was therefore worth much less than it sounded, and the grep used
+to look for leftovers was piped through `head -30` and stopped short of line 5567.
+
+**ESLint with `no-undef` catches it in a second**, and is now the check to run before claiming a
+refactor is clean:
+
+```
+eslint --config <cfg> --rule '{"no-unused-vars":"off"}' src/App.jsx
+```
+
+Proven both ways this session: clean on the fixed file, and `5567:74 error 'water' is not defined`
+on a copy with the bug reintroduced. It also caught a **literal non-breaking space** pasted into
+the new `num()` regex — invisible in source and liable to be mangled by an editor — now written
+` `. (`react-hooks/exhaustive-deps` errors in the output are inline disable comments for a
+plugin that isn't installed, and `no-unused-vars` is noise without the React plugin: JSX components
+read as unused. `no-undef` is the signal.)
+
+**Pre-existing, not introduced:** `waterBandsAsOf()` is dead — one occurrence, the definition — and
+was already dead two commits before the removal.
+
 ### The reconciliation factor now works itself out
 
 New **`computeWaterReconciliationFactor(fy)`**. Everything it needs is already captured, so the

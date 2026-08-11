@@ -5564,7 +5564,7 @@ function Analytics({ expenseCategories }) {
       const floor = plan && leviesCollected != null
         ? { ...reserveFundFloor({ reserveBalance: plan.reserve.balance, leviesCollected, adminBudget: report.totalExpense }), leviesCollected }
         : null;
-      await exportAgmReportDocx({ fy, report, prevReport, extras, usage, water, bank, plan, floor, budget });
+      await exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank, plan, floor, budget });
       setAgmStatus("idle");
     } catch (err) {
       console.error("Generating the AGM report failed:", err);
@@ -6088,7 +6088,7 @@ async function fetchAgmExtras(fy) {
 // Builds and downloads the AGM annual report as an editable .docx. Sections the
 // database can fill are filled; the rest render as tables with empty cells so
 // the figures can be typed straight into Word before the meeting.
-async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, water, bank, plan, floor, budget }) {
+async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank, plan, floor, budget }) {
   const D = await ensureDocxLoaded();
   const {
     Document, Packer, Paragraph, TextRun, HeadingLevel,
@@ -8884,7 +8884,9 @@ function AgmReportSettings() {
   // a thousands separator, so "1,125" is 1125. For "number" it never is, because
   // the reconciliation factor is a decimal — "1.045" must stay 1.045, not 1045.
   const num = (v, kind = "money") => {
-    let t = String(v ?? "").trim().replace(/[\s ]/g, "").replace(/^r/i, "");
+    // \u00A0 is written as an escape, not pasted: a literal non-breaking
+    // space in source is invisible and does not survive every editor.
+    let t = String(v ?? "").trim().replace(/[\s\u00A0]/g, "").replace(/^r/i, "");
     if (t === "") return null;
     const neg = /^[-(]/.test(t);
     t = t.replace(/[()+-]/g, "");
