@@ -1997,6 +1997,233 @@ async function signOutOfApp() {
   await client.auth.signOut();
 }
 
+// ---------- Trustee roles ----------
+// 'finance' | 'approver' | 'maintenance'. The database is the authority — every
+// table's write policy calls the matching SQL function — and this is only so
+// the UI can disable what the server would refuse anyway. Hiding a control the
+// user cannot use is kinder than letting them fill in a form and then showing
+// them a policy violation, but it is not the control itself.
+const TRUSTEE_ROLE_DEFAULT = { role: null, loading: true };
+const TrusteeRoleContext = React.createContext(TRUSTEE_ROLE_DEFAULT);
+const useTrusteeRole = () => React.useContext(TrusteeRoleContext);
+// Finance is the fallback for a signed-in user with no trustees row, matching
+// the column default — a trustee who predates roles is not locked out.
+const useCanWriteFinance = () => { const { role } = useTrusteeRole(); return role == null || role === "finance"; };
+const useCanApprove = () => { const { role } = useTrusteeRole(); return role == null || role === "finance" || role === "approver"; };
+const useCanManageMaintenance = () => { const { role } = useTrusteeRole(); return role == null || role === "finance" || role === "maintenance"; };
+
+const ROLE_LABELS = {
+  finance: "Finance trustee",
+  approver: "Approving trustee",
+  maintenance: "Maintenance trustee",
+};
+
+async function fetchTrusteeRole() {
+  const client = await ensureSupabaseClient();
+  const { data, error } = await client.rpc("trustee_role");
+  if (error) throw error;
+  return data || null;
+}
+
+// Lets a signed-in trustee set their own password. Supabase handles the hash
+// and the session stays valid, so there is nothing to re-authenticate.
+async function changeOwnPassword(newPassword) {
+  const client = await ensureSupabaseClient();
+  const { error } = await client.auth.updateUser({ password: newPassword });
+  return error ? error.message : null;
+}
+
+// ---------- Approvals ----------
+// The four sign-offs that gate statement release. Scope is a financial year
+// for the two annual subjects and a statement period for the two monthly ones
+// — see the approvals table comment for why they differ.
+const APPROVAL_SUBJECTS = [
+  { key: "levy_breakdown", label: "Levy breakdown", scopeKind: "fy" },
+  { key: "insurance", label: "Insurance breakdown", scopeKind: "fy" },
+  { key: "meter_readings", label: "Meter readings", scopeKind: "period" },
+  { key: "statements", label: "Statements", scopeKind: "period" },
+];
+
+const approvalScopeFor = (subjectKey, period = ACTIVE_PERIOD) => {
+  const s = APPROVAL_SUBJECTS.find((x) => x.key === subjectKey);
+  return s && s.scopeKind === "fy" ? periodToFY(period) : period;
+};
+
+async function fetchApprovals(period = ACTIVE_PERIOD) {
+  const client = await ensureSupabaseClient();
+  const scopes = [...new Set(APPROVAL_SUBJECTS.map((s) => approvalScopeFor(s.key, period)))];
+  const { data, error } = await client.from("approvals").select("*").in("scope", scopes);
+  if (error) throw error;
+  // Keyed by subject, but only where the scope is the one THIS period resolves
+  // to — a row for another financial year shares the table, not the meaning.
+  const out = {};
+  (data || []).forEach((r) => {
+    if (r.scope === approvalScopeFor(r.subject, period)) out[r.subject] = r;
+  });
+  return out;
+}
+
+async function setApproval(subjectKey, approved, period = ACTIVE_PERIOD, note = null) {
+  const client = await ensureSupabaseClient();
+  const scope = approvalScopeFor(subjectKey, period);
+  if (!approved) {
+    const { error } = await client.from("approvals").delete().eq("subject", subjectKey).eq("scope", scope);
+    if (error) throw error;
+    return null;
+  }
+  const { data: userData } = await client.auth.getUser();
+  const user = userData && userData.user;
+  if (!user) throw new Error("Not signed in.");
+  const row = {
+    subject: subjectKey, scope,
+    approved_by: user.id, approved_by_email: user.email || null,
+    approved_at: new Date().toISOString(), note,
+  };
+  const { error } = await client.from("approvals").upsert(row, { onConflict: "subject,scope" });
+  if (error) throw error;
+  return row;
+}
+
+// The approval control that appears on all four screens. One component so the
+// four cannot drift apart in wording or behaviour — and so the thing that
+// gates statements looks the same everywhere it is asked for.
+function ApprovalCheckbox({ subject, period = ACTIVE_PERIOD, hint }) {
+  const canApprove = useCanApprove();
+  const { role } = useTrusteeRole();
+  const [row, setRow] = useState(undefined); // undefined = loading
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const meta = APPROVAL_SUBJECTS.find((s) => s.key === subject);
+  const scope = approvalScopeFor(subject, period);
+
+  const load = async () => {
+    try {
+      const all = await fetchApprovals(period);
+      setRow(all[subject] || null);
+    } catch (err) {
+      console.error("Loading the approval failed:", err);
+      setRow(null);
+    }
+  };
+  useEffect(() => { load(); }, [subject, period]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggle = async () => {
+    setBusy(true); setError(null);
+    try {
+      await setApproval(subject, !row, period);
+      await load();
+    } catch (err) {
+      console.error("Saving the approval failed:", err);
+      // The database refuses a write from a role without can_approve(), which
+      // is the actual control — say so plainly rather than "save failed".
+      setError(canApprove ? (err.message || "Couldn't save — see browser console.")
+        : "Only the approving trustee can sign this off.");
+    }
+    setBusy(false);
+  };
+
+  const approved = Boolean(row);
+  return (
+    <Card style={{
+      marginBottom: 16,
+      background: approved ? "#EEF4F0" : "#FBF3E9",
+      border: `1px solid ${approved ? "#B9D4C6" : "#E3C9A8"}`,
+    }}>
+      <label style={{ display: "flex", alignItems: "flex-start", gap: 11, cursor: canApprove && !busy ? "pointer" : "not-allowed" }}>
+        <input
+          type="checkbox"
+          checked={approved}
+          disabled={!canApprove || busy || row === undefined}
+          onChange={toggle}
+          style={{ width: 17, height: 17, marginTop: 1, flexShrink: 0, cursor: "inherit" }}
+        />
+        <span style={{ fontSize: 12.5, lineHeight: 1.7, color: approved ? "#2F5D50" : "#8A5A1E" }}>
+          <b>{approved ? `${meta.label} approved` : `${meta.label} not yet approved`}</b>
+          {" — "}{meta.scopeKind === "fy" ? `FY ${scope}` : periodLabel(scope)}.
+          {approved && row.approved_by_email && (
+            <> Signed off by <b>{row.approved_by_email}</b> on {String(row.approved_at).slice(0, 10)}.</>
+          )}
+          {!approved && <> Statements for this month cannot be generated until all four sign-offs are in.</>}
+          {hint && <div style={{ marginTop: 4, color: "#94A0AC" }}>{hint}</div>}
+          {!canApprove && (
+            <div style={{ marginTop: 4, color: "#94A0AC" }}>
+              Only the approving trustee can change this. You are signed in as {ROLE_LABELS[role] || "a trustee"}.
+            </div>
+          )}
+          {error && <div style={{ marginTop: 4, color: "#B5651D", fontWeight: 600 }}>{error}</div>}
+        </span>
+      </label>
+    </Card>
+  );
+}
+
+// Whether statements may be produced for a period: all four sign-offs in.
+//
+// Deliberately re-read from the database rather than passed down from the four
+// screens — the approving trustee may be signing off in another browser, and a
+// gate computed from this tab's stale state is not a gate.
+function useStatementReleaseGate(period = ACTIVE_PERIOD) {
+  const [approvals, setApprovals] = useState(null); // null = still loading
+  const [version, setVersion] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    fetchApprovals(period)
+      .then((a) => { if (!cancelled) setApprovals(a); })
+      .catch((err) => {
+        console.error("Loading approvals for the statement gate failed:", err);
+        // Fail CLOSED. An approvals table that cannot be read is not evidence
+        // that everything was approved.
+        if (!cancelled) setApprovals({});
+      });
+    return () => { cancelled = true; };
+  }, [period, version]);
+
+  const outstanding = approvals == null
+    ? APPROVAL_SUBJECTS.map((s) => s.label)
+    : APPROVAL_SUBJECTS.filter((s) => !approvals[s.key]).map((s) => s.label);
+  const loading = approvals == null;
+  return {
+    loading,
+    approvals: approvals || {},
+    outstanding,
+    released: !loading && outstanding.length === 0,
+    blockedReason: loading
+      ? "Checking approvals…"
+      : `Outstanding sign-off: ${outstanding.join(", ")}.`,
+    refresh: () => setVersion((v) => v + 1),
+  };
+}
+
+function StatementReleaseGate({ gate, period }) {
+  if (gate.loading) {
+    return (
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 12.5, color: "#64748B" }}>Checking approvals for {periodLabel(period)}…</div>
+      </Card>
+    );
+  }
+  if (gate.released) {
+    return (
+      <Card style={{ marginBottom: 16, background: "#EEF4F0", border: "1px solid #B9D4CE" }}>
+        <div style={{ fontSize: 12.5, color: "#2F5D50", lineHeight: 1.7 }}>
+          <b>All four sign-offs are in for {periodLabel(period)}.</b> Statements can be produced and sent.
+        </div>
+      </Card>
+    );
+  }
+  return (
+    <Card style={{ marginBottom: 16, background: "#FBF3E9", border: "1px solid #E3C9A8" }}>
+      <div style={{ fontSize: 12.5, color: "#8A5A1E", lineHeight: 1.7 }}>
+        <b>Statements are held for {periodLabel(period)}.</b> Producing or sending is blocked until the approving
+        trustee has signed off all four. Still outstanding: <b>{gate.outstanding.join(", ")}</b>.
+        <div style={{ marginTop: 4, color: "#94A0AC" }}>
+          The preview below is live and can be checked — it just cannot leave the building yet.
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function LoginScreen() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -2552,6 +2779,22 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
+  // Which trustee is signed in. Read once per session and held in context; the
+  // database enforces the same thing on every write, so a stale value here can
+  // only ever show a control that then refuses, never grant one.
+  const [roleState, setRoleState] = useState(TRUSTEE_ROLE_DEFAULT);
+  useEffect(() => {
+    if (!session) { setRoleState({ role: null, loading: false }); return; }
+    let cancelled = false;
+    fetchTrusteeRole()
+      .then((role) => { if (!cancelled) setRoleState({ role, loading: false }); })
+      .catch((err) => {
+        console.error("Could not read the trustee role — treating as finance:", err);
+        if (!cancelled) setRoleState({ role: null, loading: false });
+      });
+    return () => { cancelled = true; };
+  }, [session]);
+
   useEffect(() => {
     let cancelled = false;
     let subscription = null;
@@ -2833,6 +3076,10 @@ export default function App() {
   if (!session) return <LoginScreen />;
 
   return (
+    // NB: `role` on TopBar below is the trustee/resident VIEW switch and has
+    // nothing to do with the trustee role in this provider — they were named
+    // the same by accident of history.
+    <TrusteeRoleContext.Provider value={roleState}>
     <div className="f-body" style={{ minHeight: "100vh", background: "#EFEAE0", color: "#1B2A38" }}>
       {FONT_IMPORT}
       <TopBar role={role} setRole={setRole} setTab={setTab} unitsSource={unitsSource} onSignOut={signOutOfApp} period={selectedPeriod} />
@@ -2842,7 +3089,12 @@ export default function App() {
           <main style={{ flex: 1, padding: "28px 32px", maxWidth: 1100 }}>
             <PeriodBar periods={periods} selectedPeriod={selectedPeriod} setSelectedPeriod={setSelectedPeriod} />
             {tab === "dashboard" && <Dashboard alloc={alloc} setTab={setTab} setSelectedUnit={setSelectedUnit} bankTxns={bankTxns} period={selectedPeriod} remittanceDeductions={remittanceDeductions} manualPayments={manualPayments} />}
-            {tab === "readings" && <Readings readings={readings} setReadings={setReadings} period={selectedPeriod} />}
+            {tab === "readings" && (
+              <>
+                <ApprovalCheckbox subject="meter_readings" period={selectedPeriod} />
+                <Readings readings={readings} setReadings={setReadings} period={selectedPeriod} />
+              </>
+            )}
             {tab === "allocation" && (
               <>
                 <UtilityBills
@@ -2919,23 +3171,40 @@ export default function App() {
             {tab === "budget" && <Budget />}
             {tab === "rate-history" && <RateHistory />}
             {tab === "levy-setup" && (
-              <LevySetup
+              <>
+                <ApprovalCheckbox subject="levy_breakdown" period={selectedPeriod}
+                  hint="Levies are set annually at the AGM, so this sign-off covers the financial year rather than the month." />
+                <LevySetup
                 levyBreakdown={levyBreakdown} setLevyBreakdown={setLevyBreakdown}
                 levyMeta={levyMeta} onSaved={() => setDataVersion((v) => v + 1)}
                 waterBands={waterBands} electricityRate={electricityRate} vatRate={vatRate}
                 commonPropertyElectricityKwh={commonPropertyElectricityKwh}
                 commonPropertyWaterKl={commonPropertyWaterKl}
                 councilInvoice={councilInvoice}
-              />
+                />
+              </>
             )}
-            {tab === "insurance" && <InsurancePage />}
+            {tab === "insurance" && (
+              <>
+                <ApprovalCheckbox subject="insurance" period={selectedPeriod}
+                  hint="The insurance schedule is set once a financial year, so this sign-off covers the year rather than the month." />
+                <InsurancePage />
+              </>
+            )}
             {tab === "additional-charges" && (
               <AdditionalCharges additionalCharges={additionalCharges} setAdditionalCharges={setAdditionalCharges} />
             )}
             {tab === "ops-expenses" && (
               <OpsExpenses opsExpenses={opsExpenses} setOpsExpenses={setOpsExpenses} period={selectedPeriod} />
             )}
-            {tab === "analytics" && <Analytics expenseCategories={expenseCategories} />}
+            {tab === "analytics" && (
+              <>
+                <Analytics expenseCategories={expenseCategories} />
+                {/* The reserve fund is money, so it belongs with the money.
+                    Moved off the Maintenance page 11 August 2026. */}
+                <ReserveFund />
+              </>
+            )}
             {tab === "config" && (
               <Config expenseCategories={expenseCategories} setExpenseCategories={setExpenseCategories} />
             )}
@@ -2949,6 +3218,7 @@ export default function App() {
         />
       )}
     </div>
+    </TrusteeRoleContext.Provider>
   );
 }
 
@@ -3048,24 +3318,37 @@ function MeterMark() {
 }
 
 function SideNav({ tab, setTab }) {
+  const { role } = useTrusteeRole();
+  // Every screen, with who has business on it. Read access is open to all
+  // trustees by policy, so this is about not presenting a wall of screens
+  // somebody has no reason to open — not about hiding data.
+  //
+  //   all         — everyone
+  //   approve     — the four screens the approving trustee signs off, which
+  //                 they must be able to READ to approve
+  //   finance     — the finance trustee's working screens
+  //   maintenance — the register
+  const all = ["finance", "approver", "maintenance"];
   const items = [
-    ["dashboard", "Dashboard"],
-    ["readings", "Meter readings"],
-    ["levy-setup", "Levy breakdown (AGM)"],
-    ["insurance", "Insurance"],
-    ["additional-charges", "Additional charges"],
-    ["ops-expenses", "Body corp expenses"],
-    ["allocation", "Invoice allocation"],
-    ["reconciliation", "Tenant recon"],
-    ["bank-recon", "Bank recon"],
-    ["maintenance", "Maintenance plan"],
-    ["budget", "Budget"],
-    ["statement-preview", "Statement preview"],
-    ["analytics", "Financial dashboard"],
-    ["tariffs", "Tariffs & rates"],
-    ["rate-history", "Rate history"],
-    ["config", "Config"],
-  ];
+    ["dashboard", "Dashboard", all],
+    ["readings", "Meter readings", ["finance", "approver"]],
+    ["levy-setup", "Levy breakdown (AGM)", ["finance", "approver"]],
+    ["insurance", "Insurance", ["finance", "approver"]],
+    ["additional-charges", "Additional charges", ["finance"]],
+    ["ops-expenses", "Body corp expenses", ["finance"]],
+    ["allocation", "Invoice allocation", ["finance"]],
+    ["reconciliation", "Tenant recon", ["finance"]],
+    ["bank-recon", "Bank recon", ["finance"]],
+    ["maintenance", "Maintenance plan", ["finance", "maintenance"]],
+    ["budget", "Budget", ["finance"]],
+    ["statement-preview", "Statement preview", ["finance", "approver"]],
+    ["analytics", "Financial dashboard", all],
+    ["tariffs", "Tariffs & rates", ["finance"]],
+    ["rate-history", "Rate history", ["finance"]],
+    // Config carries "Your login", so nobody can be shut out of their own
+    // password.
+    ["config", "Config", all],
+  ].filter(([, , roles]) => role == null || roles.includes(role));
   return (
     <nav style={{ width: 210, borderRight: "1px solid #D8D0BE", padding: "24px 12px", minHeight: "calc(100vh - 65px)" }}>
       {items.map(([key, label]) => (
@@ -4897,6 +5180,12 @@ function fyMonths(fy) {
 }
 const ymOf = (dateStr) => String(dateStr).slice(0, 7);
 
+// The income row that is levy money. Named rather than typed at each use
+// because the PMR 22 reserve threshold keys off it: matching the label by hand
+// in one more place is how it came to be summed with Interest Earned in the
+// first place.
+const INCOME_OWNER_CONTRIBUTIONS = "Owner Contributions";
+
 function buildFinancialYearReport({
   fy, txns, ops, remits, charges, manualPays = [], categories,
   unitNumbers = {}, chaserImported = true, chaserMonth = null,
@@ -4909,7 +5198,7 @@ function buildFinancialYearReport({
   };
 
   const income = {
-    "Owner Contributions": blank(),
+    [INCOME_OWNER_CONTRIBUTIONS]: blank(),
     "Interest Earned": blank(),
     "Other Credits": blank(),
   };
@@ -4938,7 +5227,7 @@ function buildFinancialYearReport({
     if (t.direction === "credit") {
       if (t.category === "resident_payment") {
         const settles = t.applied_period || (t.period ? ymOf(prevPeriod(t.period)) : ymOf(t.txn_date));
-        add(income["Owner Contributions"], ymOf(settles), amount);
+        add(income[INCOME_OWNER_CONTRIBUTIONS], ymOf(settles), amount);
       } else if (t.category === "interest") {
         add(income["Interest Earned"], ymOf(t.txn_date), amount);
       } else {
@@ -4964,10 +5253,10 @@ function buildFinancialYearReport({
     const ym = ymOf(m.applied_period);
     if (bankedKeys.has(`${m.unit_id}|${ym}`)) return; // superseded by the real thing
     const amount = Number(m.amount) || 0;
-    if (income["Owner Contributions"][ym] === undefined) return;
+    if (income[INCOME_OWNER_CONTRIBUTIONS][ym] === undefined) return;
     provisionalTotal += amount;
     provisionalDetail.push({ unit: unitNumbers[m.unit_id] || null, ym, amount });
-    add(income["Owner Contributions"], ym, amount);
+    add(income[INCOME_OWNER_CONTRIBUTIONS], ym, amount);
   });
 
   // --- Approved resident deductions: expense incurred + contribution grossed up ---
@@ -4985,7 +5274,7 @@ function buildFinancialYearReport({
       if (!(amount > 0)) return;
       deductionTotal += amount;
       add(ensureExpense(it.expenseCategory || UNCLASSIFIED), ym, amount);
-      add(income["Owner Contributions"], ym, amount);
+      add(income[INCOME_OWNER_CONTRIBUTIONS], ym, amount);
     });
   });
 
@@ -5041,14 +5330,14 @@ function buildFinancialYearReport({
   };
 
   if (deductionTotal > 0) {
-    note("Owner Contributions",
+    note(INCOME_OWNER_CONTRIBUTIONS,
       `Includes ${rand(deductionTotal)} of levies settled by approved deductions — Body Corp expenses residents paid personally. The matching amounts appear under expenditure, so the surplus is not overstated.`);
   }
   if (provisionalTotal > 0) {
     const byUnit = provisionalDetail
       .map((d) => `${d.unit ? `Unit ${d.unit}` : "an unidentified unit"} ${rand(d.amount)} (${monthName(d.ym)})`)
       .join(", ");
-    note("Owner Contributions",
+    note(INCOME_OWNER_CONTRIBUTIONS,
       `Includes ${rand(provisionalTotal)} recorded manually and not yet confirmed on a bank statement: ${byUnit}. Each entry drops out automatically once the matching bank line is imported, so it cannot be double counted.`);
   }
   expenseRows.forEach((r) => {
@@ -5171,11 +5460,18 @@ function Analytics({ expenseCategories }) {
       ]);
       // The PMR 22 floor needs figures from three places at once: the reserve
       // ledger, the year's levy income, and next year's administrative budget.
-      // Levy income is the Levies line from the income statement; the admin
-      // budget is this year's total expenditure, which is the best available
-      // proxy until a budget is captured as its own record.
-      const leviesCollected = report && report.incomeRows
-        ? round2(report.incomeRows.reduce((s, r) => s + (r.total || 0), 0)) : null;
+      // The admin budget is this year's total expenditure, which is the best
+      // available proxy until a budget is captured as its own record.
+      //
+      // Levy income is Owner Contributions ONLY. This used to sum every income
+      // row, which swept in Interest Earned and Other Credits — neither is a
+      // levy, and both inflated the 25% reserve threshold the meeting is held
+      // to. Anything that isn't a contribution from an owner is excluded by
+      // construction here rather than by listing what to skip, so a new income
+      // row added later cannot quietly rejoin the calculation.
+      const leviesRow = report && report.incomeRows
+        ? report.incomeRows.find((r) => r.label === INCOME_OWNER_CONTRIBUTIONS) : null;
+      const leviesCollected = leviesRow ? round2(leviesRow.total || 0) : null;
       const floor = plan && leviesCollected != null
         ? { ...reserveFundFloor({ reserveBalance: plan.reserve.balance, leviesCollected, adminBudget: report.totalExpense }), leviesCollected }
         : null;
@@ -6406,7 +6702,10 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
       MP.push(H2("The statutory minimum"));
       const fAligns = ["left", "right"];
       const fRows = [hrow(["", `FY ${nfy}`], fAligns)];
-      fRows.push(row([`Levies collected in FY ${fy}`, money(floor.leviesCollected)], fAligns));
+      // "Owner contributions" rather than the old "Levies collected", because
+      // that is exactly what the figure now is — and the old label had been
+      // sitting over a number that also contained bank interest.
+      fRows.push(row([`Owner contributions collected in FY ${fy}`, money(floor.leviesCollected)], fAligns));
       fRows.push(row(["25% of that — the reserve fund threshold", money(floor.threshold)], fAligns));
       fRows.push(row(["Reserve fund held", money(plan.reserve.balance)], fAligns));
       fRows.push(row(["Below the threshold?", floor.below ? "Yes" : "No"], fAligns, true));
@@ -6967,7 +7266,11 @@ async function fetchMaintenancePlan(fy, opts = {}) {
   const asOf = `${fyStartYear + 1}-07-31`;
 
   const latestByAsset = {};
-  (inspections.data || []).forEach((i) => { if (!latestByAsset[i.asset_id]) latestByAsset[i.asset_id] = i; });
+  const inspectionCountByAsset = {};
+  (inspections.data || []).forEach((i) => {
+    if (!latestByAsset[i.asset_id]) latestByAsset[i.asset_id] = i;
+    inspectionCountByAsset[i.asset_id] = (inspectionCountByAsset[i.asset_id] || 0) + 1;
+  });
 
   const entries = reserve.data || [];
   const signed = (e) => (e.entry_type === "drawdown" ? -Math.abs(Number(e.amount)) : Number(e.amount));
@@ -7001,6 +7304,11 @@ async function fetchMaintenancePlan(fy, opts = {}) {
       inspectedOn: insp ? String(insp.inspected_on).slice(0, 10) : null,
       remaining, remainingBasis, assessed,
       dueYear: assessed ? fyStartYear + Math.max(0, remaining) : null,
+      // What the register screen needs to know whether this component can be
+      // removed — the same three things the BEFORE DELETE trigger checks.
+      sortOrder: a.sort_order == null ? 0 : Number(a.sort_order),
+      inspectionCount: inspectionCountByAsset[a.id] || 0,
+      reserveEntryCount: entries.filter((e) => e.asset_id === a.id).length,
     };
   });
 
@@ -7400,7 +7708,77 @@ function UsageTrends({ fy }) {
 // the change cascades to bank transactions, ops expenses, additional charges and
 // resident deduction claims in one transaction — a plain UPDATE here would leave
 // historic records pointing at a name that no longer exists.
+// ---------- Your login ----------
+// Self-service password change for whoever is signed in. Deliberately not a
+// trustee-management screen: nobody sets anybody else's password, so there is
+// no path here for one trustee to take over another's approval rights.
+function YourLogin() {
+  const { role, loading } = useTrusteeRole();
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    ensureSupabaseClient()
+      .then((c) => c.auth.getUser())
+      .then(({ data }) => { if (!cancelled && data && data.user) setEmail(data.user.email || ""); })
+      .catch((err) => console.error("Could not read the signed-in user:", err));
+    return () => { cancelled = true; };
+  }, []);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setNotice(null); setError(null);
+    if (pw.length < 8) { setError("Use at least 8 characters."); return; }
+    if (pw !== confirm) { setError("The two passwords don't match."); return; }
+    setBusy(true);
+    const err = await changeOwnPassword(pw);
+    if (err) { setError(err); } else {
+      setPw(""); setConfirm("");
+      setNotice("Password changed. It applies the next time you sign in — this session stays open.");
+    }
+    setBusy(false);
+  };
+
+  const inp = { ...inputStyle, width: 240, textAlign: "left", fontFamily: "inherit" };
+  return (
+    <Card style={{ marginTop: 16 }}>
+      <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Your login</div>
+      <p style={{ fontSize: 12, color: "#94A0AC", marginTop: 0, marginBottom: 14, lineHeight: 1.6 }}>
+        Signed in as <b>{email || "…"}</b>
+        {!loading && <> — {ROLE_LABELS[role] || ROLE_LABELS.finance}.</>}
+        <br />
+        Set your own password here. Nobody else can set it for you, and changing it does not sign you out.
+      </p>
+      <form onSubmit={submit} style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+        {/* Helps password managers associate the entry with this account. */}
+        <input type="email" value={email} autoComplete="username" readOnly hidden />
+        <div>
+          <div style={{ fontSize: 11, color: "#64748B" }}>New password</div>
+          <input type="password" style={inp} value={pw} autoComplete="new-password"
+                 onChange={(e) => setPw(e.target.value)} />
+        </div>
+        <div>
+          <div style={{ fontSize: 11, color: "#64748B" }}>Confirm</div>
+          <input type="password" style={inp} value={confirm} autoComplete="new-password"
+                 onChange={(e) => setConfirm(e.target.value)} />
+        </div>
+        <button type="submit" style={primaryBtn} disabled={busy || !pw || !confirm}>
+          {busy ? "Saving…" : "Change password"}
+        </button>
+      </form>
+      {notice && <div style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600, marginTop: 12 }}>{notice}</div>}
+      {error && <div style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600, marginTop: 12 }}>{error}</div>}
+    </Card>
+  );
+}
+
 function Config({ expenseCategories, setExpenseCategories }) {
+  const canWriteFinance = useCanWriteFinance();
   const [usage, setUsage] = useState({});
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -7518,6 +7896,21 @@ function Config({ expenseCategories, setExpenseCategories }) {
   const th = { padding: "6px 8px", color: "#64748B", fontSize: 10.5, textTransform: "uppercase", textAlign: "left" };
   const linkBtn = { background: "none", border: "none", padding: 0, fontSize: 11.5, fontWeight: 700, color: "#2A3E7A", cursor: "pointer", textDecoration: "underline" };
 
+  // The approving and maintenance trustees reach Config only for their own
+  // password. Showing them a category editor the database would refuse every
+  // write from would be an invitation to a policy error.
+  if (!canWriteFinance) {
+    return (
+      <>
+        <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Config</h1>
+        <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
+          Expense categories, AGM report figures and the other scheme settings are maintained by the finance trustee.
+        </p>
+        <YourLogin />
+      </>
+    );
+  }
+
   return (
     <>
       <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Config — expense categories</h1>
@@ -7591,6 +7984,7 @@ function Config({ expenseCategories, setExpenseCategories }) {
       </Card>
 
       <AgmReportSettings />
+      <YourLogin />
     </>
   );
 }
@@ -8787,11 +9181,17 @@ function StatementPreview({
   // Only one half prints at a time — a statement is a document sent to one
   // person, and printing both onto one page would send each owner the other's.
   const [printing, setPrinting] = useState(null); // null | "outgoing" | "incoming"
+  const gate = useStatementReleaseGate(period);
   const printHalf = (which) => {
+    if (!gate.released) return;
     setPrinting(which);
     // Let the class land before the print dialog reads the DOM.
     setTimeout(() => { printStatement(); setTimeout(() => setPrinting(null), 0); }, 50);
   };
+  const printWhole = () => { if (gate.released) printStatement(); };
+  // Disabled rather than hidden: the trustee needs to see that the action
+  // exists and why it is unavailable, not wonder where it went.
+  const releaseBtn = (base) => (gate.released ? base : { ...base, opacity: 0.45, cursor: "not-allowed" });
 
   return (
     <>
@@ -8800,6 +9200,11 @@ function StatementPreview({
         <select value={selectedUnit} onChange={(e) => setSelectedUnit(e.target.value)} style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #D8D0BE" }}>
           {UNITS.map((u) => <option key={u.id} value={u.id}>{u.id} — {u.owner}</option>)}
         </select>
+      </div>
+
+      <div className="no-print">
+        <ApprovalCheckbox subject="statements" period={period} />
+        <StatementReleaseGate gate={gate} period={period} />
       </div>
 
       {split ? (
@@ -8825,7 +9230,10 @@ function StatementPreview({
               </div>
               <StatementPaper r={half} period={period} />
               <div className="no-print" style={{ marginTop: 12, display: "flex", gap: 10 }}>
-                <button style={secondaryBtn} onClick={() => printHalf(key)}>Download {half.proRata.label.toLowerCase()} PDF</button>
+                <button style={releaseBtn(secondaryBtn)} onClick={() => printHalf(key)} disabled={!gate.released}
+                        title={gate.released ? undefined : gate.blockedReason}>
+                  Download {half.proRata.label.toLowerCase()} PDF
+                </button>
               </div>
             </div>
           ))}
@@ -8834,8 +9242,14 @@ function StatementPreview({
         <>
           <StatementPaper r={r} period={period} />
           <div className="no-print" style={{ marginTop: 16, display: "flex", gap: 10 }}>
-            <button style={primaryBtn}>Send to {r.owner}</button>
-            <button style={secondaryBtn} onClick={printStatement}>Download PDF</button>
+            <button style={releaseBtn(primaryBtn)} disabled={!gate.released}
+                    title={gate.released ? undefined : gate.blockedReason}>
+              Send to {r.owner}
+            </button>
+            <button style={releaseBtn(secondaryBtn)} onClick={printWhole} disabled={!gate.released}
+                    title={gate.released ? undefined : gate.blockedReason}>
+              Download PDF
+            </button>
           </div>
         </>
       )}
@@ -9938,17 +10352,18 @@ function MaintenancePlan() {
   const [notice, setNotice] = useState(null);
   const [edits, setEdits] = useState({});          // assetId -> patch
   const [inspectFor, setInspectFor] = useState(null);
-  const [entry, setEntry] = useState({ entry_date: TODAY_ISO, entry_type: "contribution", amount: "", description: "" });
-  const [reserveRows, setReserveRows] = useState([]);
+  const [newComponent, setNewComponent] = useState({ name: "", category: "", code: "", location: "" });
+  const canManage = useCanManageMaintenance();
   const fy = FY_ACTIVE;
 
+  // The reserve ledger is no longer fetched here — only the plan, which already
+  // carries the balance it was computed net of. See ReserveFund on the
+  // Financial dashboard.
   const load = async () => {
     setStatus("loading");
     try {
-      const [p, client] = [await fetchMaintenancePlan(fy), await ensureSupabaseClient()];
-      const r = await client.from("reserve_fund_entries").select("*").order("entry_date", { ascending: false });
-      if (r.error) throw r.error;
-      setPlan(p); setReserveRows(r.data || []); setStatus("ready");
+      const p = await fetchMaintenancePlan(fy);
+      setPlan(p); setStatus("ready");
     } catch (err) {
       console.error("Loading the maintenance plan failed:", err);
       setStatus("error");
@@ -10009,25 +10424,66 @@ function MaintenancePlan() {
     setSaving(null);
   };
 
-  const addReserveEntry = async () => {
-    const amount = parseAmount(entry.amount);
-    if (!amount) { setNotice("Enter an amount."); return; }
-    setSaving("reserve"); setNotice(null);
+  // ---------- Adding and removing components ----------
+  // Removal is guarded in the database by a BEFORE DELETE trigger, not here —
+  // the maintenance trustee can write to assets through the API and the UI is
+  // not a control. This only avoids offering a button that would fail.
+  const addComponent = async () => {
+    const name = (newComponent.name || "").trim();
+    const category = (newComponent.category || "").trim();
+    if (!name || !category) { setNotice("A component needs a name and a category."); return; }
+    setSaving("add"); setNotice(null);
     try {
       const client = await ensureSupabaseClient();
-      const { error } = await client.from("reserve_fund_entries").insert({
-        entry_date: entry.entry_date, financial_year: fy, entry_type: entry.entry_type,
-        // A drawdown is stored as a positive amount with its type carrying the
-        // sign, so the ledger reads the way a bank statement does.
-        amount: Math.abs(amount), description: entry.description || null,
+      const maxSort = Math.max(0, ...plan.rows.map((r) => Number(r.sortOrder || 0)));
+      const { error } = await client.from("assets").insert({
+        name, category,
+        code: (newComponent.code || "").trim() || null,
+        location: (newComponent.location || "").trim() || null,
+        status: "not_assessed", active: true, sort_order: maxSort + 1,
       });
       if (error) throw error;
-      setEntry({ entry_date: TODAY_ISO, entry_type: "contribution", amount: "", description: "" });
-      setNotice("Reserve fund entry added.");
+      setNewComponent({ name: "", category: "", code: "", location: "" });
+      setNotice(`Added "${name}". It carries no provision until it has an expected life and a replacement cost.`);
       await load();
     } catch (err) {
-      console.error("Adding the reserve entry failed:", err);
-      setNotice("Adding the entry failed — see browser console.");
+      console.error("Adding the component failed:", err);
+      setNotice(err.message || "Adding the component failed — see browser console.");
+    }
+    setSaving(null);
+  };
+
+  // Mirrors the trigger's rule so the button can explain itself before it is
+  // pressed. The trigger remains the authority; if these two ever disagree the
+  // database wins and the user sees its message.
+  const captureBlocking = (r) => {
+    const reasons = [];
+    if (r.inspectionCount) reasons.push(`${r.inspectionCount} inspection${r.inspectionCount === 1 ? "" : "s"}`);
+    if (r.reserveEntryCount) reasons.push(`${r.reserveEntryCount} reserve entr${r.reserveEntryCount === 1 ? "y" : "ies"}`);
+    if (r.cost != null) reasons.push("a replacement cost");
+    if (r.expectedLife != null) reasons.push("an expected life");
+    return reasons;
+  };
+
+  const removeComponent = async (r) => {
+    const blocking = captureBlocking(r);
+    if (blocking.length) {
+      setNotice(`"${r.name}" has ${blocking.join(", ")} captured against it, so it can't be removed. Clear those first, or leave it on the register.`);
+      return;
+    }
+    if (!window.confirm(`Remove "${r.name}" from the component register?\n\nNothing has been captured against it, so nothing is lost.`)) return;
+    setSaving("remove"); setNotice(null);
+    try {
+      const client = await ensureSupabaseClient();
+      const { error } = await client.from("assets").delete().eq("id", r.id);
+      if (error) throw error;
+      setNotice(`Removed "${r.name}".`);
+      await load();
+    } catch (err) {
+      console.error("Removing the component failed:", err);
+      // The trigger's message names what is captured, which is more useful
+      // than anything this layer could invent.
+      setNotice(err.message || "Removing the component failed — see browser console.");
     }
     setSaving(null);
   };
@@ -10047,9 +10503,9 @@ function MaintenancePlan() {
 
   return (
     <>
-      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Maintenance plan & reserve fund</h1>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Maintenance plan</h1>
       <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
-        The component register behind the statutory ten-year plan. Section 13 of the AGM report is computed from exactly this data — capture it once here and it appears in the report. A component needs <strong>an expected life and a replacement cost</strong> before it can carry a provision; everything else sharpens the estimate.
+        The component register behind the statutory ten-year plan. Section 13 of the AGM report is computed from exactly this data — capture it once here and it appears in the report. A component needs <strong>an expected life and a replacement cost</strong> before it can carry a provision; everything else sharpens the estimate. The reserve fund ledger is on the <b>Financial dashboard</b>.
       </p>
 
       {notice && (
@@ -10111,9 +10567,33 @@ function MaintenancePlan() {
                       <td style={{ ...td, textAlign: "right" }}>{r.remaining == null ? "—" : `${r.remaining}y`}</td>
                       <td style={{ ...td, textAlign: "right", fontWeight: r.annualProvision ? 600 : 400 }}>{r.annualProvision == null ? "—" : money(r.annualProvision)}</td>
                       <td style={td}>
-                        <button style={{ ...secondaryBtn, padding: "3px 8px", fontSize: 11.5 }} onClick={() => setInspectFor(inspectFor === r.id ? null : r.id)}>
-                          {inspectFor === r.id ? "Close" : "Inspect"}
-                        </button>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <button style={{ ...secondaryBtn, padding: "3px 8px", fontSize: 11.5 }} onClick={() => setInspectFor(inspectFor === r.id ? null : r.id)}>
+                            {inspectFor === r.id ? "Close" : "Inspect"}
+                          </button>
+                          {canManage && (() => {
+                            const blocking = captureBlocking(r);
+                            const locked = blocking.length > 0;
+                            return (
+                              <button
+                                type="button"
+                                onClick={() => removeComponent(r)}
+                                disabled={saving === "remove"}
+                                aria-label={`Remove ${r.name}`}
+                                title={locked
+                                  ? `Can't be removed — has ${blocking.join(", ")} captured against it`
+                                  : `Remove ${r.name}`}
+                                style={{
+                                  border: "1px solid #E3D9C6", background: "#FFF",
+                                  color: locked ? "#C3BCAD" : "#B5651D",
+                                  borderRadius: 6, width: 24, height: 24, lineHeight: "20px",
+                                  fontSize: 14, padding: 0,
+                                  cursor: locked ? "not-allowed" : "pointer",
+                                }}
+                              >{locked ? "🔒" : "×"}</button>
+                            );
+                          })()}
+                        </div>
                       </td>
                     </tr>
                     {inspectFor === r.id && (
@@ -10129,51 +10609,177 @@ function MaintenancePlan() {
         </div>
         <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 10 }}>
           A shaded row is not yet assessed and contributes nothing to the plan. Remaining life comes from the latest inspection where one gives a revised figure, otherwise from age against the expected life.
+          {canManage && <> A component showing 🔒 has an inspection, a tagged reserve entry, a replacement cost or an expected life captured against it and cannot be removed — it is carrying history or a provision.</>}
         </div>
-      </Card>
 
-      <Card>
-        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Reserve fund ledger</div>
-        <div style={{ fontSize: 12, color: "#94A0AC", marginBottom: 12 }}>
-          Notional — book entries against the main FNB account, not a separate bank account. Balance <strong>{money(plan.reserve.balance)}</strong> across {plan.reserve.entryCount} entr{plan.reserve.entryCount === 1 ? "y" : "ies"}.
-        </div>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
-          <div><div style={{ fontSize: 11, color: "#64748B" }}>Date</div>
-            <input type="date" style={{ ...inp, width: 150 }} value={entry.entry_date} onChange={(e) => setEntry({ ...entry, entry_date: e.target.value })} /></div>
-          <div><div style={{ fontSize: 11, color: "#64748B" }}>Type</div>
-            <select style={{ ...inp, width: 140 }} value={entry.entry_type} onChange={(e) => setEntry({ ...entry, entry_type: e.target.value })}>
-              <option value="opening">Opening balance</option><option value="contribution">Contribution</option>
-              <option value="interest">Interest</option><option value="drawdown">Drawdown</option><option value="adjustment">Adjustment</option>
-            </select></div>
-          <div><div style={{ fontSize: 11, color: "#64748B" }}>Amount</div>
-            <input style={{ ...inp, width: 120 }} inputMode="decimal" value={entry.amount} onChange={(e) => setEntry({ ...entry, amount: e.target.value })} /></div>
-          <div style={{ flex: 1, minWidth: 200 }}><div style={{ fontSize: 11, color: "#64748B" }}>Description</div>
-            <input style={inp} value={entry.description} onChange={(e) => setEntry({ ...entry, description: e.target.value })} /></div>
-          <button style={primaryBtn} onClick={addReserveEntry} disabled={saving === "reserve"}>{saving === "reserve" ? "Adding…" : "Add entry"}</button>
-        </div>
-        {reserveRows.length === 0 ? (
-          <div style={{ fontSize: 12.5, color: "#64748B" }}>
-            No entries. The reserve fund does not exist yet — until it does, the whole replacement cost of every component has to be funded from future contributions, which is why the annual figure above is as large as it is.
+        {canManage && (
+          <div style={{ marginTop: 16, borderTop: "1px solid #EEE7D6", paddingTop: 14 }}>
+            <div style={{ fontWeight: 700, fontSize: 12.5, marginBottom: 8 }}>Add a component</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+              <div style={{ flex: 2, minWidth: 180 }}>
+                <div style={{ fontSize: 11, color: "#64748B" }}>Name</div>
+                <input style={inp} value={newComponent.name} placeholder="e.g. Driveway gate motor"
+                       onChange={(e) => setNewComponent({ ...newComponent, name: e.target.value })} />
+              </div>
+              <div style={{ flex: 1, minWidth: 140 }}>
+                <div style={{ fontSize: 11, color: "#64748B" }}>Category</div>
+                <input style={inp} list="asset-categories" value={newComponent.category} placeholder="e.g. Security"
+                       onChange={(e) => setNewComponent({ ...newComponent, category: e.target.value })} />
+                {/* Existing categories offered rather than enforced — the
+                    register groups by this text, so a typo makes a new group. */}
+                <datalist id="asset-categories">
+                  {[...new Set(plan.rows.map((r) => r.category).filter(Boolean))].map((c) => <option key={c} value={c} />)}
+                </datalist>
+              </div>
+              <div style={{ width: 110 }}>
+                <div style={{ fontSize: 11, color: "#64748B" }}>Code</div>
+                <input style={inp} value={newComponent.code}
+                       onChange={(e) => setNewComponent({ ...newComponent, code: e.target.value })} />
+              </div>
+              <div style={{ flex: 1, minWidth: 130 }}>
+                <div style={{ fontSize: 11, color: "#64748B" }}>Location</div>
+                <input style={inp} value={newComponent.location}
+                       onChange={(e) => setNewComponent({ ...newComponent, location: e.target.value })} />
+              </div>
+              <button style={primaryBtn} onClick={addComponent} disabled={saving === "add"}>
+                {saving === "add" ? "Adding…" : "Add component"}
+              </button>
+            </div>
+            <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 8 }}>
+              A new component starts unassessed and carries no provision. Give it an expected life and a replacement cost above, and it joins the ten-year plan — and can no longer be removed.
+            </div>
           </div>
-        ) : (
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead><tr><th style={th}>Date</th><th style={th}>Type</th><th style={th}>Description</th><th style={{ ...th, textAlign: "right" }}>Amount</th></tr></thead>
-            <tbody>
-              {reserveRows.map((e) => (
-                <tr key={e.id}>
-                  <td style={td}>{String(e.entry_date).slice(0, 10)}</td>
-                  <td style={td}>{e.entry_type}</td>
-                  <td style={td}>{e.description || "—"}</td>
-                  <td style={{ ...td, textAlign: "right", color: e.entry_type === "drawdown" ? "#9B2C2C" : "#2F5D50" }}>
-                    {e.entry_type === "drawdown" ? "−" : ""}{money(Math.abs(Number(e.amount)))}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         )}
       </Card>
+
+      {/* The reserve fund ledger used to sit here. It moved to the Financial
+          dashboard on 11 August 2026: it is money, not a component, and the
+          people who maintain the register are not the people who move funds.
+          The balance stays on the summary above because the plan's annual
+          contribution is computed net of it — the figure would be unreadable
+          without it. */}
+      <Card style={{ background: "#F4F1E9" }}>
+        <div style={{ fontSize: 12.5, color: "#64748B", lineHeight: 1.7 }}>
+          <b>The reserve fund ledger is on the Financial dashboard.</b>{" "}
+          Balance <strong>{money(plan.reserve.balance)}</strong> across {plan.reserve.entryCount} entr{plan.reserve.entryCount === 1 ? "y" : "ies"},
+          already netted off the annual contribution above. Section 13 of the AGM report still reports the plan and the reserve together, because PMR 22 ties them together.
+        </div>
+      </Card>
     </>
+  );
+}
+
+// ---------- Reserve fund ledger (Financial dashboard) ----------
+// Split out of the Maintenance page on 11 August 2026. Notional entries — book
+// movements against the main FNB account, not a separate bank account.
+//
+// It reads its balance through fetchMaintenancePlan rather than summing the
+// ledger itself, so the number here and the number the plan is computed net of
+// are the same number, arrived at once.
+function ReserveFund() {
+  const [plan, setPlan] = useState(null);
+  const [rows, setRows] = useState([]);
+  const [status, setStatus] = useState("loading"); // loading | ready | error
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState(null);
+  const [entry, setEntry] = useState({ entry_date: TODAY_ISO, entry_type: "contribution", amount: "", description: "" });
+  const fy = FY_ACTIVE;
+
+  const load = async () => {
+    setStatus("loading");
+    try {
+      const client = await ensureSupabaseClient();
+      const [p, r] = await Promise.all([
+        fetchMaintenancePlan(fy),
+        client.from("reserve_fund_entries").select("*").order("entry_date", { ascending: false }),
+      ]);
+      if (r.error) throw r.error;
+      setPlan(p); setRows(r.data || []); setStatus("ready");
+    } catch (err) {
+      console.error("Loading the reserve fund failed:", err);
+      setStatus("error");
+    }
+  };
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const addEntry = async () => {
+    const amount = parseAmount(entry.amount);
+    if (!amount) { setNotice("Enter an amount."); return; }
+    setSaving(true); setNotice(null);
+    try {
+      const client = await ensureSupabaseClient();
+      const { error } = await client.from("reserve_fund_entries").insert({
+        entry_date: entry.entry_date, financial_year: fy, entry_type: entry.entry_type,
+        // A drawdown is stored as a positive amount with its type carrying the
+        // sign, so the ledger reads the way a bank statement does.
+        amount: Math.abs(amount), description: entry.description || null,
+      });
+      if (error) throw error;
+      setEntry({ entry_date: TODAY_ISO, entry_type: "contribution", amount: "", description: "" });
+      setNotice("Reserve fund entry added.");
+      await load();
+    } catch (err) {
+      console.error("Adding the reserve entry failed:", err);
+      setNotice("Adding the entry failed — see browser console.");
+    }
+    setSaving(false);
+  };
+
+  const money = (n) => (n == null ? "—" : `R ${Number(n).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  const th = { padding: "6px 8px", textAlign: "left", fontSize: 11, textTransform: "uppercase", color: "#64748B" };
+  const td = { padding: "5px 8px", borderTop: "1px solid #F0EADC", fontSize: 12.5 };
+  const inp = { ...inputStyle, padding: "4px 6px", fontSize: 12.5, width: "100%", boxSizing: "border-box" };
+
+  if (status === "loading") return <Card style={{ marginTop: 16 }}><div style={{ fontSize: 13, color: "#64748B" }}>Loading the reserve fund…</div></Card>;
+  if (status === "error") return <Card style={{ marginTop: 16 }}><div style={{ fontSize: 13, color: "#B5651D" }}>Could not load the reserve fund — see browser console.</div></Card>;
+
+  return (
+    <Card style={{ marginTop: 16 }}>
+      <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 4 }}>Reserve fund ledger</div>
+      <div style={{ fontSize: 12, color: "#94A0AC", marginBottom: 12 }}>
+        Notional — book entries against the main FNB account, not a separate bank account. Balance <strong>{money(plan.reserve.balance)}</strong> across {plan.reserve.entryCount} entr{plan.reserve.entryCount === 1 ? "y" : "ies"}.
+        The ten-year plan on <b>Maintenance plan</b> is computed net of this balance.
+      </div>
+
+      {notice && <div style={{ fontSize: 12.5, fontWeight: 600, color: "#2F5D50", marginBottom: 10 }}>{notice}</div>}
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
+        <div><div style={{ fontSize: 11, color: "#64748B" }}>Date</div>
+          <input type="date" style={{ ...inp, width: 150 }} value={entry.entry_date} onChange={(e) => setEntry({ ...entry, entry_date: e.target.value })} /></div>
+        <div><div style={{ fontSize: 11, color: "#64748B" }}>Type</div>
+          <select style={{ ...inp, width: 140 }} value={entry.entry_type} onChange={(e) => setEntry({ ...entry, entry_type: e.target.value })}>
+            <option value="opening">Opening balance</option><option value="contribution">Contribution</option>
+            <option value="interest">Interest</option><option value="drawdown">Drawdown</option><option value="adjustment">Adjustment</option>
+          </select></div>
+        <div><div style={{ fontSize: 11, color: "#64748B" }}>Amount</div>
+          <input style={{ ...inp, width: 120 }} inputMode="decimal" value={entry.amount} onChange={(e) => setEntry({ ...entry, amount: e.target.value })} /></div>
+        <div style={{ flex: 1, minWidth: 200 }}><div style={{ fontSize: 11, color: "#64748B" }}>Description</div>
+          <input style={inp} value={entry.description} onChange={(e) => setEntry({ ...entry, description: e.target.value })} /></div>
+        <button style={primaryBtn} onClick={addEntry} disabled={saving}>{saving ? "Adding…" : "Add entry"}</button>
+      </div>
+
+      {rows.length === 0 ? (
+        <div style={{ fontSize: 12.5, color: "#64748B" }}>
+          No entries. The reserve fund does not exist yet — until it does, the whole replacement cost of every component has to be funded from future contributions, which is what makes the statutory annual figure as large as it is.
+        </div>
+      ) : (
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><th style={th}>Date</th><th style={th}>Type</th><th style={th}>Description</th><th style={{ ...th, textAlign: "right" }}>Amount</th></tr></thead>
+          <tbody>
+            {rows.map((e) => (
+              <tr key={e.id}>
+                <td style={td}>{String(e.entry_date).slice(0, 10)}</td>
+                <td style={td}>{e.entry_type}</td>
+                <td style={td}>{e.description || "—"}</td>
+                <td style={{ ...td, textAlign: "right", color: e.entry_type === "drawdown" ? "#9B2C2C" : "#2F5D50" }}>
+                  {e.entry_type === "drawdown" ? "−" : ""}{money(Math.abs(Number(e.amount)))}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Card>
   );
 }
 

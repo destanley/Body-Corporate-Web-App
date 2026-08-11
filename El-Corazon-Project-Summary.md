@@ -73,6 +73,77 @@ Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 20
 
 ---
 
+## Done on 11 August 2026, session 15 — the levy figure, the reserve fund, and three trustees
+
+### 1. "Levies collected" included bank interest
+
+`leviesCollected` summed **every** income row — Owner Contributions, Interest Earned *and* Other Credits — and fed that straight into `reserveFundFloor()` as the PMR 22 base. Interest is not a levy. For FY 2025/2026 the bank paid about **R10,670.85**, all of it inflating the 25% reserve threshold the meeting is held to.
+
+- Now reads the **Owner Contributions row only**, found via a new `INCOME_OWNER_CONTRIBUTIONS` constant rather than a label matched by hand — matching by hand in one more place is how it came to be summed with interest to begin with. Anything that is not an owner contribution is excluded *by construction*, so a new income row added later cannot quietly rejoin the calculation.
+- **Only one consumer**, so the fix propagates completely: `reserveFundFloor()` → section 13's statutory-minimum table → the per-unit-per-month figure. Checked; there is no second path.
+- The report line is relabelled **"Owner contributions collected in FY …"**. The old label was sitting over a number that was not what it said.
+- `docs/budget-FY2026-2027.md` carries a correction note. **The conclusion is unchanged** — the reserve holds R0.00, so the floor bites either way — but the threshold and therefore the shortfall come *down*. Regenerate the pack before quoting figures.
+
+### 2. Reserve fund split onto the Financial dashboard
+
+New `ReserveFund` component: ledger, balance, entry capture. The Maintenance page keeps the register and the ten-year plan and now shows only a pointer plus the balance, because the annual contribution is computed *net* of it and would be unreadable without it.
+
+It reads its balance through `fetchMaintenancePlan` rather than summing the ledger itself, so the number on the dashboard and the number the plan is netted against are the same number arrived at once. AGM section 13 still reports plan and reserve together — PMR 22 ties them together, so splitting the section would separate the floor from the plan that justifies it.
+
+### 3. Three trustees, enforced in the database
+
+`is_trustee()` was a flat yes/no and every table carried one `FOR ALL` policy built on it. **A second person approving the first person's figures is only a control if the approver cannot also edit them**, so the roles are enforced by RLS, not by hiding buttons.
+
+| Role | Writes |
+|---|---|
+| `finance` (Devon) | everything, as today — and it is the column **default**, so no existing or future trustee is locked out by omission |
+| `approver` | `approvals` only |
+| `maintenance` | `assets`, `asset_inspections`, `maintenance_plan_snapshots` only |
+
+Read stays open to every trustee on purpose: an approver who cannot see the levy grid cannot meaningfully approve it. The separation is of **duties**, not visibility — this is a seven-unit scheme, not a bank.
+
+The 28 flat policies were rewritten as read + role-scoped-write pairs **by a loop, not by hand** — a table missed by hand would keep its old flat policy and stay writable by everyone, which is the exact failure the change exists to prevent. It also drops whatever the old policy happened to be called; the names had drifted (`trustee_all`, `assets_trustee`, `manual_payments_trustee_all`). Result: 25 tables on `can_write_finance()`, 3 on `can_manage_maintenance()`, 1 on `can_approve()`.
+
+**Approvals.** `subject` × `scope`, where scope is deliberately *not* always a month: the levy grid and insurance schedule are set once a financial year and a monthly tick-box against them would be theatre — twelve approvals of one unchanged decision. Readings and statements genuinely are monthly. Withdrawing deletes the row, so "approved" is simply the presence of a record and there is no third state to reason about at the moment statements are released.
+
+One `ApprovalCheckbox` on all four screens, so they cannot drift apart in wording or behaviour.
+
+**The gate.** Statement generation, printing and sending are disabled until all four are in, with a banner naming what is outstanding. Two decisions worth recording:
+
+- It **re-reads approvals from the database**, not from the four screens' state — the approving trustee may be signing off in another browser, and a gate computed from this tab's stale state is not a gate.
+- It **fails closed**. An approvals table that cannot be read is not evidence that everything was approved.
+
+Buttons are disabled rather than hidden, so the trustee sees the action exists and why it is unavailable instead of wondering where it went.
+
+**Register add/remove.** Adding is a form under the register; a new component starts unassessed and carries no provision. Removal is blocked once anything is captured — an inspection, a tagged reserve entry, a replacement cost, or an expected life. The last matters because an assessed component is carrying a provision, so removing it changes the statutory figure.
+
+**Guarded by a BEFORE DELETE trigger, not by the UI.** The maintenance trustee has write access to `assets` by policy and could otherwise delete through the API — and `asset_inspections` cascades, so the loss would be silent and total. The UI mirrors the rule only so the button can explain itself before it is pressed; if the two ever disagree, the database wins and its message is what the user sees.
+
+**Passwords.** `YourLogin` on Config, using `auth.updateUser`. Deliberately not a trustee-management screen: nobody sets anybody else's password, so there is no path for one trustee to take over another's approval rights. SideNav filters by role, and Config falls back to just this card for the two new roles rather than showing a category editor every write would be refused from.
+
+### Verified
+`esbuild` parse clean. Role policies tested by creating two throwaway auth users and running each attempt as `authenticated` with a real `auth.uid()` — the way they actually run, not as the service role:
+
+| Actor | Attempt | Result |
+|---|---|---|
+| approver | write approvals | allowed ✓ |
+| approver | read levy figures | allowed ✓ |
+| approver | edit levy figures | **denied** ✓ |
+| approver | edit insurance | **denied** ✓ |
+| approver | add reserve entry | **denied** ✓ |
+| maintenance | edit register | allowed ✓ |
+| maintenance | approve statements | **denied** ✓ |
+| maintenance | edit levy figures | **denied** ✓ |
+
+Delete guard tested both ways: an untouched component deletes cleanly, one with a replacement cost raises `restrict_violation`. All test users, trustees rows, approvals and assets removed afterwards — back to 1 trustee, 0 approvals, 27 assets.
+
+> **`npm run build` still has to be run locally.** The sandbox can't — `node_modules` carries the Windows rollup binary.
+
+### Outstanding — manual step
+Auth users cannot be created from SQL. In the Supabase dashboard under **Authentication → Users**, create or invite the two logins, then insert them into `trustees` with role `'approver'` and `'maintenance'` (statement at the foot of `migrations/trustee_roles_and_approvals.sql`). They set their own password from Config → Your login, or via the reset email if invited. **Until they exist, nothing changes for Devon** — `finance` is the default and keeps full access.
+
+---
+
 ## Done on 11 August 2026, session 14 — levy line items are trustee-editable
 
 Devon asked to be able to add and remove a levy line from the Levy breakdown grid, carried through the rest of the app, with previous data left intact and the change applied going forward.
