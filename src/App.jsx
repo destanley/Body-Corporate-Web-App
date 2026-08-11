@@ -112,17 +112,42 @@ const COUNCIL_INVOICE_NO_BILL = {
 //   Electricity Network Charge — bill total, +VAT, ÷7
 // The grid stays fully editable — these rules drive the SUGGESTED values and
 // the "fill grid" action on the Levy breakdown page, never a lock.
-const LEVY_ITEMS = [
-  "Insurance",
-  "Blockwatch",
-  "Garden Service",
-  "Common Property Water",
-  "Water Demand Levy",
-  "Sewerage",
-  "Common Property Electricity",
-  "Electricity Service Charge",
-  "Electricity Network Charge",
+//
+// The list itself is trustee-editable as of 11 August 2026 and lives in
+// `levy_item_definitions`, keyed by financial year. The nine below are the
+// seed and the offline fallback; `LEVY_ITEM_DEFS` and `LEVY_ITEMS` are swapped
+// module-wide once the definitions for the selected FY have loaded, the same
+// way UNITS is (see the UNITS comment). Everything that renders or totals a
+// levy reads `LEVY_ITEMS`, so it all follows the swap without knowing about it.
+//
+// `system_key` is what code matches on when it needs a SPECIFIC line — never
+// the label, which the trustee owns. A line the trustee added has none.
+const LEVY_ITEM_DEFS_DEFAULT = [
+  { label: "Insurance", systemKey: "insurance", sortOrder: 1, active: true },
+  { label: "Blockwatch", systemKey: "blockwatch", sortOrder: 2, active: true },
+  { label: "Garden Service", systemKey: "garden_service", sortOrder: 3, active: true },
+  { label: "Common Property Water", systemKey: "common_property_water", sortOrder: 4, active: true },
+  { label: "Water Demand Levy", systemKey: "water_demand_levy", sortOrder: 5, active: true },
+  { label: "Sewerage", systemKey: "sewerage", sortOrder: 6, active: true },
+  { label: "Common Property Electricity", systemKey: "common_property_electricity", sortOrder: 7, active: true },
+  { label: "Electricity Service Charge", systemKey: "electricity_service_charge", sortOrder: 8, active: true },
+  { label: "Electricity Network Charge", systemKey: "electricity_network_charge", sortOrder: 9, active: true },
 ];
+
+// Every definition for the loaded FY, removed lines included — the AGM pack
+// still reports what was levied in a year after a line has been dropped.
+let LEVY_ITEM_DEFS = LEVY_ITEM_DEFS_DEFAULT.slice();
+// The labels that are actually billed, in statement order. This is the binding
+// every existing call site uses.
+let LEVY_ITEMS = LEVY_ITEM_DEFS_DEFAULT.filter((d) => d.active).map((d) => d.label);
+
+// Resolve a built-in line to whatever it is currently called, or null if the
+// trustee has removed it. Callers must handle null rather than assume the line
+// exists — that is the whole point of it being removable.
+const levyLabelForSystemKey = (key, defs = LEVY_ITEM_DEFS) => {
+  const d = defs.find((x) => x.systemKey === key && x.active);
+  return d ? d.label : null;
+};
 
 // The levy grid is fully manual (trustee rule change, 12 July 2026): every
 // line item for every unit is editable on the Levy breakdown page and
@@ -1004,7 +1029,17 @@ function computeStatementRow(data) {
   const utilitiesDue = subTotal + vat;
 
   const levyItems = data.levyItems || {};
-  const levy = LEVY_ITEMS.reduce((s, item) => s + (Number(levyItems[item]) || 0), 0);
+  // The resident portal never loads the trustee app's data, so it cannot use
+  // the LEVY_ITEMS module binding — that would be whatever the source-code
+  // default is, and any line not in it was dropped from the resident's total
+  // in silence. The RPC returns the order for the statement's own financial
+  // year; the keys it actually returned are the fallback, so the total is
+  // always over everything billed rather than over a list held elsewhere.
+  const levyOrder = Array.isArray(data.levyItemOrder) && data.levyItemOrder.length
+    ? data.levyItemOrder.filter((l) => l in levyItems)
+    : [];
+  const levyLines = [...levyOrder, ...Object.keys(levyItems).filter((l) => !levyOrder.includes(l))];
+  const levy = levyLines.reduce((s, item) => s + (Number(levyItems[item]) || 0), 0);
   const extras = (data.additionalCharges || []).map((c, i) => ({ id: `ac${i}`, description: c.description, amount: Number(c.amount) || 0 }));
   const additionalTotal = extras.reduce((s, e) => s + e.amount, 0);
   const total = levy + utilitiesDue + additionalTotal;
@@ -1035,7 +1070,7 @@ function computeStatementRow(data) {
     waterCost, elecCost, waterCostComputed, elecCostComputed,
     waterOverridden: ov.waterDue != null, elecOverridden: ov.electricityDue != null,
     subTotal, vat, utilitiesDue,
-    levy, levyItems, extras, additionalTotal, total,
+    levy, levyItems, levyLines, extras, additionalTotal, total,
     deduction, payment,
   };
 }
@@ -1159,7 +1194,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   // Statement inputs (readings, levy, charges, council, remittances) are for the
   // statement `period`; the bank statement + transactions are for the following
   // month (`paymentPeriod`), because that's when this period's levies are paid.
-  const [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats, ownerChanges] = await Promise.all([
+  const [bands, elec, vat, levy, manual, itemDefs, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats, ownerChanges] = await Promise.all([
     client.from("water_tariff_bands").select("*"),
     // Electricity: most recent effective_from ≤ this period (top 2 for YoY comparison)
     client.from("electricity_rates").select("*").lte("effective_from", period).order("effective_from", { ascending: false }).limit(2),
@@ -1169,6 +1204,9 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     // forward rather than falling back to the source-code defaults.
     client.from("levy_rates").select("*").in("financial_year", [FY_ACTIVE, FY_PREVIOUS]),
     client.from("levy_manual_entries").select("*").in("financial_year", [FY_ACTIVE, FY_PREVIOUS]),
+    // The line item list itself, same two years in the same round trip and for
+    // the same reason: a brand-new FY carries last year's list forward.
+    client.from("levy_item_definitions").select("*").in("financial_year", [FY_ACTIVE, FY_PREVIOUS]),
     client.from("monthly_usage").select("*").eq("period", period),
     // Previous period's readings — their "current" becomes this period's "previous"
     client.from("monthly_usage").select("*").eq("period", prevPeriod(period)),
@@ -1192,7 +1230,7 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     // statement screen produce two statements instead of one.
     client.from("ownership_changes").select("*").eq("period", period),
   ]);
-  const failed = [bands, elec, vat, levy, manual, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats, ownerChanges].find((r) => r.error);
+  const failed = [bands, elec, vat, levy, manual, itemDefs, usage, prevUsage, charges, expenses, invoice, btxns, bdocs, remits, overrides, manualPays, expCats, ownerChanges].find((r) => r.error);
   if (failed) throw failed.error;
 
   const expenseCategories = (expCats.data || []).map((c) => ({
@@ -1245,8 +1283,30 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
   const levyCarriedForward = manualActive.length === 0 && manualPrevious.length > 0;
   const manualRows = manualActive.length ? manualActive : manualPrevious;
 
+  // The line item list for this FY, carried forward from last year when the
+  // year hasn't been set up — the same rule the grid above follows, so the
+  // list and the figures on it can never disagree about which year they are.
+  // Nothing is written until the trustee saves, so last year stays untouched.
+  const defRow = (r) => ({
+    label: r.label,
+    systemKey: r.system_key || null,
+    sortOrder: Number(r.sort_order || 0),
+    active: r.active !== false,
+  });
+  const bySortThenLabel = (a, b) => (a.sortOrder - b.sortOrder) || a.label.localeCompare(b.label);
+  const defsActiveFY = (itemDefs.data || []).filter((d) => d.financial_year === FY_ACTIVE).map(defRow);
+  const defsPrevFY = (itemDefs.data || []).filter((d) => d.financial_year === FY_PREVIOUS).map(defRow);
+  // A carried-forward list drops last year's removed lines rather than
+  // resurrecting them: they were removed going forward, and this is forward.
+  const levyItemDefs = (defsActiveFY.length
+    ? defsActiveFY
+    : (defsPrevFY.length ? defsPrevFY.filter((d) => d.active) : LEVY_ITEM_DEFS_DEFAULT.slice())
+  ).sort(bySortThenLabel);
+  const levyItemsCarriedForward = defsActiveFY.length === 0 && defsPrevFY.length > 0;
+  const activeLabels = levyItemDefs.filter((d) => d.active).map((d) => d.label);
+
   const levyBreakdown = Object.fromEntries(
-    Object.entries(LEVY_BREAKDOWN_DEFAULT).map(([k, v]) => [k, { ...v }])
+    units.map((u) => [u.id, Object.fromEntries(activeLabels.map((l) => [l, 0]))])
   );
   manualRows.forEach((m) => {
     const uid = unitByDbId[m.unit_id];
@@ -1447,6 +1507,8 @@ async function loadAppData(units, period = ACTIVE_PERIOD, paymentPeriod = nextPe
     levyFinancialYear: FY_ACTIVE,
     levyCarriedForward,
     levyCarriedFromFY: levyCarriedForward ? FY_PREVIOUS : null,
+    levyItemDefs,
+    levyItemsCarriedForward,
     readings: Object.keys(readings).length ? readings : READINGS,
     additionalCharges,
     opsExpenses,
@@ -1566,20 +1628,68 @@ async function saveCommonPropertyStandardsToDb({ commonPropertyElectricityKwh, c
 }
 
 // Every grid cell is stored — the levy grid is fully manual.
+//
+// The delete is scoped to the labels being rewritten, NOT to the whole
+// financial year. A removed line keeps its captured amounts (the AGM pack
+// reports on what was actually levied in the year, so those figures cannot be
+// thrown away) and a year-wide delete would have destroyed them on the next
+// save of any cell — quietly, and a month later.
 async function saveLevyBreakdownToDb(levyBreakdown) {
   const client = await ensureSupabaseClient();
+  const labels = LEVY_ITEMS.slice();
   const rows = [];
   UNITS.forEach((u) => {
     if (!u.dbId) return;
-    LEVY_ITEMS.forEach((item) => {
+    labels.forEach((item) => {
       rows.push({ unit_id: u.dbId, financial_year: FY_ACTIVE, item_label: item, amount: levyBreakdown[u.id]?.[item] ?? 0 });
     });
   });
   if (rows.length === 0) throw new Error("Units haven't loaded from the database yet");
-  const { error: delErr } = await client.from("levy_manual_entries").delete().eq("financial_year", FY_ACTIVE);
+  const { error: delErr } = await client.from("levy_manual_entries")
+    .delete().eq("financial_year", FY_ACTIVE).in("item_label", labels);
   if (delErr) throw delErr;
   const { error } = await client.from("levy_manual_entries").insert(rows);
   if (error) throw error;
+}
+
+// Add, remove or restore a levy line for the ACTIVE financial year only.
+//
+// Every write materialises the whole list for FY_ACTIVE first. Until the year
+// is set up it has no rows of its own and is being shown last year's list
+// carried forward; editing that list has to write this year's copy rather than
+// reach back and edit last year's, which is what keeps a closed year closed.
+async function writeLevyItemDefsForActiveFY(defs) {
+  const client = await ensureSupabaseClient();
+  const rows = defs.map((d, i) => ({
+    financial_year: FY_ACTIVE,
+    label: d.label,
+    system_key: d.systemKey || null,
+    sort_order: d.sortOrder != null ? d.sortOrder : i + 1,
+    active: d.active !== false,
+    updated_at: new Date().toISOString(),
+  }));
+  // Upsert, NOT delete-then-insert. levy_manual_entries carries a foreign key
+  // onto (financial_year, label) with ON DELETE RESTRICT, so clearing the year
+  // first would be rejected the moment any figures had been captured against
+  // it — which is always, after the first save.
+  const { error } = await client.from("levy_item_definitions")
+    .upsert(rows, { onConflict: "financial_year,label" });
+  if (error) throw error;
+
+  // Tidy up any definition for this year that has dropped off the list
+  // entirely and has no figures against it. The UI deactivates rather than
+  // dropping, so this normally does nothing; RESTRICT protects anything that
+  // does have figures, which is the outcome we want.
+  const keep = rows.map((r) => r.label);
+  const stale = await client.from("levy_item_definitions")
+    .select("label").eq("financial_year", FY_ACTIVE);
+  if (stale.error) throw stale.error;
+  const orphans = (stale.data || []).map((r) => r.label).filter((l) => !keep.includes(l));
+  if (orphans.length) {
+    const { error: delErr } = await client.from("levy_item_definitions")
+      .delete().eq("financial_year", FY_ACTIVE).in("label", orphans);
+    if (delErr) console.error("Could not clear unused levy line definitions:", delErr);
+  }
 }
 
 // Suggested per-unit levy amounts from the confirmed rules — all VAT
@@ -1588,19 +1698,34 @@ async function saveLevyBreakdownToDb(levyBreakdown) {
 // LevySetup loads separately and applies per unit. These drive the suggestions
 // strip and the "fill grid" action on the Levy breakdown page; the grid itself
 // stays fully editable.
-function computeSuggestedLevyItems({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, commonPropertyWaterKl, councilInvoice }) {
+// Keyed by system_key, then mapped onto whatever those lines are currently
+// called. Keying on the label would have meant a suggestion silently stopped
+// matching the moment the trustee edited the text — and a line they invented
+// has no rule the app could compute, so it correctly gets no suggestion at all
+// rather than a zero that looks like an answer.
+function computeSuggestedLevyItems({ waterBands, electricityRate, vatRate, commonPropertyElectricityKwh, commonPropertyWaterKl, councilInvoice }, defs = LEVY_ITEM_DEFS) {
   const withVat = (n) => n * (1 + vatRate);
-  return {
-    "Insurance": null,
-    "Blockwatch": 0,
-    "Garden Service": 0,
-    "Common Property Water": withVat(calcWaterCost(commonPropertyWaterKl, waterBands)) / UNITS.length,
-    "Water Demand Levy": withVat(councilInvoice.waterDemandLevyPerUnit || 0),
-    "Sewerage": withVat(councilInvoice.sewerChargePerUnit || 0),
-    "Common Property Electricity": withVat(commonPropertyElectricityKwh * electricityRate) / UNITS.length,
-    "Electricity Service Charge": withVat(councilInvoice.elecServiceFee || 0) / UNITS.length,
-    "Electricity Network Charge": withVat(councilInvoice.elecNetworkFee || 0) / UNITS.length,
+  const bySystemKey = {
+    // Insurance is null because it is the one line that differs per unit — it
+    // comes from that unit's own row on the insurance schedule, which
+    // LevySetup loads separately and applies per unit.
+    insurance: null,
+    blockwatch: 0,
+    garden_service: 0,
+    common_property_water: withVat(calcWaterCost(commonPropertyWaterKl, waterBands)) / UNITS.length,
+    water_demand_levy: withVat(councilInvoice.waterDemandLevyPerUnit || 0),
+    sewerage: withVat(councilInvoice.sewerChargePerUnit || 0),
+    common_property_electricity: withVat(commonPropertyElectricityKwh * electricityRate) / UNITS.length,
+    electricity_service_charge: withVat(councilInvoice.elecServiceFee || 0) / UNITS.length,
+    electricity_network_charge: withVat(councilInvoice.elecNetworkFee || 0) / UNITS.length,
   };
+  const out = {};
+  defs.filter((d) => d.active).forEach((d) => {
+    // `undefined` (no rule for this line) and `null` (a rule that deliberately
+    // yields nothing, i.e. Insurance) are different and stay different.
+    if (d.systemKey && d.systemKey in bySystemKey) out[d.label] = bySystemKey[d.systemKey];
+  });
+  return out;
 }
 
 async function saveCouncilInvoiceToDb(ci) {
@@ -2159,7 +2284,7 @@ function splitStatementForChangeover(r, change, waterBands, period) {
       waterOverridden: false, elecOverridden: false, overrideNote: "",
       waterCostComputed: waterCost, elecCostComputed: elecCost,
       waterCost, elecCost, subTotal, vat, utilitiesDue,
-      levyItems: levyShare, levy,
+      levyItems: levyShare, levy, levyLines: LEVY_ITEMS.slice(),
       extras: extras || [], additionalTotal,
       total: round2(levy + utilitiesDue + additionalTotal),
       proRata: { label, from, to, days, daysInMonth },
@@ -2267,6 +2392,9 @@ function useAllocation(waterBands, electricityRate, levyBreakdown, vatRate, addi
         ...u, ...r, wUse, eUse, electricityRate, vatRate,
         waterCostComputed, elecCostComputed, waterOverridden, elecOverridden, overrideNote: ov.note || "",
         waterCost, elecCost, subTotal, vat, utilitiesDue, levy, levyItems,
+        // The lines this total was taken over, so the statement renders the
+        // same set it billed. See the note where the statement prints them.
+        levyLines: LEVY_ITEMS.slice(),
         extras, additionalTotal,
         total,
       };
@@ -2476,11 +2604,20 @@ export default function App() {
             carriedFromFY: data.levyRates.carriedFromFY || null,
           });
         }
+        // Swap the item list before the grid, so nothing renders a cell for a
+        // line the loaded FY doesn't have. Same module-wide binding trick as
+        // UNITS above, and `unitsSource` flipping to "database" is what makes
+        // useAllocation recompute against it.
+        if (data.levyItemDefs && data.levyItemDefs.length) {
+          LEVY_ITEM_DEFS = data.levyItemDefs;
+          LEVY_ITEMS = data.levyItemDefs.filter((d) => d.active).map((d) => d.label);
+        }
         setLevyBreakdown(data.levyBreakdown);
         setLevyMeta({
           financialYear: data.levyFinancialYear,
           carriedForward: Boolean(data.levyCarriedForward),
           carriedFromFY: data.levyCarriedFromFY || null,
+          itemsCarriedForward: Boolean(data.levyItemsCarriedForward),
         });
         setReadings(data.readings);
         setAdditionalCharges(data.additionalCharges);
@@ -3540,18 +3677,23 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, wa
 
   const insuranceCaptured = Object.keys(insurancePerUnit).length > 0;
 
+  // The insurance line is found by system_key, not by being called
+  // "Insurance" — the trustee owns the label.
+  const insuranceLabel = levyLabelForSystemKey("insurance");
   const fillCalculated = () => {
     setLevyBreakdown((prev) => {
       const next = {};
       UNITS.forEach((u) => {
         next[u.id] = { ...prev[u.id] };
         LEVY_ITEMS.forEach((item) => {
-          if (item === "Insurance") {
+          if (item === insuranceLabel) {
             const v = insurancePerUnit[u.id];
             if (v != null) next[u.id][item] = round2(v);
             return;
           }
           const s = suggestions[item];
+          // A line the trustee added has no rule behind it, so it is left
+          // exactly as typed rather than being zeroed by a fill.
           if (s !== null && s !== undefined) next[u.id][item] = round2(s);
         });
       });
@@ -3585,13 +3727,76 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, wa
     }
   };
 
+  // ---------- Adding and removing lines ----------
+  // Both commit immediately, and both save the grid first. A definition change
+  // triggers a full reload, which would otherwise throw away whatever cells
+  // were typed but not yet saved — so the grid goes down with it, as one
+  // action. `LEVY_ITEM_DEFS` is the loaded FY's full list including anything
+  // already removed, which is what a re-add needs to find.
+  const [newItemLabel, setNewItemLabel] = useState("");
+  const [itemsBusy, setItemsBusy] = useState(false);
+  const [itemsError, setItemsError] = useState(null);
+
+  const commitItemDefs = async (defs) => {
+    setItemsBusy(true); setItemsError(null);
+    try {
+      await saveLevyBreakdownToDb(levyBreakdown);
+      await writeLevyItemDefsForActiveFY(defs);
+      if (onSaved) onSaved();
+    } catch (err) {
+      console.error("Saving the levy line items failed:", err);
+      setItemsError(err.message || "Couldn't save the line items — see browser console.");
+    } finally {
+      setItemsBusy(false);
+    }
+  };
+
+  const addItem = async () => {
+    const label = newItemLabel.trim();
+    if (!label) return;
+    const existing = LEVY_ITEM_DEFS.find((d) => d.label.toLowerCase() === label.toLowerCase());
+    if (existing && existing.active) {
+      setItemsError(`"${existing.label}" is already on the grid.`);
+      return;
+    }
+    // Re-adding a removed line restores it with its figures rather than
+    // creating a second line with the same name — the unique constraint on
+    // (financial_year, label) would reject that anyway, and the trustee
+    // removing something by mistake should get it back whole.
+    const defs = existing
+      ? LEVY_ITEM_DEFS.map((d) => (d.label === existing.label ? { ...d, active: true } : d))
+      : [...LEVY_ITEM_DEFS, {
+          label,
+          systemKey: null,
+          sortOrder: Math.max(0, ...LEVY_ITEM_DEFS.map((d) => d.sortOrder || 0)) + 1,
+          active: true,
+        }];
+    setNewItemLabel("");
+    await commitItemDefs(defs);
+  };
+
+  const removeItem = async (label) => {
+    const billed = UNITS.reduce((s, u) => s + effectiveValue(u.id, label), 0);
+    const warning = billed > 0
+      ? `\n\nUnits are currently billed ${rand(billed)} a month in total on this line. That stops from FY ${levyMeta.financialYear}.`
+      : "";
+    if (!window.confirm(
+      `Remove "${label}" from the levy grid?${warning}\n\n`
+      + `The figures already captured against it are kept — FY ${levyMeta.financialYear}'s AGM pack still reports them, and earlier years are untouched. `
+      + `Re-adding the line brings them back.`
+    )) return;
+    await commitItemDefs(LEVY_ITEM_DEFS.map((d) => (d.label === label ? { ...d, active: false } : d)));
+  };
+
+  const removedItems = LEVY_ITEM_DEFS.filter((d) => !d.active);
+
   return (
     <>
       <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>
         Levy breakdown — {levyMeta.financialYear ? `FY ${levyMeta.financialYear}` : "set annually at the AGM"}
       </h1>
       <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 14 }}>
-        Each unit's monthly levy is the sum of these line items. Every cell is editable and defaults to 0.00 — enter the figures agreed at the AGM once a year; they carry forward every month until changed again. Statements bill exactly what's in this grid.
+        Each unit's monthly levy is the sum of these line items. Every cell is editable and defaults to 0.00 — enter the figures agreed at the AGM once a year; they carry forward every month until changed again. Statements bill exactly what's in this grid. The lines themselves can be added and removed here too, and the list is kept per financial year, so a change applies from FY {levyMeta.financialYear} on and never rewrites a year already billed.
       </p>
 
       {levyMeta.carriedForward && (
@@ -3609,19 +3814,23 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, wa
           <div style={{ fontSize: 12, color: "#64748B", lineHeight: 1.7, flex: 1, minWidth: 320 }}>
             <b>Calculated per-unit values (VAT incl.)</b> from the utility bills and Tariffs &amp; rates:{" "}
             <span className="f-mono">
-              {LEVY_ITEMS.filter((i) => suggestions[i] !== null).map((i) => `${i} ${rand(suggestions[i])}`).join(" · ")}
+              {/* `!= null` catches both: a line with no rule at all reads
+                  undefined here and used to print as "undefined". */}
+              {LEVY_ITEMS.filter((i) => suggestions[i] != null).map((i) => `${i} ${rand(suggestions[i])}`).join(" · ")}
             </span>
             <br />
-            {insuranceCaptured ? (
+            {/* Nothing to say about the insurance line if the trustee has
+                removed it from this year's grid. */}
+            {insuranceLabel && (insuranceCaptured ? (
               <>
-                <b>Insurance</b> is per unit, from the FY {insuranceFY} insurance schedule (per annum ÷ 12):{" "}
+                <b>{insuranceLabel}</b> is per unit, from the FY {insuranceFY} insurance schedule (per annum ÷ 12):{" "}
                 <span className="f-mono">
                   {UNITS.map((u) => `${u.id} ${insurancePerUnit[u.id] == null ? "—" : rand(insurancePerUnit[u.id])}`).join(" · ")}
                 </span>
               </>
             ) : (
-              <><b>Insurance</b> has no schedule captured for FY {insuranceFY} — upload the broker's schedule on the Insurance page and it fills here.</>
-            )}
+              <><b>{insuranceLabel}</b> has no schedule captured for FY {insuranceFY} — upload the broker's schedule on the Insurance page and it fills here.</>
+            ))}
           </div>
           <button style={secondaryBtn} onClick={fillCalculated}>Fill grid with calculated values</button>
         </div>
@@ -3637,6 +3846,7 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, wa
                   <th key={u.id} style={{ padding: "6px 6px" }}>{u.id}</th>
                 ))}
                 <th style={{ padding: "6px 6px", color: "#1B2A38" }}>Item total</th>
+                <th style={{ padding: "6px 6px", width: 28 }} aria-label="Remove line" />
               </tr>
             </thead>
             <tbody>
@@ -3654,6 +3864,21 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, wa
                     </td>
                   ))}
                   <td className="f-mono" style={{ padding: "6px 6px", textAlign: "right", color: "#64748B" }}>{rand(itemTotal(item))}</td>
+                  <td style={{ padding: "3px", textAlign: "center" }}>
+                    <button
+                      type="button"
+                      onClick={() => removeItem(item)}
+                      disabled={itemsBusy || LEVY_ITEMS.length <= 1}
+                      title={LEVY_ITEMS.length <= 1 ? "A levy has to have at least one line" : `Remove ${item}`}
+                      aria-label={`Remove ${item}`}
+                      style={{
+                        border: "1px solid #E3D9C6", background: "#FFF", color: "#B5651D",
+                        borderRadius: 6, width: 24, height: 24, lineHeight: "20px", fontSize: 14,
+                        cursor: itemsBusy || LEVY_ITEMS.length <= 1 ? "not-allowed" : "pointer",
+                        opacity: itemsBusy || LEVY_ITEMS.length <= 1 ? 0.4 : 1, padding: 0,
+                      }}
+                    >×</button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -3666,10 +3891,45 @@ function LevySetup({ levyBreakdown, setLevyBreakdown, levyMeta = {}, onSaved, wa
                   </td>
                 ))}
                 <td className="f-mono" style={{ padding: "8px 6px", textAlign: "right", fontWeight: 700, color: "#2F5D50" }}>{rand(grandTotal)}</td>
+                <td />
               </tr>
             </tfoot>
           </table>
         </div>
+
+        {/* Adding a line. Deliberately below the table rather than as a ghost
+            row inside it — a row in the grid reads as something already being
+            billed. */}
+        <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <input
+            type="text"
+            value={newItemLabel}
+            onChange={(e) => { setNewItemLabel(e.target.value); if (itemsError) setItemsError(null); }}
+            onKeyDown={(e) => { if (e.key === "Enter") addItem(); }}
+            placeholder="New levy line — e.g. Special Levy"
+            style={{ ...inputStyle, width: 260, textAlign: "left", fontFamily: "inherit" }}
+          />
+          <button style={secondaryBtn} onClick={addItem} disabled={itemsBusy || !newItemLabel.trim()}>
+            {itemsBusy ? "Saving…" : "Add line item"}
+          </button>
+          <span style={{ fontSize: 11.5, color: "#94A0AC", lineHeight: 1.6, flex: 1, minWidth: 260 }}>
+            Adding or removing a line saves the grid at the same time, and applies to
+            FY {levyMeta.financialYear} onwards — earlier years keep the lines they were billed on
+            and reprint unchanged.
+          </span>
+        </div>
+        {itemsError && (
+          <div style={{ marginTop: 8, fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{itemsError}</div>
+        )}
+
+        {removedItems.length > 0 && (
+          <div style={{ marginTop: 12, padding: "9px 12px", borderRadius: 7, background: "#F4F1E9", border: "1px solid #E3D9C6", color: "#64748B", fontSize: 11.5, lineHeight: 1.7 }}>
+            <b>Removed from FY {levyMeta.financialYear}:</b>{" "}
+            {removedItems.map((d) => d.label).join(", ")}. Not billed and not on statements.
+            The figures captured against {removedItems.length > 1 ? "them" : "it"} are kept and still
+            appear in the AGM pack for this year — type the name above to put {removedItems.length > 1 ? "one" : "it"} back.
+          </div>
+        )}
         <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10 }}>
           {saveStatus === "saved" && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>✓ Saved to database</span>}
           {saveStatus === "error" && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>Couldn't save — see browser console</span>}
@@ -5191,12 +5451,16 @@ async function fetchAgmExtras(fy) {
   const { from, to } = fyBounds(fy);
   const nextFrom = fyBounds(nfy).from;
 
-  const [units, bands, elec, levies, split, ops, txns, invoices, remits, insurance, settings] = await Promise.all([
+  const [units, bands, elec, levies, split, itemDefs, ops, txns, invoices, remits, insurance, settings] = await Promise.all([
     client.from("units").select("id, unit_number, participation_quota, sqm").order("unit_number"),
     client.from("water_tariff_bands").select("*").in("financial_year", [fy, nfy]).order("from_kl"),
     client.from("electricity_rates").select("rate_per_kwh, effective_from").order("effective_from"),
     client.from("levy_rates").select("*").in("financial_year", [fy, nfy]),
     client.from("levy_manual_entries").select("unit_id, financial_year, item_label, amount").in("financial_year", [fy, nfy]),
+    // The report covers a year that may have closed on a different set of levy
+    // lines from the one loaded in the app right now, so section 12 reads the
+    // list for THAT year rather than the module binding.
+    client.from("levy_item_definitions").select("financial_year, label, system_key, sort_order, active").in("financial_year", [fy, nfy]),
     client.from("ops_expenses").select("expense_date, category, amount, notes")
       .is("superseded_reason", null).gte("expense_date", from).lte("expense_date", to),
     client.from("bank_transactions").select("txn_date, description_raw, amount, direction, expense_category")
@@ -5220,7 +5484,7 @@ async function fetchAgmExtras(fy) {
     client.from("insurance_schedule").select("*").eq("financial_year", fy),
     client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1),
   ]);
-  const bad = [units, bands, elec, levies, split, ops, txns, invoices, remits, insurance, settings].find((r) => r.error);
+  const bad = [units, bands, elec, levies, split, itemDefs, ops, txns, invoices, remits, insurance, settings].find((r) => r.error);
   if (bad) throw bad.error;
 
   const unitList = (units.data || []).map((u) => ({
@@ -5263,6 +5527,32 @@ async function fetchAgmExtras(fy) {
   const nextGrid = gridFor(nfy);
   const levySplit = Object.keys(nextGrid).length ? nextGrid : gridFor(fy);
   const levySplitIsCarriedOver = Object.keys(nextGrid).length === 0;
+
+  // The rows section 12 prints, for whichever year `levySplit` came from.
+  //
+  // Active lines, plus any line removed during that year that still has
+  // figures captured against it — the report says what the scheme actually
+  // levied, and dropping a line the moment it stops being charged would make
+  // the table disagree with the statements the owners were sent. A removed
+  // line with no figures is simply omitted; there is nothing to report.
+  const levyItemLabelsFor = (year) => {
+    const defs = (itemDefs.data || []).filter((d) => d.financial_year === year);
+    const grid = gridFor(year);
+    const captured = (label) => Object.values(grid).some((row) => row[label] != null);
+    return defs
+      .filter((d) => d.active !== false || captured(d.label))
+      .sort((a, b) => (Number(a.sort_order || 0) - Number(b.sort_order || 0)) || a.label.localeCompare(b.label))
+      .map((d) => d.label);
+  };
+  const splitYear = levySplitIsCarriedOver ? fy : nfy;
+  // Falling back to the module binding keeps an un-migrated year rendering
+  // rather than producing an empty section.
+  const levySplitItems = levyItemLabelsFor(splitYear).length
+    ? levyItemLabelsFor(splitYear)
+    : LEVY_ITEMS.slice();
+  const levySplitRemoved = (itemDefs.data || [])
+    .filter((d) => d.financial_year === splitYear && d.active === false && levySplitItems.includes(d.label))
+    .map((d) => d.label);
 
   // Every individual item tagged Miscellaneous, from all three sources that
   // feed an expenditure line in buildFinancialYearReport — operating expenses,
@@ -5377,7 +5667,7 @@ async function fetchAgmExtras(fy) {
     fy, nfy, units: unitList, waterBands,
     elecCurr: rateAsOf(from), elecNext: rateAsOf(nextFrom),
     levyCurr: levyFor(fy), levyNext: levyFor(nfy),
-    levySplit, levySplitIsCarriedOver,
+    levySplit, levySplitIsCarriedOver, levySplitItems, levySplitRemoved,
     misc, maintenance,
     insuranceRows, insuranceHasData,
     settings: {
@@ -5421,7 +5711,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   } = D;
   const {
     nfy, units, waterBands, elecCurr, elecNext, levyCurr, levyNext,
-    levySplit, levySplitIsCarriedOver, misc, maintenance,
+    levySplit, levySplitIsCarriedOver, levySplitItems, levySplitRemoved, misc, maintenance,
     insuranceRows, insuranceHasData, settings, blockwatch, sewerPerUnit, demandLevyPerUnit,
     sewerChange, demandLevyChange, elecServiceFeeInvoiced, elecNetworkFeeInvoiced,
   } = extras;
@@ -6042,7 +6332,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   const lAligns = ["left", ...uCols.map(() => "right"), "right"];
   const c10 = [hrow(["Levy item", ...uCols, "Total"], lAligns, WIDE)];
   const colTotals = Object.fromEntries(units.map((u) => [u.no, 0]));
-  LEVY_ITEMS.forEach((item) => {
+  (levySplitItems || LEVY_ITEMS).forEach((item) => {
     const vals = units.map((u) => (levySplit[u.no] && levySplit[u.no][item] != null ? Number(levySplit[u.no][item]) : null));
     units.forEach((u, i) => { colTotals[u.no] = round2(colTotals[u.no] + (vals[i] || 0)); });
     const lineTotal = round2(vals.reduce((a, v) => a + (v || 0), 0));
@@ -6055,6 +6345,15 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   const anyCaptured = units.some((u) => levySplit[u.no] && Object.keys(levySplit[u.no]).length);
   c10.push(row(["Total per unit", ...units.map((u) => (anyCaptured ? money(colTotals[u.no]) : "")), anyCaptured ? money(grand) : ""], lAligns, true, BAND, WIDE));
   F.push(tbl(c10));
+  // A line withdrawn part-way through the year is still reported, because the
+  // owners were billed on it — but the table would otherwise imply it is still
+  // being charged, and the per-unit total above includes it.
+  if (levySplitRemoved && levySplitRemoved.length) {
+    F.push(hint(
+      `${levySplitRemoved.join(", ")} ${levySplitRemoved.length > 1 ? "were" : "was"} removed from the levy during the year. `
+      + `${levySplitRemoved.length > 1 ? "They are" : "It is"} shown because ${levySplitRemoved.length > 1 ? "they were" : "it was"} billed for part of it; `
+      + `${levySplitRemoved.length > 1 ? "they are" : "it is"} not charged going forward.`));
+  }
 
   // ---------- Landscape MP: section 13 ----------
   // The statutory section. PMR 22 requires a written maintenance, repair and
@@ -6411,7 +6710,7 @@ async function fetchUsageTrend(fy) {
 async function fetchWaterReconciliation(fy) {
   const client = await ensureSupabaseClient();
   const { from, to } = fyBounds(fy);
-  const [inv, usage, overrides, bands, cpLevy, unitRows, vat] = await Promise.all([
+  const [inv, usage, overrides, bands, cpLevy, unitRows, vat, itemDefs] = await Promise.all([
     client.from("council_invoices")
       .select("period, bulk_water_kl, bulk_water_rand, sewer_charge_per_unit, water_demand_levy_per_unit")
       .gte("period", from).lte("period", to),
@@ -6422,14 +6721,26 @@ async function fetchWaterReconciliation(fy) {
       .select("unit_id, period, water_due")
       .gte("period", from).lte("period", to),
     client.from("water_tariff_bands").select("band_label, from_kl, to_kl, rate_per_kl, effective_from"),
+    // Not filtered on the label here. The common property water line is found
+    // by system_key against that year's definitions, because the trustee owns
+    // the display text and matching on it would have gone quietly wrong the
+    // day it was edited — and returned zero, which reads as a real figure.
     client.from("levy_manual_entries")
-      .select("unit_id, amount")
-      .eq("financial_year", fy).eq("item_label", "Common Property Water"),
+      .select("unit_id, amount, item_label")
+      .eq("financial_year", fy),
     client.from("units").select("id, unit_number"),
     client.from("vat_rates").select("rate").order("effective_from", { ascending: false }).limit(1),
+    client.from("levy_item_definitions")
+      .select("label, system_key, active").eq("financial_year", fy),
   ]);
-  const failed = [inv, usage, overrides, bands, cpLevy, unitRows].find((r) => r.error);
+  const failed = [inv, usage, overrides, bands, cpLevy, unitRows, itemDefs].find((r) => r.error);
   if (failed) throw failed.error;
+
+  // Fall back to the historical label for a year predating the definitions
+  // table, so an old reconciliation still reconciles.
+  const cpWaterDef = (itemDefs.data || []).find((d) => d.system_key === "common_property_water");
+  const cpWaterLabel = cpWaterDef ? cpWaterDef.label : "Common Property Water";
+  const cpLevyRows = (cpLevy.data || []).filter((r) => r.item_label === cpWaterLabel);
 
   const bandRows = bands.data || [];
   const invByPeriod = {};
@@ -6463,9 +6774,9 @@ async function fetchWaterReconciliation(fy) {
   // than silent.
   const unitCount = (unitRows.data || []).length || UNITS.length;
   const vatRate = vat.data && vat.data[0] ? Number(vat.data[0].rate) : VAT_RATE_DEFAULT;
-  const cpMonthlyIncVat = round2((cpLevy.data || []).reduce((s, r) => s + (Number(r.amount) || 0), 0));
+  const cpMonthlyIncVat = round2(cpLevyRows.reduce((s, r) => s + (Number(r.amount) || 0), 0));
   const cpMonthly = round2(cpMonthlyIncVat / (1 + vatRate));
-  const cpCaptured = (cpLevy.data || []).length > 0;
+  const cpCaptured = cpLevyRows.length > 0;
 
   const periods = fyPeriods(fy);
   const rows = periods.map((p) => {
@@ -8836,7 +9147,11 @@ function StatementPaper({ r, period = CURRENT_PERIOD }) {
         <div style={{ fontSize: 11, color: "#94A0AC", marginBottom: 8 }}>Set annually at the AGM</div>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
           <tbody>
-            {LEVY_ITEMS.map((item) => (
+            {/* `levyLines` is the list the row was actually totalled over —
+                the trustee app's loaded FY, or the statement's own FY on the
+                resident portal. Rendering LEVY_ITEMS instead would let the
+                lines shown disagree with the total printed below them. */}
+            {(r.levyLines || LEVY_ITEMS).map((item) => (
               <tr key={item} style={{ borderTop: "1px solid #EEE7D6" }}>
                 <td style={{ padding: "5px 6px 5px 0", textAlign: "left" }}>{item}</td>
                 <td className="f-mono" style={{ padding: "5px 0 5px 6px", textAlign: "right", whiteSpace: "nowrap" }}>{rand(r.levyItems?.[item] || 0)}</td>

@@ -73,6 +73,61 @@ Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 20
 
 ---
 
+## Done on 11 August 2026, session 14 — levy line items are trustee-editable
+
+Devon asked to be able to add and remove a levy line from the Levy breakdown grid, carried through the rest of the app, with previous data left intact and the change applied going forward.
+
+### What was actually in the way
+Storage was never the problem. `levy_manual_entries` is keyed `(unit_id, financial_year, item_label)` and `get_unit_statement` aggregated whatever labels existed. **Three** things pinned the list to nine:
+
+1. `LEVY_ITEMS`, a hardcoded array in `App.jsx`, read in 12 places.
+2. A **CHECK constraint** on `levy_manual_entries.item_label` restricting it to those nine strings. Found by the end-to-end test, not by reading the code — nothing in the app referenced it.
+3. `computeSuggestedLevyItems`, the water projection and the fill-grid action all matching lines by their **display text**.
+
+And the array was doing damage well beyond being inflexible. Two places total the levy by iterating it (`App.jsx` resident-statement builder, and `useAllocation`), so **any row whose label wasn't in the array was silently dropped from the unit's total**. A line added directly in the database would have billed nothing and said nothing about it.
+
+### The model
+`levy_item_definitions`, one row per line per financial year: `label`, `system_key`, `sort_order`, `active`. Keyed by FY like `levy_rates` and `levy_manual_entries`, which is what makes *"applies going forward"* true by construction rather than by convention — a past year is a different set of rows, so a statement reprinted for it rebuilds on that year's list and cannot be reshaped by a decision taken later. A new FY with no rows carries the previous year's forward as a starting point (dropping its removed lines — they were removed going forward, and this is forward) and writes nothing until saved.
+
+- **`LEVY_ITEMS` is now a mutable module binding**, swapped after load exactly like `UNITS`, with `LEVY_ITEM_DEFS` alongside it holding the full list including removed lines. All 12 call sites kept working untouched, which is why this stayed a small change.
+- **`system_key` is what code matches on** when it needs a specific line — never the label, which the trustee owns. `levyLabelForSystemKey()` resolves it and returns null when the line is gone, so callers have to handle absence. The suggestions map is now keyed by system key, and the water reconciliation's `Common Property Water` lookup goes through it instead of an `.eq("item_label", …)` that would have quietly returned zero the day the label was edited.
+- **The CHECK constraint became a foreign key** onto `(financial_year, label)`, `on update cascade on delete restrict`. Still constrained, but to the list the trustee maintains. Cascade means a future rename carries the figures with it; RESTRICT means an accidental hard delete fails loudly instead of taking a year of levies with it.
+
+### Removal keeps the data — and that needed guarding twice
+Devon's instruction was to keep the line and its figures, because the AGM pack reports on what was actually levied in the year. Two places would have got that wrong:
+
+- **`saveLevyBreakdownToDb` deleted every row for the FY** before reinserting. That would have destroyed a removed line's figures on the next save of any cell — quietly, and a month later. The delete is now scoped to the labels being rewritten.
+- **`get_unit_statement` aggregated every row for the FY**, so keeping the figures would have kept *billing residents* for a line the body corporate had stopped charging. The RPC now excludes rows whose definition is inactive.
+
+Section 12 of the AGM pack shows active lines **plus any line removed during that year that still has figures against it**, with a note saying it was withdrawn mid-year and isn't charged going forward. Dropping it the moment it stopped being billed would have made the table disagree with the statements the owners were sent.
+
+### The resident portal was reading the wrong list entirely
+It never loads the trustee app's data, so `LEVY_ITEMS` there was always the source-code default. The RPC now returns `levyItemOrder` with the amounts, and the client totals over the keys it was actually given. Statements render `r.levyLines` — the list the row was totalled over — so the lines shown can't disagree with the total printed under them.
+
+### UI
+Per-row `×` with a confirmation that names the monthly amount at stake, and an add box below the table. Both **save the grid first**, because a definition change triggers a reload that would otherwise discard unsaved cells. Re-adding a removed line restores it with its figures rather than creating a duplicate. The last line can't be removed. Removed lines are listed under the grid with a note on how to restore them.
+
+### Verified
+`esbuild` parse clean. End-to-end test run against a throwaway FY `9999/0000` — copy the real grid, add a custom line, remove a built-in, then run the app's own scoped save:
+
+| Assertion | Result |
+|---|---|
+| Removed line's rows kept | 7 (all units) |
+| New custom line's rows created | 7 |
+| FY 2026/2027 rows untouched | 63 |
+| FY 2025/2026 rows untouched | 63 |
+| FY 2025/2026 active items | 9 |
+| RPC: rows held vs rows billed | 10 vs 9 |
+| RPC: `levyItemOrder` | correct order, removed line absent |
+
+Test data deleted afterwards; back to 126 entries and 18 definitions. The build itself can't run in the sandbox (`node_modules` carries the Windows rollup binary) — **run `npm run build` locally before committing**.
+
+### Worth knowing
+- A line the trustee invents has no `system_key`, so **"Fill grid with calculated values" leaves it exactly as typed** rather than zeroing it. There is no rule the app could compute for it.
+- Removing a line changes what is billed for the **whole current FY**, including months already issued in that year — that is the FY-scoped model Devon chose, and it is how levy *amounts* have always behaved. Month-level versioning would mean re-keying `levy_manual_entries` from FY to period.
+
+---
+
 ## Done on 11 August 2026, session 13 — the AGM "New" column for the bill-driven charges
 
 ### The gap
