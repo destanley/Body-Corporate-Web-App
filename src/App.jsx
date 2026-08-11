@@ -5547,22 +5547,35 @@ function Analytics({ expenseCategories }) {
         // meeting to approve nfy.
         fetchBudget(nextFY(fy)).catch((err) => { console.warn("Loading the budget for the AGM report failed:", err); return null; }),
       ]);
-      // The PMR 22 floor needs figures from three places at once: the reserve
-      // ledger, the year's levy income, and next year's administrative budget.
-      // The admin budget is this year's total expenditure, which is the best
-      // available proxy until a budget is captured as its own record.
+      // The Regulation 2 floor needs figures from three places at once: the
+      // reserve ledger, the year just ended's ACTUAL owner contributions, and
+      // the coming year's BUDGETED contributions.
       //
-      // Levy income is Owner Contributions ONLY. This used to sum every income
-      // row, which swept in Interest Earned and Other Credits — neither is a
-      // levy, and both inflated the 25% reserve threshold the meeting is held
-      // to. Anything that isn't a contribution from an owner is excluded by
-      // construction here rather than by listing what to skip, so a new income
-      // row added later cannot quietly rejoin the calculation.
+      // Actual contributions are the Owner Contributions row ONLY. This used to
+      // sum every income row, which swept in Interest Earned and Other Credits
+      // — neither is a contribution, and both inflated the 25% threshold the
+      // meeting is held to. Anything that isn't a contribution from an owner is
+      // excluded by construction here rather than by listing what to skip, so a
+      // new income row added later cannot quietly rejoin the calculation.
       const leviesRow = report && report.incomeRows
         ? report.incomeRows.find((r) => r.label === INCOME_OWNER_CONTRIBUTIONS) : null;
       const leviesCollected = leviesRow ? round2(leviesRow.total || 0) : null;
+      // Which reading of "contribution to the administrative fund" the scheme
+      // has adopted. Set on Config → AGM report figures; the budget rows carry
+      // the classification the two readings differ on.
+      const reserveBasis = (extras && extras.settings && extras.settings.reserveBasis) || "all_contributions";
+      const budgetedContributions = contributionBase(budget, reserveBasis);
       const floor = plan && leviesCollected != null
-        ? { ...reserveFundFloor({ reserveBalance: plan.reserve.balance, leviesCollected, adminBudget: report.totalExpense }), leviesCollected }
+        ? {
+            ...reserveFundFloor({
+              reserveBalance: plan.reserve.balance,
+              priorYearContributions: leviesCollected,
+              budgetedContributions,
+              budgetedRM: budget ? budget.commonPropertyRM : null,
+            }),
+            leviesCollected,
+            basis: reserveBasis,
+          }
         : null;
       await exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank, plan, floor, budget });
       setAgmStatus("idle");
@@ -6067,6 +6080,12 @@ async function fetchAgmExtras(fy) {
       blockwatchMonthlyProposed: st.blockwatch_monthly_proposed == null ? null : Number(st.blockwatch_monthly_proposed),
       servicesNoteAnnualEstimate: st.services_note_annual_estimate == null ? null : Number(st.services_note_annual_estimate),
       seweragePerUnitNew: st.sewerage_per_unit_new == null ? null : Number(st.sewerage_per_unit_new),
+      // Reserve fund, section 12. Neither is derivable: the basis is an
+      // unresolved reading of Regulation 2, and the designation is a decision
+      // the meeting takes. Same convention as sewerage above — stored on the
+      // year the report covers, proposing for the year after.
+      reserveBasis: st.reserve_contribution_basis || null,
+      reserveProposedDesignation: st.reserve_proposed_designation == null ? null : Number(st.reserve_proposed_designation),
       // Same reason as sewerage above: the New column for these three has no
       // council source and nothing writes them to levy_rates any more.
       waterDemandLevyNew: st.water_demand_levy_new == null ? null : Number(st.water_demand_levy_new),
@@ -6639,22 +6658,169 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
   }
 
   // ---------- Landscape MP: section 12 ----------
-  // The statutory section. PMR 22 requires a written maintenance, repair and
-  // replacement plan over at least ten years, re-approved at every AGM. It is
-  // built from the register rather than typed, so it cannot say one thing here
-  // and another on the Maintenance page.
+  // The reserve fund and the plan that justifies it, in that order.
+  //
+  // They share a section because Regulation 2 and PMR 22 answer two different
+  // questions about the same money — the regulation sets a MINIMUM, s3(1)(b)
+  // sets the actual standard ("reasonably sufficient"), and only the plan can
+  // say what sufficient is. Splitting them would separate the floor from the
+  // thing that decides whether the floor is anywhere near enough.
+  //
+  // Everything below the proposal is built from the register rather than typed,
+  // so it cannot say one thing here and another on the Maintenance page. The
+  // two figures that ARE typed — the basis and the proposed designation — are
+  // decisions, not data, and they live on Config → AGM report figures.
   const MP = [];
-  MP.push(H1("12. Maintenance, repair and replacement plan (PMR 22)"));
+  MP.push(H1("12. Reserve fund and the PMR 22 maintenance plan"));
   if (!plan) {
-    MP.push(hint(`The maintenance plan could not be loaded for FY ${fy}, so this section is omitted. It rebuilds from the asset register — check the Maintenance page and generate the report again.`));
+    MP.push(hint(`The reserve fund and maintenance plan could not be loaded for FY ${fy}, so this section is omitted. It rebuilds from the reserve ledger and the asset register — check the Financial dashboard and the Maintenance page, then generate the report again.`));
   } else {
+    const perUnitMonth = (v) => money(round2(v / (units.length || 7) / 12));
+    const basisIsLevyOnly = floor && floor.basis === "levy_only";
+    const basisLabel = basisIsLevyOnly ? "levy contributions only" : "all owner contributions";
+    const otherBase = budget && budget.contributions
+      ? (basisIsLevyOnly ? budget.contributions.all : budget.contributions.levy) : null;
+    const otherLabel = basisIsLevyOnly ? "all owner contributions" : "levy contributions only";
+    const proposed = settings.reserveProposedDesignation;
+
     MP.push(para(
-      "Prescribed Management Rule 22 requires the body corporate to maintain a written plan for the maintenance, repair and replacement of major capital items over at least ten years, and to have it approved at each annual general meeting. The plan below is built from the component register; the annual contribution is the rule's own formula, being replacement cost less the reserve already held, divided by the years remaining.",
+      "Section 3(1)(b) of the Act requires the body corporate to establish and maintain a reserve fund reasonably sufficient to cover the future maintenance, repair and replacement of common property. Regulation 2 sets a minimum annual contribution to it, and Prescribed Management Rule 22 requires a written ten-year plan approved at each annual general meeting. The minimum and the plan are different tests: the regulation says what may not be gone below, the plan says what is actually needed. This section reports the fund's position, the minimum, what is proposed, and then the plan.",
       { size: 20 }));
 
-    // Coverage first. A plan built on 3 of 27 components is not a plan, and the
-    // report should say so before it shows a single rand.
-    MP.push(H2("Register coverage"));
+    // ---- 1. Where the fund stands ----
+    MP.push(H2("Where the fund stands"));
+    const rAligns = ["left", "right"];
+    const rRows = [hrow(["", `FY ${fy}`], rAligns)];
+    rRows.push(row(["Contributions and interest to date", money(plan.reserve.contributions)], rAligns));
+    rRows.push(row(["Drawdowns", money(plan.reserve.drawdowns)], rAligns));
+    rRows.push(row(["Balance held", money(plan.reserve.balance)], rAligns, true, BAND));
+    MP.push(tbl(rRows));
+    if (plan.reserve.entryCount === 0) {
+      MP.push(para(
+        "There is no reserve fund. The ledger has no entries and nothing has ever been designated to it, so the whole replacement cost of every component still has to be funded from future contributions — which is what makes the annual figure further down as large as it is. A nil balance also fixes which tier of Regulation 2 applies: the minimum below is not optional.",
+        { size: 20 }));
+    }
+
+    // ---- 2. The statutory minimum ----
+    if (floor) {
+      MP.push(H2("The statutory minimum — Regulation 2"));
+      const fAligns = ["left", "right"];
+      const fRows = [hrow(["", `FY ${nfy}`], fAligns)];
+      // "Owner contributions" rather than the old "Levies collected", because
+      // that is exactly what the figure now is — and the old label had been
+      // sitting over a number that also contained bank interest.
+      fRows.push(row([`Owner contributions collected in FY ${fy} (actual)`, money(floor.leviesCollected)], fAligns));
+      fRows.push(row(["25% of that — the tier threshold", money(floor.threshold)], fAligns));
+      fRows.push(row(["100% of that — the tier 3 threshold", money(floor.ceiling)], fAligns));
+      fRows.push(row(["Reserve fund held at the start of the year", money(floor.balance)], fAligns));
+      fRows.push(row(["Tier that applies", `Tier ${floor.tier}`], fAligns, true));
+      if (floor.tier === 1 && floor.budgetedContributions != null) {
+        fRows.push(row([`Budgeted contributions for FY ${nfy} — ${basisLabel}`, money(floor.budgetedContributions)], fAligns));
+        fRows.push(row(["Minimum reserve contribution — 15% of it", money(floor.floor)], fAligns, true, BAND));
+        fRows.push(row(["Per unit, per month", perUnitMonth(floor.floor)], fAligns));
+      } else if (floor.tier === 2 && floor.budgetedRM != null) {
+        fRows.push(row([`Budgeted repairs & maintenance to common property, FY ${nfy}`, money(floor.budgetedRM)], fAligns));
+        fRows.push(row(["Minimum reserve contribution — that amount", money(floor.floor)], fAligns, true, BAND));
+        fRows.push(row(["Per unit, per month", perUnitMonth(floor.floor)], fAligns));
+      } else if (floor.tier === 3) {
+        fRows.push(row(["Minimum reserve contribution", "None prescribed"], fAligns, true, BAND));
+      }
+      MP.push(tbl(fRows));
+
+      if (floor.tier === 1 && floor.floor != null) {
+        MP.push(para(
+          `The fund is below 25% of the contributions actually collected last year, so Regulation 2(a) applies and the coming year's budgeted reserve contribution must be at least 15% of the budgeted contribution to the administrative fund — ${money(floor.floor)}, about ${perUnitMonth(floor.floor)} per unit per month. This is a floor set by regulation, not a proposal, and it applies whether or not the plan below has been completed.`,
+          { size: 20 }));
+      } else if (floor.tier === 2 && floor.floor != null) {
+        MP.push(para(
+          `The fund sits between 25% and 100% of last year's contributions, so Regulation 2(c) applies and the minimum is the amount budgeted to be spent from the ADMINISTRATIVE fund on repairs and maintenance to common property — ${money(floor.floor)}. Note what this is not: it is not what the scheme plans to spend out of the reserve. Reaching this tier lowers the obligation sharply, which is the reason the designation below is set above the 25% line rather than at the bare minimum.`,
+          { size: 20 }));
+      } else if (floor.tier === 3) {
+        MP.push(para(
+          "The fund equals or exceeds a full year of contributions, so Regulation 2 prescribes no minimum. Section 3(1)(b) still requires it to be reasonably sufficient, which is the plan's question rather than the regulation's.",
+          { size: 20 }));
+      }
+
+      // The reading of "contribution" is contested, so the report says which one
+      // it used and what the other would have produced. A single number with no
+      // basis stated is the thing a reader has to reverse-engineer.
+      MP.push(H2("Which figure the 15% was taken of"));
+      MP.push(para(
+        `Regulation 2 speaks of "the total budgeted contribution to the administrative fund" and does not define it. Section 3(1)(f) says contributions are levied in proportion to participation quota, which points at the levy grid alone; section 3(1)(a)(ii) puts the council water and electricity bill squarely in the administrative fund, which points at everything owners pay. The trustees have reported on ${basisLabel}. Note the levy grid already contains the fixed utility charges — sewerage, the water demand levy and common-property water and electricity — so only metered consumption separates the two.`,
+        { size: 20 }));
+      if (budget && budget.contributions) {
+        const bAl = ["left", "right", "right"];
+        const bR = [hrow([`Budgeted owner contributions, FY ${nfy}`, "Amount", "15% of it"], bAl)];
+        bR.push(row(["Levy grid", money(budget.contributions.levy), money(round2(budget.contributions.levy * 0.15))], bAl, basisIsLevyOnly, basisIsLevyOnly ? BAND : undefined));
+        bR.push(row(["Metered water and electricity recovered", money(budget.contributions.metered), "—"], bAl));
+        bR.push(row(["All owner contributions", money(budget.contributions.all), money(round2(budget.contributions.all * 0.15))], bAl, !basisIsLevyOnly, !basisIsLevyOnly ? BAND : undefined));
+        MP.push(tbl(bR));
+        if (budget.contributions.unclassified.length) {
+          MP.push(hint(`Not counted in either reading because they have not been classified on the Budget page: ${budget.contributions.unclassified.join(", ")}. Until they are, the figures above understate the base and therefore the minimum.`));
+        }
+        MP.push(hint(`Interest earned is excluded from both readings — it is not a contribution from an owner. On the other reading (${otherLabel}) the minimum would be ${money(round2((otherBase || 0) * 0.15))}. The question should be settled with the scheme's accountant; the designation proposed below is compliant on either.`));
+      }
+
+      // ---- 3. The proposal ----
+      MP.push(H2("Proposed opening designation"));
+      if (proposed == null) {
+        MP.push(hint("No opening designation has been proposed. Capture it on Config → AGM report figures — it is a decision the meeting takes, not a figure any table here can produce."));
+      } else {
+        const cash = budget && budget.openingCash != null ? budget.openingCash : null;
+        const monthly = budget && budget.totalExpenditure ? round2(budget.totalExpenditure / 12) : null;
+        const pAl = ["left", "right"];
+        const pR = [hrow(["", `FY ${nfy}`], pAl)];
+        pR.push(row(["Proposed designation to the reserve fund", money(proposed)], pAl, true, BAND));
+        // A null floor means the base could not be computed, not that the
+        // minimum is nil. Printing R 0.00 for it would be a lie the meeting
+        // would have no way to spot.
+        pR.push(row(["Statutory minimum on the adopted basis", floor.floor == null ? "not computed" : money(floor.floor)], pAl));
+        if (floor.floor != null) pR.push(row(["Margin over the minimum", money(round2(proposed - floor.floor))], pAl));
+        if (budget && budget.contributions) {
+          pR.push(row(["As % of all budgeted owner contributions", `${(proposed / budget.contributions.all * 100).toFixed(1)}%`], pAl));
+          pR.push(row(["As % of budgeted levy contributions", `${(proposed / budget.contributions.levy * 100).toFixed(1)}%`], pAl));
+        }
+        if (cash != null) {
+          pR.push(row(["Cash held", money(cash)], pAl));
+          pR.push(row(["Administrative cash after the designation", money(round2(cash - proposed))], pAl));
+          // Rounded once, not twice: round2 then toFixed(1) turns 6.246 into
+          // 6.3 by way of 6.25, and disagrees with every other statement of the
+          // same figure.
+          if (monthly) pR.push(row(["Months of operating cover remaining", ((cash - proposed) / monthly).toFixed(1)], pAl));
+        }
+        MP.push(tbl(pR));
+
+        MP.push(para(
+          `No owner pays anything for this. The scheme holds ${cash == null ? "accumulated cash" : money(cash)} in a single account with no stated purpose, accumulated over years of collecting more than was spent. Designating ${money(proposed)} of it as the reserve fund changes the label on the money, not the bank balance: it is a transfer between two funds of the same body corporate, not an outflow, and it requires no increase in levies. This is the point most likely to be misunderstood, and it is why the contribution does not appear in the cash projection in section 13.`,
+          { size: 20 }));
+
+        if (budget && budget.contributions) {
+          const pctAll = proposed / budget.contributions.all * 100;
+          const pctLevy = proposed / budget.contributions.levy * 100;
+          const clearsBoth = pctAll > 25 && pctLevy > 25;
+          MP.push(para(
+            `${money(proposed)} is chosen to clear the 25% line rather than to meet the minimum. At ${pctAll.toFixed(1)}% of all contributions and ${pctLevy.toFixed(1)}% of the levy grid it sits above 25% on ${clearsBoth ? "both readings" : "the adopted reading"}, so FY ${nextFY(nfy)} falls into tier 2 and its minimum becomes the year's budgeted repairs and maintenance — currently ${budget.commonPropertyRM == null ? "a figure yet to be budgeted" : money(budget.commonPropertyRM)} — instead of a further 15%. ${clearsBoth ? "It is therefore compliant whichever way the accountant reads the regulation, so the meeting need not wait for that answer to act. " : ""}Two cautions: the FY ${nextFY(nfy)} test runs against FY ${nfy} ACTUAL contributions rather than the budget, so if collections overshoot materially the designation should be topped up before year end; and a balance of exactly 25% falls in a drafting gap between paragraphs (a) and (c) of Regulation 2, so the line is one to clear rather than to land on.`,
+            { size: 20 }));
+        }
+        MP.push(hint("Transferring accumulated administrative surplus between funds is a members' decision rather than a trustee one, so it is on the agenda as an express resolution rather than reported as already done. Nothing has been designated: the ledger above is still empty."));
+      }
+
+      if (floor.atGap) {
+        MP.push(hint("The reserve balance sits at almost exactly 25% of last year's contributions. Regulation 2(a) catches a fund of LESS than 25% and 2(c) a fund of MORE than 25%, so a balance on the line is caught by neither. Move it clear in either direction rather than leaving it there."));
+      }
+
+      // ---- 4. The compliance gap the report will not hide ----
+      MP.push(H2("Separate bank account — PMR 26(1)(b)"));
+      MP.push(para(
+        "Prescribed Management Rule 26(1)(b) requires separate books of account and separate bank accounts for the administrative fund and the reserve fund. The scheme operates one account. Reserve entries are therefore tracked notionally against it, which is enough to report the fund honestly but is not what the rule requires. The trustees have chosen to state this openly rather than present the notional position as compliance; opening the account is on the agenda, and PMR 21 then requires the balance to be held in a secure investment.",
+        { size: 20 }));
+    }
+
+    // ---- 5. The plan ----
+    MP.push(H2("The PMR 22 plan — register coverage"));
+    MP.push(para(
+      "The minimum above is a floor set by regulation. What the fund actually needs is set by the components it exists to replace, and that is the plan's question. The annual contribution below is the rule's own formula: replacement cost less the reserve already held, divided by the years remaining.",
+      { size: 20 }));
     const cAligns = ["left", "right"];
     const cRows = [hrow(["", "Components"], cAligns)];
     cRows.push(row(["On the register", String(plan.totalCount)], cAligns));
@@ -6665,48 +6831,9 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
       MP.push(para(
         `No component has been assessed yet, so no plan can be calculated and the tables below are empty. The register carries ${plan.totalCount} components as a checklist; each needs an age or install date, an expected life, a present condition and an estimated replacement cost. That is a walk around the property with a clipboard, not a consultant.`,
         { size: 20 }));
-      MP.push(hint("Until this is done the scheme is not compliant with PMR 22. It is the single largest gap in the AGM pack."));
+      MP.push(hint(`Until this is done nobody can say whether the reserve fund is reasonably sufficient, only that it is lawful. A seven-unit scheme with an uncosted roof does not know whether ${floor && floor.floor ? money(floor.floor) : "the statutory minimum"} a year is generous or negligent. This is the single largest gap in the AGM pack and it is the work that answers the question the fund exists to answer.`));
     } else if (plan.assessedCount < plan.totalCount) {
       MP.push(hint(`${plan.totalCount - plan.assessedCount} of ${plan.totalCount} components are unassessed and contribute nothing to the figures below, so the contribution is understated. They are listed at the end of this section.`));
-    }
-
-    // Reserve fund position.
-    MP.push(H2("Reserve fund"));
-    const rAligns = ["left", "right"];
-    const rRows = [hrow(["", `FY ${fy}`], rAligns)];
-    rRows.push(row(["Contributions and interest to date", money(plan.reserve.contributions)], rAligns));
-    rRows.push(row(["Drawdowns", money(plan.reserve.drawdowns)], rAligns));
-    rRows.push(row(["Balance held", money(plan.reserve.balance)], rAligns, true, BAND));
-    MP.push(tbl(rRows));
-    if (plan.reserve.entryCount === 0) {
-      MP.push(para(
-        "There is no reserve fund. The ledger has no entries, so the whole replacement cost of every component still has to be funded from future contributions — which is what makes the annual figure below as large as it is.",
-        { size: 20 }));
-    }
-
-    // The statutory floor.
-    if (floor) {
-      MP.push(H2("The statutory minimum"));
-      const fAligns = ["left", "right"];
-      const fRows = [hrow(["", `FY ${nfy}`], fAligns)];
-      // "Owner contributions" rather than the old "Levies collected", because
-      // that is exactly what the figure now is — and the old label had been
-      // sitting over a number that also contained bank interest.
-      fRows.push(row([`Owner contributions collected in FY ${fy}`, money(floor.leviesCollected)], fAligns));
-      fRows.push(row(["25% of that — the reserve fund threshold", money(floor.threshold)], fAligns));
-      fRows.push(row(["Reserve fund held", money(plan.reserve.balance)], fAligns));
-      fRows.push(row(["Below the threshold?", floor.below ? "Yes" : "No"], fAligns, true));
-      if (floor.below && floor.floor != null) {
-        fRows.push(row(["Budgeted administrative contribution", money(floor.adminBudget)], fAligns));
-        fRows.push(row(["Minimum reserve contribution — 15% of it", money(floor.floor)], fAligns, true, BAND));
-        fRows.push(row(["Per unit, per month", money(round2(floor.floor / (units.length || 7) / 12))], fAligns));
-      }
-      MP.push(tbl(fRows));
-      if (floor.below && floor.floor != null) {
-        MP.push(para(
-          `Because the reserve fund is below 25% of last year's levies, PMR 22 requires the coming year's budgeted reserve contribution to be at least 15% of the budgeted administrative contribution — ${money(floor.floor)}, about ${money(round2(floor.floor / (units.length || 7) / 12))} per unit per month. This is a floor set by regulation, not a proposal, and it applies whether or not the plan below has been completed.`,
-          { size: 20 }));
-      }
     }
 
     if (plan.assessedCount > 0) {
@@ -6719,6 +6846,16 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
       aRows.push(row(["Per unit, per month", money(round2(plan.annualContribution / (units.length || 7) / 12))], aAligns));
       MP.push(tbl(aRows));
       MP.push(hint(`Each component contributes its own replacement cost less the reserve attributed to it, divided by its remaining life; the total is the sum. Reserve entries tagged to a component are attributed directly, and the untagged balance is apportioned in proportion to replacement cost.`));
+      // Regulation 2's minimum does not discharge s3(1)(b). Where the plan asks
+      // for more, the plan is the number that matters.
+      if (floor && floor.floor != null) {
+        const gap = round2(plan.annualContribution - floor.floor);
+        MP.push(para(
+          gap > 0
+            ? `The plan asks for ${money(plan.annualContribution)} a year and the regulation for ${money(floor.floor)} — a difference of ${money(gap)}. The higher of the two governs: meeting a minimum set by regulation does not discharge the section 3(1)(b) duty to keep the fund reasonably sufficient, and a fund funded to the floor while the plan asks for more is a special levy waiting to happen.`
+            : `The plan asks for ${money(plan.annualContribution)} a year against a statutory minimum of ${money(floor.floor)}, so the regulation is the binding figure this year. That holds only while the register stays as costed; the plan is the number to watch as components are assessed.`,
+          { size: 20 }));
+      }
 
       // The ten-year schedule.
       MP.push(H2("Ten-year schedule"));
@@ -6811,7 +6948,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
 
     if (budget.reserve.length && budget.afterReserve < 0 && budget.operatingSurplus >= 0) {
       BG.push(para(
-        `The budget balances on operations and fails on the reserve: a surplus of ${money(budget.operatingSurplus)} becomes a shortfall of ${money(Math.abs(budget.afterReserve))} once the statutory reserve contribution of ${money(budget.totalReserve)} is added. Section 13 sets out why that contribution is a regulatory floor rather than a proposal. It does not follow that levies must rise — the contribution is a designation, and the scheme's accumulated cash is discussed below.`,
+        `The budget balances on operations and fails on the reserve: a surplus of ${money(budget.operatingSurplus)} becomes a shortfall of ${money(Math.abs(budget.afterReserve))} once the statutory reserve contribution of ${money(budget.totalReserve)} is added. Section 12 sets out why that contribution is a regulatory floor rather than a proposal, and proposes how it is funded. It does not follow that levies must rise — the contribution is a designation, and the scheme's accumulated cash is discussed below.`,
         { size: 20 }));
     }
 
@@ -7186,10 +7323,10 @@ async function fetchMaintenancePlan(fy, opts = {}) {
 }
 
 // ---------- Budget ----------
-// Section 14 of the AGM report and the Budget page read the same rows. The
+// Section 13 of the AGM report and the Budget page read the same rows. The
 // report NEVER recomputes a line — it prints what is stored, so the document
 // tabled at the meeting is exactly what the trustee agreed and saved. That is
-// the opposite of sections 3, 10 and 13, which are computed on the fly because
+// the opposite of sections 3, 10 and 12, which are computed on the fly because
 // they report facts; a budget is a decision, and a decision has to be pinned.
 async function fetchBudget(fy) {
   const client = await ensureSupabaseClient();
@@ -7208,6 +7345,26 @@ async function fetchBudget(fy) {
   const total = (rows) => round2(rows.reduce((s, r) => s + r.amount, 0));
 
   const totalIncome = total(income), totalExpenditure = total(expenditure), totalReserve = total(reserve);
+
+  // Regulation 2 is taken of "the total budgeted contribution to the
+  // administrative fund" and never defines it. The two readings differ only on
+  // the metered recoveries, so the rows carry their own class and the report
+  // sums whichever the scheme has adopted. Classifying on the row rather than
+  // matching labels in the report is deliberate: matching by label is exactly
+  // how bank interest got inside the 25% threshold once already, and a new
+  // income line added later would rejoin the calculation silently.
+  const classTotal = (c) => total(income.filter((r) => r.contribution_class === c));
+  const levyContributions = classTotal("levy");
+  const meteredRecoveries = classTotal("metered_recovery");
+  // An unclassified income row is not assumed either way. It is reported, so a
+  // line added on the Budget page and left unclassified shows up as a gap in
+  // the AGM pack rather than quietly moving the statutory floor.
+  const unclassifiedIncome = income.filter((r) => !r.contribution_class).map((r) => r.label);
+  // The tier 2 minimum: what is budgeted to be spent FROM THE ADMINISTRATIVE
+  // FUND on repairs and maintenance to common property. Not what is planned to
+  // be spent out of the reserve — that is the trap in Regulation 2(c).
+  const rmRows = expenditure.filter((r) => r.is_common_property_rm);
+
   const m = (meta.data || [])[0] || null;
   const openingCash = m && m.opening_cash != null ? Number(m.opening_cash) : null;
   const operatingSurplus = round2(totalIncome - totalExpenditure);
@@ -7223,22 +7380,79 @@ async function fetchBudget(fy) {
     // balance. Getting this wrong understates cash by the contribution.
     closingCash: openingCash == null ? null : round2(openingCash + operatingSurplus),
     assumptions: all.filter((r) => r.is_assumption).map((r) => r.label),
+    // The Regulation 2 inputs, both readings side by side so the report can
+    // state the one adopted and cross-check the other in a line.
+    contributions: {
+      levy: levyContributions,
+      metered: meteredRecoveries,
+      all: round2(levyContributions + meteredRecoveries),
+      unclassified: unclassifiedIncome,
+    },
+    commonPropertyRM: rmRows.length ? total(rmRows) : null,
+    commonPropertyRMLabels: rmRows.map((r) => r.label),
     meta: m,
     hasData: all.length > 0,
   };
 }
 
-// The PMR 22 minimum. If the reserve fund at the end of the last financial year
-// is below 25% of that year's total levies, the coming year's budgeted reserve
-// contribution must be at least 15% of the budgeted administrative contribution.
-// Returns the floor and whether it bites, so the report can state it as a rule
-// rather than as an opinion.
-function reserveFundFloor({ reserveBalance, leviesCollected, adminBudget }) {
-  if (leviesCollected == null) return null;
-  const threshold = round2(leviesCollected * 0.25);
-  const below = (reserveBalance || 0) < threshold;
-  const floor = below && adminBudget != null ? round2(adminBudget * 0.15) : null;
-  return { threshold, below, floor, adminBudget: adminBudget == null ? null : round2(adminBudget) };
+// The basis the scheme has adopted, resolved to an amount. Defaults to the
+// broad reading when nothing has been chosen on Config — it is the larger of
+// the two, so an unanswered question produces the more conservative floor
+// rather than the more convenient one.
+function contributionBase(budget, basis) {
+  if (!budget || !budget.contributions) return null;
+  return basis === "levy_only" ? budget.contributions.levy : budget.contributions.all;
+}
+
+// The Regulation 2 minimum, all three tiers.
+//
+// Two bases, and conflating them is the easy mistake. The THRESHOLD test runs
+// against the previous year's ACTUAL contributions to the administrative fund;
+// the 15% is of the coming year's BUDGETED contributions. They are different
+// years and different quantities.
+//
+//   reserve < 25% of prior actual   → 15% of budgeted contributions   (tier 1)
+//   25% – 100%                      → budgeted admin-fund R&M spend   (tier 2)
+//   ≥ 100%                          → no minimum                      (tier 3)
+//
+// Two traps this function exists to stop the report walking into:
+//
+//   * Tier 2 is NOT what the scheme plans to spend out of the reserve. It is
+//     what it budgets to spend from the ADMINISTRATIVE fund on repairs and
+//     maintenance to common property. Small, but rarely nil — and the previous
+//     version of this function returned null above 25%, which reads as "no
+//     obligation" at exactly the point tier 2 starts to bite.
+//   * Paragraph (a) catches a reserve of LESS than 25% and paragraph (c) MORE
+//     than 25%. A balance of precisely 25% is caught by neither. The gap is a
+//     defect in the drafting, not something to land on, so it is flagged.
+function reserveFundFloor({ reserveBalance, priorYearContributions, budgetedContributions, budgetedRM }) {
+  if (priorYearContributions == null) return null;
+  const balance = round2(reserveBalance || 0);
+  const threshold = round2(priorYearContributions * 0.25);
+  const ceiling = round2(priorYearContributions);
+
+  let tier, floor;
+  if (balance < threshold) {
+    tier = 1;
+    floor = budgetedContributions == null ? null : round2(budgetedContributions * 0.15);
+  } else if (balance < ceiling) {
+    tier = 2;
+    floor = budgetedRM == null ? null : round2(budgetedRM);
+  } else {
+    tier = 3;
+    floor = 0;
+  }
+
+  return {
+    tier, threshold, ceiling, floor, balance,
+    below: tier === 1,            // kept: tier 1 is the only tier the 15% applies in
+    atGap: Math.abs(balance - threshold) < 0.005,
+    priorYearContributions: round2(priorYearContributions),
+    budgetedContributions: budgetedContributions == null ? null : round2(budgetedContributions),
+    budgetedRM: budgetedRM == null ? null : round2(budgetedRM),
+    // What the balance would have to reach to leave the tier it is in.
+    toNextTier: tier === 1 ? round2(threshold - balance) : tier === 2 ? round2(ceiling - balance) : 0,
+  };
 }
 
 // The water band set in force on a given date, in the shape calcWaterCost and
@@ -8813,6 +9027,28 @@ const AGM_FIELDS = [
   { key: "electricity_service_fee_new", label: "Electricity service charge — new complex total", kind: "money" },
   { key: "electricity_network_fee_new", label: "Electricity network charge — new complex total", kind: "money" },
   { key: "services_note_annual_estimate", label: "Service notes — estimated annual cost", kind: "money" },
+  // Section 12. Neither figure is derivable from anything the app holds.
+  //
+  // The BASIS is an unresolved reading of Regulation 2 — s3(1)(f) points at the
+  // levy grid alone, s3(1)(a)(ii) at everything owners pay — and the difference
+  // is which budget income rows count. Left blank it defaults to the broad
+  // reading, which is the larger base and therefore the more conservative floor:
+  // an unanswered question should not produce the more convenient answer.
+  //
+  // The DESIGNATION is a decision the meeting takes, in the same way the four
+  // "new rate" fields above are proposals the meeting votes on rather than
+  // figures the council or an invoice can supply.
+  {
+    key: "reserve_contribution_basis",
+    label: "Reserve fund — basis for the 15% minimum",
+    kind: "select",
+    options: [
+      { value: "", label: "Not chosen — defaults to all contributions" },
+      { value: "all_contributions", label: "All owner contributions" },
+      { value: "levy_only", label: "Levy contributions only" },
+    ],
+  },
+  { key: "reserve_proposed_designation", label: "Reserve fund — proposed opening designation", kind: "money" },
   // Water rate-card reconciliation factor, approved at the AGM for the year
   // AHEAD. Multiply CoJ's published step rates by it to get the card owners are
   // billed on:  card rate = CoJ step rate × factor.
@@ -8979,6 +9215,8 @@ function AgmReportSettings() {
         <br />
         <b>The year above is the year the report covers</b>, not the year every figure applies to. The <i>current</i> fields are that year's; the <i>proposed</i> and <i>new</i> fields are what the meeting is asked to approve for the year after. A September 2026 AGM reporting on FY 2025/2026 therefore keeps both sets on <b>2025/2026</b>.
         <br />
+        <b>The two reserve fund fields</b> drive section 12. The <i>basis</i> settles which budget income lines the 15% statutory minimum is taken of — Regulation 2 says "the total budgeted contribution to the administrative fund" and never defines it, so this is the reading the trustees have adopted on the accountant's advice. Left unchosen it defaults to <b>all owner contributions</b>, the larger base and so the more conservative floor. Which rows fall into each reading is set per line on the <b>Budget</b> page. The <i>proposed opening designation</i> is what the meeting is asked to transfer from accumulated administrative funds — a decision, not a figure any table can produce.
+        <br />
         <b>The water reconciliation factor</b> is the figure the meeting approves for the year ahead: multiply the council's published step rates by it to get the rate card owners are billed on. Work it out as the year's council consumption charges (excluding VAT) divided by the same year's unit readings priced on the council's own step rates, capped at the highest step any invoice reached. FY 2025/2026 gives <b>0,9543</b>. <b>Nothing is billed on it yet</b> — statements still use the tariff table directly — so changing it here affects the AGM discussion only.
       </p>
 
@@ -8991,6 +9229,14 @@ function AgmReportSettings() {
             {AGM_FIELDS.map((f) => (
               <label key={f.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, fontSize: 12.5 }}>
                 <span style={{ color: "#1B2A38" }}>{f.label}</span>
+                {f.kind === "select" ? (
+                  <select
+                    value={settings[f.key] ?? ""}
+                    onChange={(e) => setSettings((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                    style={{ ...inputStyle, width: 230, textAlign: "left", fontFamily: "inherit" }}>
+                    {f.options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                ) : (
                 <input
                   type={f.kind === "date" ? "date" : "text"}
                   inputMode={f.kind === "money" || f.kind === "number" ? "decimal" : undefined}
@@ -9007,6 +9253,7 @@ function AgmReportSettings() {
                   }}
                   style={{ ...inputStyle, width: f.kind === "text" || f.kind === "date" ? 150 : 110, textAlign: f.kind === "text" ? "left" : "right", fontFamily: f.kind === "text" || f.kind === "date" ? "inherit" : inputStyle.fontFamily }}
                 />
+                )}
               </label>
             ))}
           </div>
@@ -10807,7 +11054,7 @@ function BankRecon({ periods, period, setPeriod, onImported }) {
 
 // ---------- Maintenance plan & reserve fund ----------
 // Added 8 August 2026. Where the PMR 22 register actually lives: the component
-// list, its condition history, and the reserve fund ledger. Section 13 of the
+// list, its condition history, and the reserve fund ledger. Section 12 of the
 // AGM report is computed from exactly this data, so anything captured here
 // appears in the report and nothing has to be typed twice.
 function MaintenancePlan() {
@@ -10970,7 +11217,7 @@ function MaintenancePlan() {
     <>
       <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Maintenance plan</h1>
       <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
-        The component register behind the statutory ten-year plan. Section 13 of the AGM report is computed from exactly this data — capture it once here and it appears in the report. A component needs <strong>an expected life and a replacement cost</strong> before it can carry a provision; everything else sharpens the estimate. The reserve fund ledger is on the <b>Financial dashboard</b>.
+        The component register behind the statutory ten-year plan. Section 12 of the AGM report is computed from exactly this data — capture it once here and it appears in the report. A component needs <strong>an expected life and a replacement cost</strong> before it can carry a provision; everything else sharpens the estimate. The reserve fund ledger is on the <b>Financial dashboard</b>.
       </p>
 
       {notice && (
@@ -11127,7 +11374,7 @@ function MaintenancePlan() {
         <div style={{ fontSize: 12.5, color: "#64748B", lineHeight: 1.7 }}>
           <b>The reserve fund ledger is on the Financial dashboard.</b>{" "}
           Balance <strong>{money(plan.reserve.balance)}</strong> across {plan.reserve.entryCount} entr{plan.reserve.entryCount === 1 ? "y" : "ies"},
-          already netted off the annual contribution above. Section 13 of the AGM report still reports the plan and the reserve together, because PMR 22 ties them together.
+          already netted off the annual contribution above. Section 12 of the AGM report reports the reserve fund and the plan together, because Regulation 2 sets the floor and PMR 22 decides whether the floor is enough.
         </div>
       </Card>
     </>
@@ -11273,7 +11520,7 @@ function InspectionForm({ onSave, saving }) {
 }
 
 // ---------- Budget ----------
-// Added 8 August 2026. Section 14 of the AGM report prints exactly what is saved
+// Added 8 August 2026. Section 13 of the AGM report prints exactly what is saved
 // here — it does not recompute. A budget is a decision rather than a fact, so
 // what the meeting sees has to be what the trustee agreed, not what a formula
 // produced at the moment the document was generated.
@@ -11362,7 +11609,7 @@ function Budget() {
         }, { onConflict: "financial_year" });
         if (error) throw error;
       }
-      setNotice("Saved. Section 14 of the AGM report now prints these figures.");
+      setNotice("Saved. Section 13 of the AGM report now prints these figures.");
       await load(fy);
     } catch (err) {
       console.error("Saving the budget failed:", err);
@@ -11456,7 +11703,7 @@ function Budget() {
         <div>
           <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Budget — FY {fy}</h1>
           <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18, maxWidth: 720 }}>
-            Every figure is editable and every figure is printed. <strong>Section 14 of the AGM report prints exactly what is saved here</strong> — it does not recompute, so what is tabled at the meeting is what you agreed. Totals below move as you type; nothing is written until you save.
+            Every figure is editable and every figure is printed. <strong>Section 13 of the AGM report prints exactly what is saved here</strong> — it does not recompute, so what is tabled at the meeting is what you agreed. Totals below move as you type; nothing is written until you save.
           </p>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>

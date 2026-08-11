@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 11 August 2026, session 20 (supersedes the 11 August 2026 session 19 summary)
+Last updated: 11 August 2026, session 21 (supersedes the 11 August 2026 session 20 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,75 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 11 August 2026, session 21 — the reserve fund is built into the AGM pack
+
+Session 20 planned it; this session shipped it. **`docs/El-Corazon-Reserve-Fund-Working-Plan.docx`**
+sets out both readings side by side. Devon chose **Option A2: report on all owner
+contributions, designate R 70,000.** Still a proposal — the ledger is empty and no money has moved.
+
+### Section 12 is now the reserve fund section
+
+Renamed **"12. Reserve fund and the PMR 22 maintenance plan"** and reordered so the reserve leads:
+position → statutory minimum → which figure the 15% was taken of → the R 70,000 proposal → the
+PMR 26(1)(b) gap → register coverage → the plan. **Renaming rather than splitting was deliberate**:
+a new standalone section renumbers the budget too, and every prose cross-reference with it — the
+exact change that broke the report in session 18.
+
+Printed for FY 2026/2027: tier 1, threshold R 56,848.73, floor **R 40,018.43** (R 476.41/unit/month),
+proposal R 70,000 at 26.2% of all contributions and 46.7% of the levy grid, cash after R 140,844.15,
+6.2 months of cover. **Verified against live data**; every figure matches the working plan.
+
+### `reserveFundFloor()` was wrong twice over and is now right
+
+- **Wrong base.** It took `adminBudget: report.totalExpense` — prior-year *expenditure*, where the
+  regulation wants next year's *budgeted contributions*. It now takes both bases separately, because
+  the threshold runs on last year's **actual** contributions and the 15% on next year's **budgeted**
+  ones. One argument was serving both.
+- **Tier 1 only.** It returned `null` above 25%, which reads as "no obligation" exactly when tier 2
+  starts to bite. All three tiers now, plus `toNextTier` and an `atGap` flag for the
+  exactly-25% drafting hole between Reg 2(a) and 2(c).
+
+### The two things the app cannot derive, and where they live
+
+Both on **Config → AGM report figures**, driven by `AGM_FIELDS` — the same home and the same
+convention as `sewerage_per_unit_new`: stored on the row for the year the report **covers**, holding
+what is proposed for the year after. So the FY 2026/2027 figures sit on the **2025/2026** row.
+
+| Field | Why it can't be computed |
+|---|---|
+| `reserve_contribution_basis` | An unresolved reading of Reg 2. Blank → **all contributions**, the larger base, so an unanswered question gives the more conservative floor rather than the more convenient one. |
+| `reserve_proposed_designation` | A decision the meeting takes. |
+
+`AGM_FIELDS` gained a **`select` kind** for the basis — the card previously rendered `<input>` only.
+
+### Classification moved onto the budget row
+
+`budget_lines.contribution_class` (`levy` / `metered_recovery` / `non_contribution`) and
+`is_common_property_rm`. **Matching income rows by label in the report is how bank interest got
+inside the 25% threshold in the first place** (session 15), and a new income line would rejoin the
+calculation silently. Now both readings sum from one table, so they cannot drift, and an
+**unclassified income row is reported as a gap rather than assumed either way**. The one-off
+backfill matches by label — acceptable once, against a known set of rows; not acceptable per render.
+Migration `reserve_fund_basis_and_budget_classes.sql`, applied and mirrored. Additive only.
+
+### Section numbers were stale since session 18 — nine of them
+
+The renumbering that session missed the prose. Section 12 was being called 13 and the budget 14, in
+one report paragraph, three comments and two UI strings. All corrected.
+
+### Verified
+Bundle clean; `no-undef` clean apart from the pre-existing `URLSearchParams` at line 950.
+`reserveFundFloor()` re-run against live figures reproduces the working plan to the cent.
+**`npm run build` still has to be run locally** — the sandbox can't, `node_modules` carries the
+Windows rollup binary.
+
+### Still not done
+Costing the 24 components. Until that happens the fund is lawful but nobody can say it is
+*sufficient*, which is the only question that matters. The Reserve fund page still shows no tier —
+section 12 does, but the ledger screen doesn't yet.
 
 ---
 
