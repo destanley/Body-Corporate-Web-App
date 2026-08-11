@@ -73,6 +73,42 @@ Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 20
 
 ---
 
+## Done on 11 August 2026, session 13 — the AGM "New" column for the bill-driven charges
+
+### The gap
+Section 9 of the AGM report has three rows whose **New — FY** cell could never be filled by anybody:
+
+- Water Demand Levy (per unit / month) excl VAT
+- Electricity Service Charge (complex, excl VAT)
+- Electricity Network Charge (complex, excl VAT)
+
+They read `levy_rates` for the *following* financial year, and **nothing writes to those columns any more**. Tariffs & rates dropped the three inputs when the charges moved to the invoice-driven model (session 5); a `levy_rates` row for a new year is created as a side effect of saving the common property standards, which correctly leaves the fee columns **null** (see `levy_rates_nullable_fees.sql` — null was deliberately chosen over a misleading `R 0,00`).
+
+So the null wasn't "you forgot to type it", it was a **dead end**: no field existed anywhere in the app to capture an AGM figure for these three. Confirmed against live data — `levy_rates` FY 2026/2027 is null on all three, FY 2025/2026 has R124.00 / R278.98 / R1,125.75.
+
+The Current column never showed the gap because `feeCell()` falls back to the uploaded council invoice with a source footnote. The New column has no fallback, because there is nothing to fall back *to* — the council hasn't published next year's tariff and the invoice only carries what is being billed now.
+
+### The fix — same shape as `sewerage_per_unit_new`
+This is the identical problem sewerage had in session 3, so it gets the identical answer rather than a second mechanism.
+
+- **Migration `agm_report_settings_utility_new_rates`** (mirrored in `migrations/agm_report_settings_utility_new_rates.sql`) adds `water_demand_levy_new`, `electricity_service_fee_new`, `electricity_network_fee_new` to `agm_report_settings`. Additive only; nothing altered.
+- **Three fields on Config → AGM report figures.** The card is driven entirely off `AGM_FIELDS`, so they are three list entries — no new form code.
+- **`newCell(approved, proposed)`** in the report builder: an AGM-approved figure in next year's `levy_rates` still wins, the Config proposal is the fallback, blank if neither. Sewerage now routes through the same helper instead of its own inline expression.
+- Stored on the row for the year the report **covers**, holding the figure proposed for the year after — the existing convention shared by `sewerage_per_unit_new`, `garden_proposed_rate_per_day` and `blockwatch_monthly_proposed`.
+
+### Why not restore the inputs on Tariffs & rates
+That was the alternative. It re-opens the invoice-vs-AGM ambiguity the session 5 refactor removed: the invoice is the single source for what is actually being charged, and a second editable copy of the same charge invites the two to disagree. Keeping the proposals on Config says what they are — figures the meeting votes on, not something the council tells you.
+
+> Still not interchangeable with the invoice, which is why the fallback is a *proposal* and not the bill: FY 2025/2026's approved `water_demand_levy` is **R124.00** against a council charge of R65.08–R107.74.
+
+### The closing hint now names the right page
+It previously sent the reader to Tariffs & rates for every blank in the New column. There are two different gaps with two different homes, so it now reports them separately — common property provisions → Tariffs & rates, the four bill-driven charges → Config — and only fires when a cell is **actually** blank, tracked by `newGap`.
+
+### Verified
+`esbuild` parse clean (the sandbox can't run `vite build` — `node_modules` carries the Windows rollup binary). Migration applied to the live project and confirmed. **Left null deliberately**: no approved FY 2026/2027 figures exist to seed, so the cells stay blank until Devon captures them on Config.
+
+---
+
 ## Done on 8 August 2026, session 12 — the budget, as a module and a report section
 
 ### `docs/budget-FY2026-2027.md` — the projected budget, built at last
@@ -965,7 +1001,7 @@ Mirrored in `migrations/agm_report_insurance_and_settings.sql`. Additive; nothin
 - **`agm_report_settings`** — one row per FY: garden rate/day, increase %, proposed rate/day, visits/month, bonus + due date, increase effective date, blockwatch current/proposed, the services-note estimate, `sewerage_per_unit_new`, and `prepared_by`/`checked_by`.
 - Both RLS-enabled, trustee-only via `is_trustee()`. Seeded with the template's FY2025/2026 figures, so the report reproduces it out of the box.
 - **Projected annual garden cost is not stored** — it is proposed rate × visits/month × 12, so it can't fall out of step with the rate.
-- `sewerage_per_unit_new` exists because the New column had **no source at all**: `council_invoices` only carries the rate being billed now, and next year's isn't published yet. It was a permanent blank.
+- `sewerage_per_unit_new` exists because the New column had **no source at all**: `council_invoices` only carries the rate being billed now, and next year's isn't published yet. It was a permanent blank. *(Session 13: the water demand levy and the two electricity charges turned out to have the same problem and now sit here too — `water_demand_levy_new`, `electricity_service_fee_new`, `electricity_network_fee_new`.)*
 
 ### Config screen: "AGM report figures" card
 New `AgmReportSettings` component under the categories card. FY selector (current body-corp FY plus the three before it), the insurance grid with live derived per-annum/per-month, and the settings fields. *(Session 4: the insurance grid moved off this card to the Insurance page — see below. The garden/Blockwatch/sewerage/sign-off fields stay here.)* Text inputs with `inputMode="decimal"` and a comma-tolerant parser — **not `type="number"`**, for the reasons already recorded under session 2 (en-ZA renders `33.57` as `33,57` and strips trailing zeros). A blank field still renders that report row as an empty cell to complete in Word, which is how the whole section used to work.

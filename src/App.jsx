@@ -4393,7 +4393,7 @@ function RateSettings({
           )}
         </div>
         <p style={{ fontSize: 12, color: "#94A0AC", marginBottom: 12 }}>
-          Water Demand Levy, Sewerage, and the Electricity Service/Network charges now come from the uploaded utility bills — see <b>Invoice allocation</b>. Only the common-property standards live here; they drive the calculated values on the Levy breakdown page.
+          Water Demand Levy, Sewerage, and the Electricity Service/Network charges now come from the uploaded utility bills — see <b>Invoice allocation</b>. Only the common-property standards live here; they drive the calculated values on the Levy breakdown page. Next year’s <i>proposed</i> figures for those four charges are captured under <b>AGM report figures</b> on Config, since the council hasn’t published them yet.
         </p>
         {standardsMeta.carriedForward && (
           <div style={{ marginBottom: 12, padding: "9px 12px", borderRadius: 7, background: "#FBF3E9", border: "1px solid #E3C9A8", color: "#8A5A1E", fontSize: 12, lineHeight: 1.6 }}>
@@ -5392,6 +5392,11 @@ async function fetchAgmExtras(fy) {
       blockwatchMonthlyProposed: st.blockwatch_monthly_proposed == null ? null : Number(st.blockwatch_monthly_proposed),
       servicesNoteAnnualEstimate: st.services_note_annual_estimate == null ? null : Number(st.services_note_annual_estimate),
       seweragePerUnitNew: st.sewerage_per_unit_new == null ? null : Number(st.sewerage_per_unit_new),
+      // Same reason as sewerage above: the New column for these three has no
+      // council source and nothing writes them to levy_rates any more.
+      waterDemandLevyNew: st.water_demand_levy_new == null ? null : Number(st.water_demand_levy_new),
+      elecServiceFeeNew: st.electricity_service_fee_new == null ? null : Number(st.electricity_service_fee_new),
+      elecNetworkFeeNew: st.electricity_network_fee_new == null ? null : Number(st.electricity_network_fee_new),
       preparedBy: st.prepared_by || null,
       checkedBy: st.checked_by || null,
     },
@@ -5750,17 +5755,30 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   waterBands.forEach((b) => c7.push(row([b.label, b.curr == null ? "" : money(b.curr), b.next == null ? "" : money(b.next)], ["left", "right", "right"])));
   E.push(tbl(c7));
   E.push(H2("Provision, demand levy and sewerage"));
+  // The New column for the bill-driven charges. An AGM-approved figure captured
+  // against next year in levy_rates wins; otherwise the proposal captured on
+  // Config, which is the only place these can be entered — Tariffs & rates
+  // dropped the three inputs when the charges moved to the invoice-driven
+  // model, so without this fallback the cells were a permanent blank. Tracks
+  // whether anything is still uncaptured, so the closing hint below only fires
+  // when there is actually a gap to fill in Word.
+  let newGap = false;
+  const newCell = (approved, proposed) => {
+    const v = approved != null ? approved : proposed;
+    if (v == null) { newGap = true; return ""; }
+    return money(v);
+  };
   const c7b = [hrow(["Item", CUR, NEW], ["left", "right", "right"])];
   const cpw = (l) => (l.common_property_water_kl == null ? "" : nb(`${Number(l.common_property_water_kl)} kL`));
   c7b.push(row(["Common property provision (kL / month)", cpw(levyCurr) || nb(`${COMMON_PROPERTY_WATER_KL_DEFAULT} kL`), cpw(levyNext)], ["left", "right", "right"]));
   c7b.push(row(["Water Demand Levy (per unit / month) excl VAT",
     money(levyCurr.water_demand_levy != null ? levyCurr.water_demand_levy : demandLevyPerUnit),
-    levyNext.water_demand_levy == null ? "" : money(levyNext.water_demand_levy)], ["left", "right", "right"]));
+    newCell(levyNext.water_demand_levy, settings.waterDemandLevyNew)], ["left", "right", "right"]));
   // The New column has no council source until the tariff is published, so it
   // is captured on Config alongside the other AGM figures.
   c7b.push(row(["Sewerage (per unit / month) excl VAT",
     sewerPerUnit == null ? "" : money(sewerPerUnit),
-    settings.seweragePerUnitNew == null ? "" : money(settings.seweragePerUnitNew)], ["left", "right", "right"]));
+    newCell(null, settings.seweragePerUnitNew)], ["left", "right", "right"]));
   E.push(tbl(c7b));
   // A council tariff that moved part-way through the year would otherwise be
   // invisible: the Current column carries the rate the year opened on, so the
@@ -5800,16 +5818,24 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
   };
   c8.push(row(["Electricity Service Charge (complex, excl VAT)",
     feeCell(levyCurr.electricity_service_fee, elecServiceFeeInvoiced, "service charge"),
-    levyNext.electricity_service_fee == null ? "" : money(levyNext.electricity_service_fee)], ["left", "right", "right"]));
+    newCell(levyNext.electricity_service_fee, settings.elecServiceFeeNew)], ["left", "right", "right"]));
   c8.push(row(["Electricity Network Charge (complex, excl VAT)",
     feeCell(levyCurr.electricity_network_fee, elecNetworkFeeInvoiced, "network charge"),
-    levyNext.electricity_network_fee == null ? "" : money(levyNext.electricity_network_fee)], ["left", "right", "right"]));
+    newCell(levyNext.electricity_network_fee, settings.elecNetworkFeeNew)], ["left", "right", "right"]));
   E.push(tbl(c8));
   if (fromInvoice.length) {
     E.push(hint(`The electricity ${fromInvoice.join(" and ")} shown for FY ${fy} ${fromInvoice.length > 1 ? "are" : "is"} taken from the uploaded council invoice, not from an AGM-approved rate — no figure has been captured on Tariffs & rates for this year. Confirm before the meeting.`));
   }
-  if (!levyNext || levyNext.financial_year == null) {
-    E.push(hint(`No FY ${nfy} levy rates have been captured yet, so the "New" column is blank where the figure isn't already on the tariff tables. Capture them on Tariffs & rates to have them fill automatically.`));
+  // Two different gaps, two different places to close them, so say which is
+  // which rather than sending the reader to one page for both. The provision
+  // rows come off levy_rates (Tariffs & rates); the four bill-driven charges
+  // are proposals with no council source and live on Config.
+  const noLevyNext = !levyNext || levyNext.financial_year == null;
+  if (noLevyNext || newGap) {
+    E.push(hint([
+      noLevyNext && `No FY ${nfy} levy rates have been captured, so the common property provisions in the "New" column are blank — capture them on Tariffs & rates.`,
+      newGap && `Where the demand levy, sewerage or the electricity service and network charges are blank in the "New" column, no figure has been proposed for FY ${nfy} — these have no council source until the tariff is published, so they are captured under AGM report figures on Config.`,
+    ].filter(Boolean).join(" ")));
   }
 
   // ---------- Landscape G: section 9.4, the usage trend charts ----------
@@ -7740,6 +7766,9 @@ const AGM_FIELDS = [
   { key: "blockwatch_monthly_current", label: "Blockwatch — monthly fee, current", kind: "money" },
   { key: "blockwatch_monthly_proposed", label: "Blockwatch — monthly fee, proposed", kind: "money" },
   { key: "sewerage_per_unit_new", label: "Sewerage — new rate per unit / month", kind: "money" },
+  { key: "water_demand_levy_new", label: "Water demand levy — new rate per unit / month", kind: "money" },
+  { key: "electricity_service_fee_new", label: "Electricity service charge — new complex total", kind: "money" },
+  { key: "electricity_network_fee_new", label: "Electricity network charge — new complex total", kind: "money" },
   { key: "services_note_annual_estimate", label: "Service notes — estimated annual cost", kind: "money" },
   { key: "prepared_by", label: "Report prepared by", kind: "text" },
   { key: "checked_by", label: "Report checked by", kind: "text" },
@@ -7823,7 +7852,7 @@ function AgmReportSettings() {
         </label>
       </div>
       <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 0, marginBottom: 14, lineHeight: 1.6 }}>
-        The garden, blockwatch, sewerage and sign-off figures used by the annual report.
+        The garden, blockwatch, utility-charge and sign-off figures used by the annual report. The four <i>new rate</i> fields — sewerage, water demand levy and the two electricity charges — are the section 9 tariff proposals: the council hasn’t published next year’s figures and the invoice only carries what is being billed now, so these are the meeting’s proposals and have no other source.
         The insurance schedule moved to its own <b>Insurance</b> page, where the broker's schedule is uploaded and the per-unit figure is worked out — one editable grid over that table rather than two.
         <br />
         <b>The year above is the year the report covers</b>, not the year every figure applies to. The <i>current</i> fields are that year's; the <i>proposed</i> and <i>new</i> fields are what the meeting is asked to approve for the year after. A September 2026 AGM reporting on FY 2025/2026 therefore keeps both sets on <b>2025/2026</b>.
