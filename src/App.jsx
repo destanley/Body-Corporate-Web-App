@@ -8698,6 +8698,29 @@ const AGM_FIELDS = [
   { key: "electricity_service_fee_new", label: "Electricity service charge — new complex total", kind: "money" },
   { key: "electricity_network_fee_new", label: "Electricity network charge — new complex total", kind: "money" },
   { key: "services_note_annual_estimate", label: "Service notes — estimated annual cost", kind: "money" },
+  // Water rate-card reconciliation factor, approved at the AGM for the year
+  // AHEAD. Multiply CoJ's published step rates by it to get the card owners are
+  // billed on:  card rate = CoJ step rate × factor.
+  //
+  // How it is worked out, once a year, from data already captured:
+  //   numerator   — the twelve council consumption charges, ex VAT
+  //                 (`council_invoices.bulk_water_rand`)
+  //   denominator — the same twelve months of unit readings priced on CoJ's
+  //                 NOMINAL step rates, capped at the highest step any invoice
+  //                 reached that year
+  // FY 2025/2026 worked out at 14 165.50 / 14 844.40 = 0.9543. It sits below 1
+  // because CoJ pools the free 6kL allowance across the complex and the light
+  // users never claim theirs; that effect (−R3 166) slightly outweighs the
+  // common-property water CoJ charges for and no unit meter records (+R2 547).
+  //
+  // DELIBERATELY NOT EFFECTIVE-DATED — trustee's decision, 11 Aug 2026: one
+  // current value, edited here. Safe today because NOTHING BILLS ON IT: the
+  // engine still uses individualWaterCost and the August 2026 minimum-charge
+  // rule, and this field feeds the AGM discussion only. If option D is ever
+  // adopted into the billing engine, this must become effective-dated first —
+  // otherwise editing it silently re-prices every statement already issued,
+  // which is exactly the bug the water-band rate versioning fixed in August.
+  { key: "water_reconciliation_factor", label: "Water rate card — reconciliation factor (year ahead)", kind: "number" },
   { key: "prepared_by", label: "Report prepared by", kind: "text" },
   { key: "checked_by", label: "Report checked by", kind: "text" },
 ];
@@ -8784,6 +8807,8 @@ function AgmReportSettings() {
         The insurance schedule moved to its own <b>Insurance</b> page, where the broker's schedule is uploaded and the per-unit figure is worked out — one editable grid over that table rather than two.
         <br />
         <b>The year above is the year the report covers</b>, not the year every figure applies to. The <i>current</i> fields are that year's; the <i>proposed</i> and <i>new</i> fields are what the meeting is asked to approve for the year after. A September 2026 AGM reporting on FY 2025/2026 therefore keeps both sets on <b>2025/2026</b>.
+        <br />
+        <b>The water reconciliation factor</b> is the figure the meeting approves for the year ahead: multiply the council's published step rates by it to get the rate card owners are billed on. Work it out as the year's council consumption charges (excluding VAT) divided by the same year's unit readings priced on the council's own step rates, capped at the highest step any invoice reached. FY 2025/2026 gives <b>0,9543</b>. <b>Nothing is billed on it yet</b> — statements still use the tariff table directly — so changing it here affects the AGM discussion only.
       </p>
 
       {status === "loading" && <div style={{ color: "#94A0AC", fontSize: 13 }}>Loading…</div>}
