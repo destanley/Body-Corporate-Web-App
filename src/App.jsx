@@ -5537,13 +5537,10 @@ function Analytics({ expenseCategories }) {
       // Usage is fetched here rather than read off the rendered charts so the
       // report doesn't depend on the trends card having finished loading, and
       // a failure there costs the section rather than the whole document.
-      const [prevReport, extras, usage, water, bank, plan, budget] = await Promise.all([
+      const [prevReport, extras, usage, bank, plan, budget] = await Promise.all([
         loadFyReport(previousFY(fy), expenseCategories).catch(() => null),
         fetchAgmExtras(fy),
         fetchUsageTrend(fy).catch((err) => { console.warn("Loading usage for the AGM report failed:", err); return null; }),
-        // Same treatment as usage: section 10 is worth failing on its own rather
-        // than costing the whole document.
-        fetchWaterReconciliation(fy).catch((err) => { console.warn("Loading water charged-vs-billed for the AGM report failed:", err); return null; }),
         fetchBankAccountSummary(fy).catch((err) => { console.warn("Loading the bank account summary for the AGM report failed:", err); return null; }),
         fetchMaintenancePlan(fy).catch((err) => { console.warn("Loading the maintenance plan for the AGM report failed:", err); return null; }),
         // The budget is for the year AHEAD — the report reviews fy and asks the
@@ -5846,7 +5843,7 @@ async function fetchAgmExtras(fy) {
     client.from("levy_rates").select("*").in("financial_year", [fy, nfy]),
     client.from("levy_manual_entries").select("unit_id, financial_year, item_label, amount").in("financial_year", [fy, nfy]),
     // The report covers a year that may have closed on a different set of levy
-    // lines from the one loaded in the app right now, so section 12 reads the
+    // lines from the one loaded in the app right now, so section 11 reads the
     // list for THAT year rather than the module binding.
     client.from("levy_item_definitions").select("financial_year, label, system_key, sort_order, active").in("financial_year", [fy, nfy]),
     client.from("ops_expenses").select("expense_date, category, amount, notes")
@@ -5916,7 +5913,7 @@ async function fetchAgmExtras(fy) {
   const levySplit = Object.keys(nextGrid).length ? nextGrid : gridFor(fy);
   const levySplitIsCarriedOver = Object.keys(nextGrid).length === 0;
 
-  // The rows section 12 prints, for whichever year `levySplit` came from.
+  // The rows section 11 prints, for whichever year `levySplit` came from.
   //
   // Active lines, plus any line removed during that year that still has
   // figures captured against it — the report says what the scheme actually
@@ -6243,7 +6240,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
       BK.push(tbl(cRows));
       BK.push(para(
         bank.monthsOfCover >= 12
-          ? `The closing balance covers ${bank.monthsOfCover.toFixed(1)} months of the year's average spend — over a full year of expenditure held in cash. A balance this size is normally the sign of a scheme that has been accumulating without a stated purpose for the money, which is what section 13 addresses.`
+          ? `The closing balance covers ${bank.monthsOfCover.toFixed(1)} months of the year's average spend — over a full year of expenditure held in cash. A balance this size is normally the sign of a scheme that has been accumulating without a stated purpose for the money, which is what section 12 addresses.`
           : bank.monthsOfCover >= 3
             ? `The closing balance covers ${bank.monthsOfCover.toFixed(1)} months of the year's average spend.`
             : `The closing balance covers only ${bank.monthsOfCover.toFixed(1)} months of the year's average spend. A scheme with no reserve and under three months of cover has no capacity to absorb an unplanned repair without a special levy.`,
@@ -6559,133 +6556,9 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     G.push(hint("The dotted line adds the flat common-property provision from the levy rates, not bulk less meters — that derived gap goes negative in some months because council invoice periods do not line up with reading months, and it is covered by the provision check on Utility bills."));
   }
 
-  // ---------- Landscape W: section 10 ----------
-  // Water charged by CoJ against water billed to owners. A permanent part of
-  // the template: it is the one place the meeting can see what the scheme
-  // recovers on water versus what the council actually charged for it, and
-  // whether the common-property provision bears any relation to the volume
-  // nobody's meter accounts for. Built entirely from captured data — no figure
-  // in it is typed into this document.
-  const W = [];
-  W.push(H1("10. Water — charged by CoJ vs billed to owners"));
-  if (!water) {
-    W.push(hint(`Water charged-vs-billed could not be loaded for FY ${fy}, so this section is omitted. It rebuilds from the council invoices, meter readings and levy grid — check those pages and generate the report again.`));
-  } else {
-    const wt = water.totals;
-    W.push(para(
-      "Charged is the consumption line off the CoJ invoice, excluding VAT — not the sewer charge or the water demand levy, which are flat per-dwelling amounts passed through to owners at cost and reported separately below. Billed is metered unit water priced exactly as each statement priced it, plus the common-property water provision recovered through the levy. A positive difference means the body corporate collected more for water than the council charged.",
-      { size: 20 }));
-
-    const wCols = ["Month", "CoJ kL", "CoJ charged", "Units kL", "Metered water billed", "Common property provision", "Total billed", "Difference"];
-    const wAligns = ["left", "right", "right", "right", "right", "right", "right", "right"];
-    const wRows = [hrow(wCols, wAligns, WIDE)];
-    const blankOr = (v, fmt) => (v == null ? "—" : fmt(v));
-    water.rows.forEach((r) => {
-      wRows.push(row([
-        r.label,
-        blankOr(r.councilKl, dec),
-        blankOr(r.councilRand, amt),
-        blankOr(r.unitsKl, dec),
-        blankOr(r.unitsRand, amt),
-        r.unitsRand == null ? "—" : amt(r.cpRand),
-        blankOr(r.totalBilled, amt),
-        blankOr(r.difference, amt),
-      ], wAligns, false, r.comparable ? undefined : "F4E7E7", WIDE));
-    });
-    wRows.push(row([
-      `Total (${water.monthsCompared} of ${water.monthsTotal} months)`,
-      dec(wt.councilKl), amt(wt.councilRand), dec(wt.unitsKl),
-      amt(wt.unitsRand), amt(wt.cpRand), amt(wt.totalBilled), amt(wt.margin),
-    ], wAligns, true, BAND, WIDE));
-    W.push(tbl(wRows));
-    W.push(hint("All rand figures exclude VAT and are shown without the R prefix so no amount wraps. A shaded row is a month left out of the total — see the notes below."));
-
-    // The one-line answer, separated from the month grid so it can be read out
-    // at the meeting without anyone having to add up a column.
-    W.push(H2("Summary"));
-    const sAligns = ["left", "right"];
-    const sRows = [hrow(["", `FY ${fy}`], sAligns)];
-    sRows.push(row(["CoJ charged for water consumption", money(wt.councilRand)], sAligns));
-    sRows.push(row(["Billed to owners — metered unit water", money(wt.unitsRand)], sAligns));
-    sRows.push(row(["Billed to owners — common property provision", money(wt.cpRand)], sAligns));
-    sRows.push(row(["Total billed to owners for water", money(wt.totalBilled)], sAligns, true));
-    sRows.push(row([
-      wt.margin >= 0 ? "Recovered above cost" : "Recovered below cost",
-      `${money(Math.abs(wt.margin))}${wt.marginPct == null ? "" : nb(`  (${wt.marginPct >= 0 ? "+" : ""}${wt.marginPct}%)`)}`,
-    ], sAligns, true, BAND));
-    if (wt.marginPerUnitPerMonth != null) {
-      sRows.push(row(["Per unit, per month", money(wt.marginPerUnitPerMonth)], sAligns));
-    }
-    W.push(tbl(sRows));
-    W.push(para(
-      wt.margin >= 0
-        ? `Over the ${water.monthsCompared} months compared, owners were billed ${money(wt.margin)} more for water than the City of Johannesburg charged the complex — ${money(wt.marginPerUnitPerMonth)} per unit per month. This is not a loss to anyone: it funds the scheme. It is shown here so that it is a decision the meeting takes deliberately rather than a markup nobody sees.`
-        : `Over the ${water.monthsCompared} months compared, the City of Johannesburg charged ${money(Math.abs(wt.margin))} more for water than owners were billed — the body corporate is carrying the shortfall out of general levies.`,
-      { size: 20 }));
-
-    // The volume side. A provision set far above the metered gap is the usual
-    // reason the margin above is large, and it cannot be seen from rand alone.
-    W.push(H2("Common property water — provision vs actual"));
-    const cAligns = ["left", "right"];
-    const cRows = [hrow(["", `FY ${fy}`], cAligns)];
-    cRows.push(row(["CoJ metered for the complex", nb(`${dec(wt.councilKl)} kL`)], cAligns));
-    cRows.push(row(["Accounted for by the seven unit meters", nb(`${dec(wt.unitsKl)} kL`)], cAligns));
-    cRows.push(row(["Common property use and losses", nb(`${dec(wt.commonPropertyKl)} kL`)], cAligns, true, BAND));
-    if (wt.commonPropertyKlPerMonth != null) {
-      cRows.push(row(["— per month, actual", nb(`${dec(wt.commonPropertyKlPerMonth)} kL`)], cAligns));
-    }
-    cRows.push(row(["— per month, provision billed", levyCurr.common_property_water_kl == null
-      ? nb(`${COMMON_PROPERTY_WATER_KL_DEFAULT} kL`)
-      : nb(`${Number(levyCurr.common_property_water_kl)} kL`)], cAligns));
-    W.push(tbl(cRows));
-    const provisionKl = levyCurr.common_property_water_kl == null
-      ? COMMON_PROPERTY_WATER_KL_DEFAULT : Number(levyCurr.common_property_water_kl);
-    if (wt.commonPropertyKlPerMonth != null && provisionKl > 0) {
-      const ratio = round2(provisionKl / Math.max(wt.commonPropertyKlPerMonth, 0.01));
-      W.push(para(
-        wt.commonPropertyKlPerMonth <= 0
-          ? `The unit meters account for at least as much water as CoJ metered for the complex, so no common-property use is measurable this year — yet ${provisionKl} kL a month is provided for and billed. The provision is worth reviewing.`
-          : `The provision is ${nb(`${ratio}×`)} the measured common-property draw of ${dec(wt.commonPropertyKlPerMonth)} kL a month. Setting it closer to actual is the single largest lever the meeting has over what water costs an owner.`,
-        { size: 20 }));
-    }
-
-    // Pass-throughs. Shown so the meeting can see they are pass-throughs, and
-    // so a change in either is visible in the same place as the consumption.
-    const lastWithFixed = [...water.rows].reverse().find((r) => r.sewerPerUnit != null || r.demandLevyPerUnit != null);
-    if (lastWithFixed) {
-      W.push(H2("Fixed water lines (memo — not part of the comparison above)"));
-      const fAligns = ["left", "right", "right"];
-      const fRows = [hrow(["Line", "Per unit / month", `${water.unitCount} units × 12 months`], fAligns)];
-      const annual = (v) => (v == null ? "" : money(round2(v * water.unitCount * 12)));
-      fRows.push(row(["Sewerage", lastWithFixed.sewerPerUnit == null ? "" : money(lastWithFixed.sewerPerUnit), annual(lastWithFixed.sewerPerUnit)], fAligns));
-      fRows.push(row(["Water demand levy", lastWithFixed.demandLevyPerUnit == null ? "" : money(lastWithFixed.demandLevyPerUnit), annual(lastWithFixed.demandLevyPerUnit)], fAligns));
-      W.push(tbl(fRows));
-      W.push(hint("Both are charged by CoJ per dwelling and billed on to each unit at the same figure, so they recover exactly and are excluded from the margin above. Rates shown are the latest captured in the year; where one rose mid-year, section 9 says when."));
-    }
-
-    // Everything that qualifies the numbers above, said plainly rather than
-    // left for someone to notice.
-    if (water.missingInvoicePeriods.length) {
-      W.push(hint(`No council invoice is captured for ${water.missingInvoicePeriods.join(", ")}. ${water.missingInvoicePeriods.length === 1 ? "That month is" : "Those months are"} shaded and excluded from the totals, so the margin is understated by whatever ${water.missingInvoicePeriods.length === 1 ? "it" : "they"} would have added. Capture the invoice on Utility bills and generate the report again.`));
-    }
-    if (water.missingReadingPeriods.length) {
-      W.push(hint(`No meter readings are captured for ${water.missingReadingPeriods.join(", ")}, so nothing can be priced for ${water.missingReadingPeriods.length === 1 ? "that month" : "those months"} and ${water.missingReadingPeriods.length === 1 ? "it is" : "they are"} excluded from the totals.`));
-    }
-    if (!water.cpCaptured) {
-      W.push(hint(`No Common Property Water line is captured on the FY ${fy} levy grid, so the provision recovered shows as R 0,00 and the margin is understated. Capture it on Levy breakdown.`));
-    }
-    if (water.overrideMonths) {
-      W.push(hint(`${water.overrideMonths} ${water.overrideMonths === 1 ? "month carries" : "months carry"} a manual statement override on water. The override is used here rather than the computed figure, so this section agrees with the statements that were actually sent.`));
-    }
-    W.push(hint(`CoJ reading periods run 24 to 36 days and never line up with a calendar month, so any single month's difference is approximate — only the annual total ties out.`));
-    if (water.cpCaptured) {
-      W.push(hint(`Every figure above excludes VAT. The levy grid is billed VAT-inclusive, so the common-property provision — captured at ${money(water.cpPerUnitIncVat)} per unit per month, ${money(water.cpMonthlyIncVat)} across the ${water.unitCount} units — is shown here at ${money(water.cpMonthly)} a month, being that figure less VAT at ${nb(`${round2(water.vatRate * 100)}%`)}. Comparing it inclusive against a council charge that excludes VAT would overstate the margin.`));
-    }
-  }
-
-  // ---------- Portrait E2: section 11 ----------
+  // ---------- Portrait E2: section 10 ----------
   const E2 = [];
-  E2.push(H1("11. Service notes"));
+  E2.push(H1("10. Service notes"));
   // Each note takes its recorded cost from its own line in section 1, so it
   // cannot contradict the statement and cannot go stale. The notes used to
   // assert WHERE a cost was recorded — "in the operating-expense log" — which
@@ -6709,10 +6582,10 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     E2.push(para(`Note: it is recommended that the above services are once again paid by the body corporate to keep levies low. The estimated annual cost of this would be ${money(gs.servicesNoteAnnualEstimate)}.`, { size: 20 }));
   }
 
-  // ---------- Landscape F: section 10 ----------
+  // ---------- Landscape F: section 11 ----------
   // Nine columns of rand amounts; landscape so no figure has to wrap.
   const F = [];
-  F.push(H1(`12. Levy split — proposed for FY ${nfy}`));
+  F.push(H1(`11. Levy split — proposed for FY ${nfy}`));
   if (levySplitIsCarriedOver) {
     F.push(hint(`No FY ${nfy} levy grid has been captured yet, so this table carries forward the FY ${fy} figures as a starting point. Adjust each line for the new year.`));
   }
@@ -6743,13 +6616,13 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
       + `${levySplitRemoved.length > 1 ? "they are" : "it is"} not charged going forward.`));
   }
 
-  // ---------- Landscape MP: section 13 ----------
+  // ---------- Landscape MP: section 12 ----------
   // The statutory section. PMR 22 requires a written maintenance, repair and
   // replacement plan over at least ten years, re-approved at every AGM. It is
   // built from the register rather than typed, so it cannot say one thing here
   // and another on the Maintenance page.
   const MP = [];
-  MP.push(H1("13. Maintenance, repair and replacement plan (PMR 22)"));
+  MP.push(H1("12. Maintenance, repair and replacement plan (PMR 22)"));
   if (!plan) {
     MP.push(hint(`The maintenance plan could not be loaded for FY ${fy}, so this section is omitted. It rebuilds from the asset register — check the Maintenance page and generate the report again.`));
   } else {
@@ -6872,11 +6745,11 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
     }
   }
 
-  // ---------- Portrait BG: section 14, the budget ----------
+  // ---------- Portrait BG: section 13, the budget ----------
   // Everything before this reports what happened. This is the only section that
   // asks the meeting to approve something, so it closes the document.
   const BG = [];
-  BG.push(H1(`14. Budget — FY ${nfy}`));
+  BG.push(H1(`13. Budget — FY ${nfy}`));
   if (!budget || !budget.hasData) {
     BG.push(hint(`No budget has been captured for FY ${nfy}. Build it on the Budget page — it seeds from this year's actuals and the captured tariffs, and every line stays editable. This section prints what is saved there.`));
   } else {
@@ -6964,7 +6837,6 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, wate
       { properties: landscape, children: Dsec },
       { properties: portrait, children: E },
       { properties: landscape, children: G },
-      { properties: landscape, children: W },
       { properties: portrait, children: E2 },
       { properties: landscape, children: F },
       { properties: landscape, children: MP },
@@ -7076,166 +6948,6 @@ async function fetchUsageTrend(fy) {
       allocated: periods.map((p) => (unitE[p] == null ? null : round2(unitE[p] + cpElec))),
     },
     provision: { water: cpWater, electricity: cpElec },
-  };
-}
-
-// ---------- Water: charged by CoJ vs billed to owners ----------
-// Section 9 of the AGM report, and a permanent part of the template.
-//
-// The question it answers is the one the trustees are actually asked at the
-// meeting: for every rand of water CoJ charged the complex, how many rand did
-// the body corporate recover from owners? Two sides:
-//
-//   CHARGED — `council_invoices.bulk_water_rand`, the consumption line off the
-//     CoJ invoice, excluding VAT. Not the sewer charge and not the water demand
-//     levy: those are flat per-dwelling amounts that pass through to owners at
-//     cost and reconcile by construction, so they are reported as a separate
-//     memo rather than mixed into the margin.
-//   BILLED — metered unit water, priced exactly the way each statement priced
-//     it (a captured statement override wins over the computed figure, so this
-//     agrees with the statements that were actually sent), plus the
-//     common-property water provision recovered through the levy grid.
-//
-// A month missing either side is printed, flagged and left out of the totals.
-// Silently dropping it is what let the 2026-02 capture error sit unnoticed.
-async function fetchWaterReconciliation(fy) {
-  const client = await ensureSupabaseClient();
-  const { from, to } = fyBounds(fy);
-  const [inv, usage, overrides, bands, cpLevy, unitRows, vat, itemDefs] = await Promise.all([
-    client.from("council_invoices")
-      .select("period, bulk_water_kl, bulk_water_rand, sewer_charge_per_unit, water_demand_levy_per_unit")
-      .gte("period", from).lte("period", to),
-    client.from("monthly_usage")
-      .select("unit_id, period, water_current, water_previous")
-      .gte("period", from).lte("period", to),
-    client.from("statement_overrides")
-      .select("unit_id, period, water_due")
-      .gte("period", from).lte("period", to),
-    client.from("water_tariff_bands").select("band_label, from_kl, to_kl, rate_per_kl, effective_from"),
-    // Not filtered on the label here. The common property water line is found
-    // by system_key against that year's definitions, because the trustee owns
-    // the display text and matching on it would have gone quietly wrong the
-    // day it was edited — and returned zero, which reads as a real figure.
-    client.from("levy_manual_entries")
-      .select("unit_id, amount, item_label")
-      .eq("financial_year", fy),
-    client.from("units").select("id, unit_number"),
-    client.from("vat_rates").select("rate").order("effective_from", { ascending: false }).limit(1),
-    client.from("levy_item_definitions")
-      .select("label, system_key, active").eq("financial_year", fy),
-  ]);
-  const failed = [inv, usage, overrides, bands, cpLevy, unitRows, itemDefs].find((r) => r.error);
-  if (failed) throw failed.error;
-
-  // Fall back to the historical label for a year predating the definitions
-  // table, so an old reconciliation still reconciles.
-  const cpWaterDef = (itemDefs.data || []).find((d) => d.system_key === "common_property_water");
-  const cpWaterLabel = cpWaterDef ? cpWaterDef.label : "Common Property Water";
-  const cpLevyRows = (cpLevy.data || []).filter((r) => r.item_label === cpWaterLabel);
-
-  const bandRows = bands.data || [];
-  const invByPeriod = {};
-  (inv.data || []).forEach((r) => { invByPeriod[String(r.period).slice(0, 10)] = r; });
-
-  // A statement override is keyed on the database unit id, the same as the
-  // usage row it overrides, so no unit-number lookup is needed here.
-  const ovByKey = {};
-  (overrides.data || []).forEach((o) => {
-    if (o.water_due == null) return;
-    ovByKey[`${String(o.period).slice(0, 10)}|${o.unit_id}`] = Number(o.water_due);
-  });
-
-  const usageByPeriod = {};
-  (usage.data || []).forEach((r) => {
-    const p = String(r.period).slice(0, 10);
-    if (!usageByPeriod[p]) usageByPeriod[p] = [];
-    usageByPeriod[p].push(r);
-  });
-
-  // The common-property provision is a levy line, so what owners actually paid
-  // for it is what the levy grid says — a manual figure, not a derived one.
-  // Per unit per month, summed across units, times twelve for the year.
-  //
-  // VAT: the levy grid is billed VAT-INCLUSIVE by convention. `bulk_water_rand`
-  // off the council invoice and `individualWaterCost` are both EXCLUSIVE. Left
-  // alone, this section would compare an inclusive recovery against an exclusive
-  // charge and overstate the margin by the VAT on the provision — about R888 a
-  // year at 15%. The comparison therefore uses the de-VATed figure and the note
-  // prints the inclusive one alongside, so the transformation is visible rather
-  // than silent.
-  const unitCount = (unitRows.data || []).length || UNITS.length;
-  const vatRate = vat.data && vat.data[0] ? Number(vat.data[0].rate) : VAT_RATE_DEFAULT;
-  const cpMonthlyIncVat = round2(cpLevyRows.reduce((s, r) => s + (Number(r.amount) || 0), 0));
-  const cpMonthly = round2(cpMonthlyIncVat / (1 + vatRate));
-  const cpCaptured = cpLevyRows.length > 0;
-
-  const periods = fyPeriods(fy);
-  const rows = periods.map((p) => {
-    const ci = invByPeriod[p];
-    const monthUsage = usageByPeriod[p] || [];
-    const priceBands = waterBandsAsOf(bandRows, p);
-    const statementPeriod = p.slice(0, 7);
-
-    let unitsKl = null, unitsRand = null, overrideCount = 0;
-    if (monthUsage.length) {
-      unitsKl = 0; unitsRand = 0;
-      monthUsage.forEach((r) => {
-        const use = round2(Number(r.water_current || 0) - Number(r.water_previous || 0));
-        unitsKl = round2(unitsKl + use);
-        const ov = ovByKey[`${p}|${r.unit_id}`];
-        if (ov != null) overrideCount += 1;
-        unitsRand = round2(unitsRand + (ov != null ? ov : individualWaterCost(use, priceBands, statementPeriod)));
-      });
-    }
-
-    const councilKl = ci && ci.bulk_water_kl != null ? Number(ci.bulk_water_kl) : null;
-    const councilRand = ci && ci.bulk_water_rand != null ? Number(ci.bulk_water_rand) : null;
-    // A month only counts towards the margin when both sides are real.
-    const comparable = councilRand != null && unitsRand != null;
-    const totalBilled = unitsRand == null ? null : round2(unitsRand + cpMonthly);
-
-    return {
-      period: p,
-      label: (() => { const [y, m] = p.split("-"); return `${MONTH_NAMES[parseInt(m, 10) - 1].slice(0, 3)} ${y.slice(2)}`; })(),
-      councilKl, councilRand, unitsKl, unitsRand,
-      cpRand: cpMonthly, totalBilled,
-      difference: comparable ? round2(totalBilled - councilRand) : null,
-      comparable,
-      missingInvoice: !ci,
-      missingReadings: monthUsage.length === 0,
-      overrideCount,
-      sewerPerUnit: ci && ci.sewer_charge_per_unit != null ? Number(ci.sewer_charge_per_unit) : null,
-      demandLevyPerUnit: ci && ci.water_demand_levy_per_unit != null ? Number(ci.water_demand_levy_per_unit) : null,
-    };
-  });
-
-  const compared = rows.filter((r) => r.comparable);
-  const sum = (key) => round2(compared.reduce((s, r) => s + (r[key] || 0), 0));
-  const totals = {
-    councilKl: sum("councilKl"), councilRand: sum("councilRand"),
-    unitsKl: sum("unitsKl"), unitsRand: sum("unitsRand"),
-    cpRand: round2(cpMonthly * compared.length),
-    totalBilled: sum("totalBilled"),
-  };
-  totals.margin = round2(totals.totalBilled - totals.councilRand);
-  totals.marginPct = totals.councilRand > 0 ? round2((totals.margin / totals.councilRand) * 100) : null;
-  totals.marginPerUnitPerMonth = compared.length && unitCount
-    ? round2(totals.margin / unitCount / compared.length) : null;
-  // The volume gap CoJ metered but no unit meter accounts for — common property
-  // use plus losses. Read against the provision, this is what says whether the
-  // 20 kL standard is anywhere near reality.
-  totals.commonPropertyKl = round2(totals.councilKl - totals.unitsKl);
-  totals.commonPropertyKlPerMonth = compared.length ? round2(totals.commonPropertyKl / compared.length) : null;
-
-  return {
-    rows, totals,
-    monthsCompared: compared.length,
-    monthsTotal: periods.length,
-    missingInvoicePeriods: rows.filter((r) => r.missingInvoice).map((r) => r.label),
-    missingReadingPeriods: rows.filter((r) => r.missingReadings).map((r) => r.label),
-    overrideMonths: rows.filter((r) => r.overrideCount > 0).length,
-    cpMonthly, cpMonthlyIncVat, cpCaptured, unitCount, vatRate,
-    cpPerUnitIncVat: unitCount ? round2(cpMonthlyIncVat / unitCount) : null,
   };
 }
 

@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 8 August 2026, session 12 (supersedes the 8 August 2026 session 11 summary)
+Last updated: 11 August 2026, session 18 (supersedes the 11 August 2026 session 17 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,66 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 11 August 2026, session 18 — the water review leaves the AGM report
+
+### The water charged-vs-billed section is out of the generator
+
+Session 12 made "Water — charged by CoJ vs billed to owners" a permanent section of the AGM
+report on the reasoning that a one-off markdown file would be invisible at every meeting after
+this one. **The trustee has decided it is genuinely a one-off**: the meeting takes the decision
+once, and after that the section is a standing reminder of a question already answered. It is
+removed.
+
+- **Deleted:** the `W` landscape section block, its entry in the docx section list, and
+  `fetchWaterReconciliation()` (~160 lines) with its `Promise.all` slot in the AGM builder.
+- **Renumbered:** service notes 11→10, levy split 12→11, PMR 22 plan 13→12, budget 14→13, plus
+  the three prose cross-references that named those numbers.
+- **Carried by** `docs/El-Corazon-Water-Billing-AGM-2026.pdf` instead — a five-page standalone
+  pack for the 2026 meeting, ending in six numbered resolutions.
+
+**No billing code was touched.** The August 2026 minimum-charge rule (session 5) is still what
+the app bills on; everything below is a proposal for the meeting, not shipped behaviour.
+
+### The option-D analysis was partly wrong, and is corrected
+
+`docs/water-billing-option-D-FY2025-2026.md` claimed the app's fixed 6/4/5 kL monthly band
+widths were a defect because CoJ pro-rates its own steps by days. **That inference does not
+hold.** CoJ pro-rates *because its reading periods are irregular* — 24 to 36 days, never a
+calendar month. Ours are always calendar months, so the unmodified monthly widths are already
+correct: over a year the two free allowances differ by **0.05 kL per unit** (71.95 vs 72.00).
+
+The original option D applied CoJ's day-scaled widths to calendar-month unit readings, mixing
+two incompatible period bases. Rebuilt on calendar months the per-unit figures move by under
+R35 a year, so the conclusion held, but the method did not. §§3–7 of that document are rewritten;
+§§1–2 (the invoice reconstruction and the 2026-02 discrepancy) are unaffected.
+
+### What forced the redesign: statements go out on the 1st
+
+Levy statements are issued on the 1st for the month just ended. On that date the council invoice
+for the period **has not arrived** — and for 2026-02 it never did. That rules out pricing off the
+invoice, and it rules out a monthly reconciliation factor: modelled monthly the factor swings
+**0.448 to 1.887, a 4.2× spread**, because CoJ's reading window is offset ~6 weeks and drifts.
+A 1- and 2-period lag narrows it only to 3.9× and 3.1×.
+
+Option D therefore became **a rate card fixed once a year**: CoJ's step rates, capped at the
+highest step the complex itself is billed at, multiplied by a factor set at the AGM and trued up
+the following year. On FY2025/2026 the factor is **0.9543**, giving free / **R28.48** / **R29.73**
+per kL. The trustee needs nothing but the meter readings to bill on the 1st.
+
+### A third defect, missed the first time
+
+CoJ gives the complex **504 kL free a year** (6 kL × 7 units × 12) and applies it to the *complex
+total*. The units claimed only **404.5 kL** — Units 2, 4 and 7 never come near their 6 kL — and
+CoJ let the remaining **99.5 kL** absorb the heavier households' usage. Per-unit laddering throws
+that away. **This is what the reconciliation factor exists to hand back**, and it is why the
+factor sits below 1.
+
+**Unchanged and still outstanding:** the R9,083.55/year margin (R108.14/unit/month), the
+2026-02 invoice discrepancy (R1,216.06 recorded against R940.34 reconstructed), the 20 kL
+common-property provision at 2.9× actual use, and Unit 2's −5.43 kL December reading.
 
 ---
 
@@ -858,7 +918,7 @@ change hands back more to light users than the tariff takes.
 for 2026/2027, so AGM report §8 will show that one New cell blank even though the grid
 carries R123.90/unit.
 
-### AGM report §9 — "Water: charged by CoJ vs billed to owners" (now permanent in the template)
+### AGM report §9 — "Water: charged by CoJ vs billed to owners" *(REMOVED session 18 — see below)*
 
 The AGM report had no place where the meeting could see what the scheme recovers on water
 against what the council actually charged for it. The option-D analysis

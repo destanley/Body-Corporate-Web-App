@@ -13,12 +13,18 @@ Analysis date: 7 August 2026. Sources: the 10-page merged CoJ water invoice PDF
 > is genuinely absent** from the supplied PDFs — page 7 jumps 2026/01 → 2026/03 —
 > so the R275.72 discrepancy in §2 remains unverified against a physical invoice.
 >
-> **This analysis is now part of the AGM report.** Section 9,
-> "Water — charged by CoJ vs billed to owners", rebuilds the charged-vs-billed
-> comparison from `council_invoices`, `monthly_usage`, `statement_overrides` and
-> the levy grid every time the report is generated. It is a permanent section of
-> the template, not a one-off. This document remains the *reasoning*; the report
-> carries the *numbers*.
+> **Superseded in part, 11 August 2026 — read §3 before relying on anything below.**
+> The original §3(a) claimed the scheme's fixed monthly band widths were a defect
+> because CoJ pro-rates its own by days. **That was wrong**, and the model built
+> on it distorted the per-unit split. Sections 3 to 7 have been rewritten.
+> Sections 1 and 2 — the invoice reconstruction and the 2026-02 discrepancy —
+> are unaffected and still stand.
+>
+> **This analysis is no longer part of the AGM report.** Section 10, "Water —
+> charged by CoJ vs billed to owners", has been **removed from the generator**:
+> it is a one-off decision for the 2026 meeting, not a permanent annual section.
+> It is carried instead by the standalone pack,
+> `El-Corazon-Water-Billing-AGM-2026.pdf`.
 
 ---
 
@@ -47,7 +53,8 @@ step width (kL) = monthly band width  ÷  (365.25 / 12)  ×  days  ×  7 dwellin
 
 **This settles the question the code has been guessing at: the complex genuinely
 does receive 7 × 6 kL free.** Billing each unit with its own free 6 kL is right in
-aggregate. What is *not* right is the band widths and the ceiling — see §3.
+aggregate. What is *not* right is the ceiling, and the fact that the allowance is
+handed out per unit rather than pooled — see §3.
 
 ### Verification against every bill in the FY
 
@@ -94,81 +101,132 @@ the physical invoice. It feeds the AGM report and the financial dashboard.
 
 ---
 
-## 3. Where the over-recovery actually comes from
+## 3. Where the over-recovery comes from — corrected
 
 Across the twelve months the seven units were billed **R17,327.53** for metered
 water. CoJ charged **R14,165.50**. That is **+22.3%**, and on top of it the levy
 carries a common-property water provision raising a further **R5,921.52** a year.
 
-The minimum charge is *not* the main cause. The money is in two structural gaps:
+### (a) The original claim was wrong: fixed monthly band widths are correct
 
-**(a) Band widths are not pro-rated.** The app applies a fixed 6 / 4 / 5 kL
-ladder to every unit regardless of how many days the period ran. CoJ pro-rates
-every step. A 36-day period gives each dwelling 7.10 kL free, a 24-day period
-4.73 kL.
+The first version of this paper said the app was defective for applying a fixed
+6 / 4 / 5 kL ladder regardless of period length, because CoJ pro-rates every
+step by days. **That inference does not hold.** CoJ pro-rates *because its
+reading periods are irregular* — 24 to 36 days, never a calendar month. The
+scheme's periods are always calendar months, so the unmodified monthly widths
+are already the right ones. Over a year the two agree:
 
-**(b) Units are pushed into bands the complex never entered.** CoJ reached step 3
-(R31.15) in eleven months and step 2 (R29.84) in the twelfth. It never once
-reached step 4. Yet Unit 3 at 17.52 kL is billed R43.67/kL on its top slice, and
-Unit 6 at 34.32 kL in December reaches R66.01/kL. Those rates were never paid.
+| | Free allowance per unit per year |
+|---|---:|
+| CoJ, pro-rated across 365 days | 71.95 kL |
+| Calendar month × 12 | 72.00 kL |
 
-That is why the heavy users, not the light ones, carry most of the over-recovery.
+A 0.05 kL difference is not a defect. **Billing calendar months on
+calendar-month allowances is correct**, and the original option D — which
+applied CoJ's day-scaled widths to calendar-month unit readings — was mixing two
+incompatible period bases and distorting the per-unit split. It has been
+rebuilt. The revised per-unit figures move by under R35 a year, so the
+conclusion survives; the method does not.
 
-**(c) The common-property provision is 2.9× actual.** CoJ metered 973 kL over the
-year; the units metered 889.74 kL. Common property plus losses is therefore
-**83.26 kL/year — 6.94 kL a month**, against a provision of 20 kL.
+### (b) Units are pushed into bands the complex never entered — stands
+
+CoJ reached step 3 (R31.15) in eleven months and step 2 (R29.84) in the twelfth.
+It never once reached step 4. Yet Unit 3 at 17.52 kL is billed R43.67/kL on its
+top slice, and Unit 6 at 34.32 kL in December reaches R66.01/kL. Those rates were
+never paid by anyone. **This is the largest single source of over-recovery, and
+it falls on the heaviest users, not the lightest.**
+
+### (c) The free allowance is pooled by CoJ and discarded by the scheme — new
+
+This was missed first time round and is the reason a reconciliation factor is
+needed at all. CoJ gives the complex **504 kL free a year** (6 kL × 7 units × 12)
+and applies it to the *complex total*. The units only claimed **404.5 kL** of it —
+Units 2, 4 and 7 never come close to their 6 kL. CoJ let the remaining **99.5 kL**
+absorb the heavier households' consumption. Billing each unit on its own ladder
+throws that 99.5 kL away.
+
+### (d) The common-property provision is 2.9× actual — stands
+
+CoJ metered 973 kL over the year; the units metered 889.74 kL. Common property
+plus losses is therefore **83.26 kL/year — 6.94 kL a month**, against a provision
+of 20 kL.
 
 ---
 
-## 4. Option D
+## 4. The operational constraint that determines the design
 
-For each month:
+**Levy statements go out on the 1st of every month for the month just ended.**
 
-1. Build each unit's ladder using CoJ's **pro-rated** step widths for that
-   period's day count.
-2. **Cap it at the highest step CoJ actually reached** — never charge a resident a
-   marginal rate the complex did not pay.
-3. Sum, and gross the total to the invoice's actual consumption charge.
+That single fact rules out any method that prices off the council invoice,
+because on the 1st the invoice for that period has not arrived — and for
+2026-02 it never did. It also rules out a monthly reconciliation factor:
+modelled month by month the factor swings between **0.448 and 1.887, a 4.2×
+spread**, because CoJ's reading window is offset from the calendar month by
+roughly six weeks and drifts. Testing a 1- and 2-period lag narrows it only to
+3.9× and 3.1×; the dates never align, so no lag fixes it.
 
-Recovery is exact by construction, and no minimum charge exists, so the
-"pay less by using more" inversion cannot arise.
+| | The scheme | CoJ |
+|---|---|---|
+| Reading date | Last day of each calendar month | Drifts — 24 to 36 day periods |
+| Period length | Always a calendar month | Never a calendar month |
+| Available when? | Immediately | Weeks later, sometimes not at all |
+
+Whatever is adopted must therefore produce **a rate the trustee can apply on the
+1st with nothing but the meter readings**, while still honouring the council's
+arithmetic *over the year*.
+
+---
+
+## 5. Option D, rebuilt: a published rate card
+
+1. Take CoJ's published step rates.
+2. **Cap the ladder at the highest step the complex itself is billed at** — no
+   unit is ever charged a marginal rate the scheme does not pay. Step 3 last year.
+3. Multiply by a **reconciliation factor set once a year**, so the scheme
+   recovers what it pays and the pooled free allowance is handed back.
+4. Bill calendar-month consumption on the resulting card. No pro-rating, no
+   invoice dependency, no minimum charge — so the inversion cannot arise.
+
+On FY 2025/2026 the factor is **0.9543** and the card would have read:
+
+| Consumption in the month | Charge |
+|---|---:|
+| First 6 kL | free |
+| Next 4 kL (6 – 10 kL) | **R 28.48** per kL |
+| Above 10 kL | **R 29.73** per kL |
+
+Worked examples: 3 kL → R0.00 · 5 kL → R0.00 · 8 kL → R56.95 · 12 kL → R173.35 ·
+18 kL → R351.70 · 25 kL → R559.78.
 
 ### Result — FY 2025/2026, per unit
 
 | Unit | kL/year | Current rule | Option D | Change | |
 |---|---:|---:|---:|---:|---:|
-| U1 | 183.04 | R 3,517.84 | R 3,248.26 | −R 269.58 | −8% |
-| U2 | 23.57 | R 353.01 | R 14.91 | −R 338.10 | −96% |
-| U3 | 226.16 | R 5,541.74 | R 4,530.69 | −R 1,011.05 | −18% |
-| U4 | 83.99 | R 764.95 | R 551.90 | −R 213.05 | −28% |
-| U5 | 128.53 | R 1,702.02 | R 1,636.81 | −R 65.21 | −4% |
-| U6 | 212.52 | R 5,099.45 | R 4,126.03 | −R 973.42 | −19% |
-| U7 | 31.93 | R 348.53 | R 56.91 | −R 291.62 | −84% |
+| U1 | 183.04 | R 3,517.84 | R 3,240.70 | −R 277.13 | −8% |
+| U2 | 23.57 | R 353.01 | R 23.63 | −R 329.37 | −93% |
+| U3 | 226.16 | R 5,541.74 | R 4,522.46 | −R 1,019.28 | −18% |
+| U4 | 83.99 | R 764.95 | R 587.59 | −R 177.36 | −23% |
+| U5 | 128.53 | R 1,702.02 | R 1,624.18 | −R 77.84 | −5% |
+| U6 | 212.52 | R 5,099.45 | R 4,119.09 | −R 980.36 | −19% |
+| U7 | 31.93 | R 348.53 | R 47.84 | −R 300.69 | −86% |
 | **Total** | **889.74** | **R 17,327.53** | **R 14,165.50** | **−R 3,162.03** | **−18%** |
 
-Figures use the **annual** gross-up factor of **0.9570** — see §5.
+Units 2, 4 and 7 fall close to nil because CoJ genuinely charged nothing for
+their water — it fell inside the free step. They continue to pay **R882.22 a
+month** in fixed water charges (sewer R774.48 + demand levy R107.74), so a R0.00
+consumption line does not mean free water.
 
-Units 2, 4 and 7 fall close to zero in most months because CoJ genuinely charged
-nothing for their water: it fell inside the free step. They continue to pay
-**R882.22 a month** in fixed water charges (sewer R774.48 + demand levy R107.74),
-so a R0.00 consumption line does not mean free water.
+### How it runs
 
----
+| When | What happens |
+|---|---|
+| At the AGM, once a year | The meeting sets the card: CoJ's newly published step rates × the factor. Three numbers, minuted. |
+| 1st of every month | Statements go out for the month just ended, priced off the card and the meter readings alone. |
+| When each invoice arrives | Captured as now, for the accounts and next year's factor. It changes no statement already issued. |
+| At the year end | Twelve invoices against twelve months billed; the difference sets the following year's factor. |
 
-## 5. Use an annual gross-up factor, not a monthly one
-
-Modelled monthly, the factor swings between **0.448 and 1.887 — a 4.2× spread**.
-A resident's effective rate per kL would quadruple month to month for reasons
-entirely outside their control.
-
-The cause is a timing mismatch: CoJ's "2026/07" invoice reads 17 May – 18 June,
-while the app's 2026-07 unit readings cover July. Testing a 1- and 2-period lag
-narrows the spread only to 3.9× and 3.1× — it does not fix it, because the CoJ
-reading dates drift (24 to 36 days) and never align to a calendar month.
-
-Over a full year the mismatch washes out. **A single factor set annually at the
-AGM and trued up the following year** is stable, predictable, printable on a
-statement, and still recovers exactly. FY 2025/2026 would have been **0.9570**.
+The factor is set from a full prior year, so it is stable. Were it wrong by as
+much as 5%, the year-end correction would be about **R8.43 per unit per month**.
 
 ---
 
@@ -183,24 +241,32 @@ statement, and still recovers exactly. FY 2025/2026 would have been **0.9570**.
 | **Margin** | **R 9,083.55** |
 
 That is **R108.14 per unit per month**. Under option D the common-property
-provision must be **removed** — the gross-up already recovers common-property
-water inside the invoice total — so adopting it in full means the body corp
-either raises levies by about R108 a unit a month or runs a smaller budget.
+provision must be **removed** — the factor already recovers common-property water
+inside the invoice total — so adopting it in full means the body corp either
+raises levies by about R108 a unit a month or runs a smaller budget.
 
 This is a trustee and AGM decision, not a bug. The margin is not misappropriated;
 it is funding the scheme. But it is currently an undisclosed markup on water,
 weighted towards the heaviest users, and option D makes it explicit.
 
+Held revenue-neutral, option D is a redistribution rather than a saving: it costs
+the five lighter households **R10 to R31 a month** and returns **R44 to R47 a
+month** to Units 3 and 6, the two that were most overcharged.
+
 ---
 
-## 7. Open items before this could be implemented
+## 7. Open items
 
-- **Confirm the 2026-02 invoice figure** and correct `council_invoices`.
-- **Decide how common-property water is shared.** The gross-up spreads it in
+- **Confirm the 2026-02 invoice figure** and correct `council_invoices`
+  (R1,216.06 recorded against R940.34 reconstructed).
+- **Unit 2's December 2025 reading is −5.43 kL** — a meter rollback or capture
+  error. Clamped to nil in this model. It needs fixing at source.
+- **Decide how common-property water is shared.** The factor spreads it in
   proportion to consumption. Splitting it equally seven ways is arguably fairer —
   a leaking common-property pipe is not the heavy user's fault.
-- **Unit 2's December 2025 reading is −5.43 kL** — a meter rollback or capture
-  error. Clamped to 0 in this model. It needs fixing at source.
 - **Decide the levy consequence** of removing the R5,921.52 provision.
-- The reading-period mismatch remains even under an annual factor; it means any
-  single month's statement is approximate and only the year ties out exactly.
+- **Nothing in the app implements this yet.** The August 2026 minimum-charge rule
+  is what is live; option D is a proposal for the meeting.
+- The reading-period offset persists under an annual factor. It is constant and
+  does not accumulate, but any single month's statement is approximate and only
+  the year ties out exactly.
