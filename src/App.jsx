@@ -5526,13 +5526,14 @@ function Analytics({ expenseCategories }) {
   const [status, setStatus] = useState("loading"); // loading | ready | error
   const [error, setError] = useState(null);
   const [showMonths, setShowMonths] = useState(false);
-  const [agmStatus, setAgmStatus] = useState("idle"); // idle | working | error
+  const [agmStatus, setAgmStatus] = useState("idle"); // idle | working | ready | error
+  const [agmFile, setAgmFile] = useState(null);       // { blob, filename } once built
 
   // Builds the AGM report for the selected financial year. The comparative
   // prior year is loaded on demand rather than held in state — it's only ever
   // needed here, and it keeps the dashboard's own load a single year.
   const generateAgmReport = async () => {
-    setAgmStatus("working");
+    setAgmStatus("working"); setAgmFile(null);
     try {
       // Usage is fetched here rather than read off the rendered charts so the
       // report doesn't depend on the trends card having finished loading, and
@@ -5563,7 +5564,7 @@ function Analytics({ expenseCategories }) {
       // Which reading of "contribution to the administrative fund" the scheme
       // has adopted. Set on Config → AGM report figures; the budget rows carry
       // the classification the two readings differ on.
-      const reserveBasis = (extras && extras.settings && extras.settings.reserveBasis) || "all_contributions";
+      const reserveBasis = (extras && extras.settingsNext && extras.settingsNext.reserveBasis) || "all_contributions";
       const budgetedContributions = contributionBase(budget, reserveBasis);
       const floor = plan && leviesCollected != null
         ? {
@@ -5577,8 +5578,9 @@ function Analytics({ expenseCategories }) {
             basis: reserveBasis,
           }
         : null;
-      await exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank, plan, floor, budget });
-      setAgmStatus("idle");
+      const file = await exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank, plan, floor, budget });
+      setAgmFile(file);
+      setAgmStatus("ready");
     } catch (err) {
       console.error("Generating the AGM report failed:", err);
       setAgmStatus("error");
@@ -5658,13 +5660,27 @@ function Analytics({ expenseCategories }) {
             disabled={status !== "ready" || agmStatus === "working"}
             style={{ ...primaryBtn, padding: "7px 14px", opacity: status !== "ready" || agmStatus === "working" ? 0.6 : 1 }}
           >
-            {agmStatus === "working" ? "Generating…" : "Generate AGM report"}
+            {agmStatus === "working" ? "Generating…" : agmStatus === "ready" ? "Regenerate" : "Generate AGM report"}
           </button>
+          {/* A separate click, on purpose. See downloadBlob. */}
+          {agmStatus === "ready" && agmFile && (
+            <button
+              onClick={() => downloadBlob(agmFile.blob, agmFile.filename)}
+              style={{ ...primaryBtn, padding: "7px 14px", background: "#2F5D50" }}
+            >
+              Download the AGM pack
+            </button>
+          )}
         </div>
       </div>
       {agmStatus === "error" && (
         <div className="no-print" style={{ color: "#B5651D", fontSize: 12.5, fontWeight: 600, marginBottom: 10, textAlign: "right" }}>
           Couldn’t generate the AGM report — see browser console.
+        </div>
+      )}
+      {agmStatus === "ready" && (
+        <div className="no-print" style={{ color: "#2F5D50", fontSize: 12.5, fontWeight: 600, marginBottom: 10, textAlign: "right" }}>
+          {agmFile.filename} is ready — click Download to save it. It stays here until you regenerate or leave the page.
         </div>
       )}
       <p className="no-print" style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
@@ -5880,7 +5896,10 @@ async function fetchAgmExtras(fy) {
     // levy_rates or the tariff tables. Both are maintained on Config; a year
     // with no row renders as blank cells, exactly as the whole section used to.
     client.from("insurance_schedule").select("*").eq("financial_year", fy),
-    client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1),
+    // Both years: the year under review carries the Current column and the
+    // report metadata; the year ahead carries every figure the meeting votes
+    // on. One row per year, keyed by the year the figures APPLY TO.
+    client.from("agm_report_settings").select("*").in("financial_year", [fy, nfy]),
   ]);
   const bad = [units, bands, elec, levies, split, itemDefs, ops, txns, invoices, remits, insurance, settings].find((r) => r.error);
   if (bad) throw bad.error;
@@ -6059,7 +6078,48 @@ async function fetchAgmExtras(fy) {
   });
   const insuranceHasData = insuranceRows.some((r) => r.perAnnum != null || r.sumInsured != null);
 
-  const st = (settings.data || [])[0] || {};
+  // agm_report_settings holds ONE row per financial year, carrying the figures
+  // that apply to THAT year. There is no longer a "current" column beside a
+  // "proposed" one — they are the same column on two rows, which is why the
+  // report reads two: the year under review for the Current column, the year
+  // ahead for the New column. Before 11 August 2026 both lived on one row and
+  // every FY 2026/2027 proposal was filed under 2025/2026.
+  const settingsFor = (year) => {
+    const st = (settings.data || []).find((r) => r.financial_year === year) || {};
+    const n = (v) => (v == null ? null : Number(v));
+    return {
+      fy: year,
+      gardenRatePerDay: n(st.garden_rate_per_day),
+      gardenIncreasePct: n(st.garden_increase_pct),
+      gardenVisitsPerMonth: n(st.garden_visits_per_month),
+      gardenBonusAmount: n(st.garden_bonus_amount),
+      gardenBonusDueDate: st.garden_bonus_due_date || null,
+      gardenIncreaseEffectiveDate: st.garden_increase_effective_date || null,
+      blockwatchMonthly: n(st.blockwatch_monthly),
+      // The four bill-driven charges. No council source until the tariff is
+      // published, so for a future year these are the meeting's proposals; once
+      // applied they are also written to levy_rates, which is what the billing
+      // engine and the Current column read.
+      seweragePerUnit: n(st.sewerage_per_unit),
+      waterDemandLevy: n(st.water_demand_levy),
+      electricityServiceFee: n(st.electricity_service_fee),
+      electricityNetworkFee: n(st.electricity_network_fee),
+      waterReconciliationFactor: n(st.water_reconciliation_factor),
+      // Reserve fund, section 12. Neither is derivable: the basis is an
+      // unresolved reading of Regulation 2, and the designation is a decision
+      // the meeting takes.
+      reserveBasis: st.reserve_contribution_basis || null,
+      reserveProposedDesignation: n(st.reserve_proposed_designation),
+      // Report metadata — these describe the document, not a rate, so they stay
+      // on the year the report covers.
+      servicesNoteAnnualEstimate: n(st.services_note_annual_estimate),
+      preparedBy: st.prepared_by || null,
+      checkedBy: st.checked_by || null,
+      figuresApprovedOn: st.figures_approved_on || null,
+      figuresApprovedBy: st.figures_approved_by || null,
+      figuresAppliedAt: st.figures_applied_at || null,
+    };
+  };
 
   return {
     fy, nfy, units: unitList, waterBands,
@@ -6068,32 +6128,8 @@ async function fetchAgmExtras(fy) {
     levySplit, levySplitIsCarriedOver, levySplitItems, levySplitRemoved,
     misc, maintenance,
     insuranceRows, insuranceHasData,
-    settings: {
-      gardenRatePerDay: st.garden_rate_per_day == null ? null : Number(st.garden_rate_per_day),
-      gardenIncreasePct: st.garden_increase_pct == null ? null : Number(st.garden_increase_pct),
-      gardenProposedRatePerDay: st.garden_proposed_rate_per_day == null ? null : Number(st.garden_proposed_rate_per_day),
-      gardenVisitsPerMonth: st.garden_visits_per_month == null ? null : Number(st.garden_visits_per_month),
-      gardenBonusAmount: st.garden_bonus_amount == null ? null : Number(st.garden_bonus_amount),
-      gardenBonusDueDate: st.garden_bonus_due_date || null,
-      gardenIncreaseEffectiveDate: st.garden_increase_effective_date || null,
-      blockwatchMonthlyCurrent: st.blockwatch_monthly_current == null ? null : Number(st.blockwatch_monthly_current),
-      blockwatchMonthlyProposed: st.blockwatch_monthly_proposed == null ? null : Number(st.blockwatch_monthly_proposed),
-      servicesNoteAnnualEstimate: st.services_note_annual_estimate == null ? null : Number(st.services_note_annual_estimate),
-      seweragePerUnitNew: st.sewerage_per_unit_new == null ? null : Number(st.sewerage_per_unit_new),
-      // Reserve fund, section 12. Neither is derivable: the basis is an
-      // unresolved reading of Regulation 2, and the designation is a decision
-      // the meeting takes. Same convention as sewerage above — stored on the
-      // year the report covers, proposing for the year after.
-      reserveBasis: st.reserve_contribution_basis || null,
-      reserveProposedDesignation: st.reserve_proposed_designation == null ? null : Number(st.reserve_proposed_designation),
-      // Same reason as sewerage above: the New column for these three has no
-      // council source and nothing writes them to levy_rates any more.
-      waterDemandLevyNew: st.water_demand_levy_new == null ? null : Number(st.water_demand_levy_new),
-      elecServiceFeeNew: st.electricity_service_fee_new == null ? null : Number(st.electricity_service_fee_new),
-      elecNetworkFeeNew: st.electricity_network_fee_new == null ? null : Number(st.electricity_network_fee_new),
-      preparedBy: st.prepared_by || null,
-      checkedBy: st.checked_by || null,
-    },
+    settings: settingsFor(fy),
+    settingsNext: settingsFor(nfy),
     blockwatch: { actualTotal: bwTotal, monthCount: bwMonthCount, monthly: bwMonthCount ? round2(bwTotal / bwMonthCount) : null },
     sewerPerUnit: rateAtStart("sewer_charge_per_unit"),
     demandLevyPerUnit: rateAtStart("water_demand_levy_per_unit"),
@@ -6116,7 +6152,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
   const {
     nfy, units, waterBands, elecCurr, elecNext, levyCurr, levyNext,
     levySplit, levySplitIsCarriedOver, levySplitItems, levySplitRemoved, misc, maintenance,
-    insuranceRows, insuranceHasData, settings, blockwatch, sewerPerUnit, demandLevyPerUnit,
+    insuranceRows, insuranceHasData, settings, settingsNext, blockwatch, sewerPerUnit, demandLevyPerUnit,
     sewerChange, demandLevyChange, elecServiceFeeInvoiced, elecNetworkFeeInvoiced,
   } = extras;
   const prev = prevReport && prevReport.hasData ? prevReport : null;
@@ -6411,7 +6447,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
   E.push(H1("7. Blockwatch"));
   // The recorded monthly figure is the average of what actually went out; the
   // agreed fee is the one the meeting votes on, so a captured setting wins.
-  const bwCurrent = settings.blockwatchMonthlyCurrent != null ? settings.blockwatchMonthlyCurrent : blockwatch.monthly;
+  const bwCurrent = settings.blockwatchMonthly != null ? settings.blockwatchMonthly : blockwatch.monthly;
   // The total shown is the BlockWatch line from section 1, exactly as garden
   // service below takes its own — so this table cannot contradict the figure on
   // the dashboard and in section 1. `blockwatch.actualTotal` is the same
@@ -6423,10 +6459,10 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
   c5.push(row(["Monthly fee payable — current", bwCurrent == null ? "" : money(bwCurrent)], ["left", "right"]));
   c5.push(row([`Total paid in FY ${fy} (recorded)`, money(bwTotalShown)], ["left", "right"]));
   c5.push(row([`Monthly fee payable — proposed FY ${nfy}`,
-    settings.blockwatchMonthlyProposed == null ? "" : money(settings.blockwatchMonthlyProposed)], ["left", "right"]));
+    settingsNext.blockwatchMonthly == null ? "" : money(settingsNext.blockwatchMonthly)], ["left", "right"]));
   E.push(tbl(c5));
-  const bwUnchanged = settings.blockwatchMonthlyProposed != null && bwCurrent != null
-    && round2(settings.blockwatchMonthlyProposed) === round2(bwCurrent);
+  const bwUnchanged = settingsNext.blockwatchMonthly != null && bwCurrent != null
+    && round2(settingsNext.blockwatchMonthly) === round2(bwCurrent);
   E.push(para(
     bwUnchanged
       ? "Blockwatch contribution remains unchanged."
@@ -6440,24 +6476,28 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
 
   E.push(H1("8. Garden service"));
   const gardenActual = (report.expenseRows.find((r) => r.label === "Garden Service") || {}).total || 0;
-  const gs = settings;
+  // The current rate is this year's row; everything proposed is next year's.
+  // They are the same columns on two rows now, which is what makes "proposed"
+  // and "approved" the same field at different points in time.
+  const gs = settings, gn = settingsNext;
   // Projected cost is derived from the proposed rate rather than typed, so it
   // moves with the increase instead of being a figure to remember to update.
-  const projectedAnnual = gs.gardenProposedRatePerDay != null && gs.gardenVisitsPerMonth != null
-    ? round2(gs.gardenProposedRatePerDay * gs.gardenVisitsPerMonth * 12) : null;
-  const bonusLabel = gs.gardenBonusDueDate
-    ? `Proposed year-end bonus (Payable by ${longDate(gs.gardenBonusDueDate)})`
+  const gnVisits = gn.gardenVisitsPerMonth != null ? gn.gardenVisitsPerMonth : gs.gardenVisitsPerMonth;
+  const projectedAnnual = gn.gardenRatePerDay != null && gnVisits != null
+    ? round2(gn.gardenRatePerDay * gnVisits * 12) : null;
+  const bonusLabel = gn.gardenBonusDueDate
+    ? `Proposed year-end bonus (Payable by ${longDate(gn.gardenBonusDueDate)})`
     : "Proposed year-end bonus";
-  const projLabel = gs.gardenVisitsPerMonth != null
-    ? `Projected Annual cost — based on ${gs.gardenVisitsPerMonth} visits per month`
+  const projLabel = gnVisits != null
+    ? `Projected Annual cost — based on ${gnVisits} visits per month`
     : "Projected Annual cost";
   const c6 = [hrow(["Item", "Amount / value"], ["left", "right"])];
   c6.push(row([`Total salary costs FY ${fy} (actual)`, money(gardenActual)], ["left", "right"]));
   c6.push(row(["Current Rate Per Day", gs.gardenRatePerDay == null ? "" : money(gs.gardenRatePerDay)], ["left", "right"]));
-  c6.push(row(["Proposed salary increase (%)", pct(gs.gardenIncreasePct)], ["left", "right"]));
-  c6.push(row([`Proposed salary for FY ${nfy} — Per Day`, gs.gardenProposedRatePerDay == null ? "" : money(gs.gardenProposedRatePerDay)], ["left", "right"]));
-  c6.push(row([bonusLabel, gs.gardenBonusAmount == null ? "" : money(gs.gardenBonusAmount)], ["left", "right"]));
-  c6.push(row(["Increase Effective Date", longDate(gs.gardenIncreaseEffectiveDate)], ["left", "right"]));
+  c6.push(row(["Proposed salary increase (%)", pct(gn.gardenIncreasePct)], ["left", "right"]));
+  c6.push(row([`Proposed salary for FY ${nfy} — Per Day`, gn.gardenRatePerDay == null ? "" : money(gn.gardenRatePerDay)], ["left", "right"]));
+  c6.push(row([bonusLabel, gn.gardenBonusAmount == null ? "" : money(gn.gardenBonusAmount)], ["left", "right"]));
+  c6.push(row(["Increase Effective Date", longDate(gn.gardenIncreaseEffectiveDate)], ["left", "right"]));
   c6.push(row([projLabel, projectedAnnual == null ? "" : money(projectedAnnual)], ["left", "right"]));
   E.push(tbl(c6));
   E.push(hint("Actual cost is the spend recorded this year. Rate, increase, bonus and effective date are maintained on Config and are for approval at the meeting; the projected annual cost is the proposed rate times the visits per month, over twelve months."));
@@ -6489,12 +6529,12 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
   c7b.push(row(["Common property provision (kL / month)", cpw(levyCurr) || nb(`${COMMON_PROPERTY_WATER_KL_DEFAULT} kL`), cpw(levyNext)], ["left", "right", "right"]));
   c7b.push(row(["Water Demand Levy (per unit / month) excl VAT",
     money(levyCurr.water_demand_levy != null ? levyCurr.water_demand_levy : demandLevyPerUnit),
-    newCell(levyNext.water_demand_levy, settings.waterDemandLevyNew)], ["left", "right", "right"]));
+    newCell(levyNext.water_demand_levy, settingsNext.waterDemandLevy)], ["left", "right", "right"]));
   // The New column has no council source until the tariff is published, so it
   // is captured on Config alongside the other AGM figures.
   c7b.push(row(["Sewerage (per unit / month) excl VAT",
     sewerPerUnit == null ? "" : money(sewerPerUnit),
-    newCell(null, settings.seweragePerUnitNew)], ["left", "right", "right"]));
+    newCell(null, settingsNext.seweragePerUnit)], ["left", "right", "right"]));
   E.push(tbl(c7b));
   // A council tariff that moved part-way through the year would otherwise be
   // invisible: the Current column carries the rate the year opened on, so the
@@ -6534,10 +6574,10 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
   };
   c8.push(row(["Electricity Service Charge (complex, excl VAT)",
     feeCell(levyCurr.electricity_service_fee, elecServiceFeeInvoiced, "service charge"),
-    newCell(levyNext.electricity_service_fee, settings.elecServiceFeeNew)], ["left", "right", "right"]));
+    newCell(levyNext.electricity_service_fee, settingsNext.electricityServiceFee)], ["left", "right", "right"]));
   c8.push(row(["Electricity Network Charge (complex, excl VAT)",
     feeCell(levyCurr.electricity_network_fee, elecNetworkFeeInvoiced, "network charge"),
-    newCell(levyNext.electricity_network_fee, settings.elecNetworkFeeNew)], ["left", "right", "right"]));
+    newCell(levyNext.electricity_network_fee, settingsNext.electricityNetworkFee)], ["left", "right", "right"]));
   E.push(tbl(c8));
   if (fromInvoice.length) {
     E.push(hint(`The electricity ${fromInvoice.join(" and ")} shown for FY ${fy} ${fromInvoice.length > 1 ? "are" : "is"} taken from the uploaded council invoice, not from an AGM-approved rate — no figure has been captured on Tariffs & rates for this year. Confirm before the meeting.`));
@@ -6681,7 +6721,7 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
     const otherBase = budget && budget.contributions
       ? (basisIsLevyOnly ? budget.contributions.all : budget.contributions.levy) : null;
     const otherLabel = basisIsLevyOnly ? "all owner contributions" : "levy contributions only";
-    const proposed = settings.reserveProposedDesignation;
+    const proposed = settingsNext.reserveProposedDesignation;
 
     MP.push(para(
       "Section 3(1)(b) of the Act requires the body corporate to establish and maintain a reserve fund reasonably sufficient to cover the future maintenance, repair and replacement of common property. Regulation 2 sets a minimum annual contribution to it, and Prescribed Management Rule 22 requires a written ten-year plan approved at each annual general meeting. The minimum and the plan are different tests: the regulation says what may not be gone below, the plan says what is actually needed. This section reports the fund's position, the minimum, what is proposed, and then the plan.",
@@ -7002,11 +7042,28 @@ async function exportAgmReportDocx({ fy, report, prevReport, extras, usage, bank
       { properties: portrait, children: BG },
     ],
   });
-  const blob = await Packer.toBlob(doc);
+  // Returns the file rather than downloading it. Building the pack takes
+  // several seconds — the docx CDN load, six queries and the charts — and by
+  // the time it finished the browser no longer connected the download to the
+  // click that started it. Chrome treats that as an AUTOMATIC download and
+  // blocks it behind the "Automatic downloads" site permission, which is the
+  // "needs permission to download" the trustee hit. The caller now shows a
+  // Download button, so the click that saves the file is a fresh user gesture
+  // and the download is never automatic. It also means a missed or cancelled
+  // download can be retried without rebuilding the document.
+  return {
+    blob: await Packer.toBlob(doc),
+    filename: `ElCorazon-AGM-Report-FY${fy.replace("/", "-")}.docx`,
+  };
+}
+
+// One place that turns a built file into a save. Must be called FROM a user
+// gesture — see the note above.
+function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `ElCorazon-AGM-Report-FY${fy.replace("/", "-")}.docx`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -9012,21 +9069,34 @@ async function computeWaterReconciliationFactor(fy, unitCount = UNITS.length) {
   };
 }
 
+// One row per financial year, holding the figures that APPLY TO that year.
+//
+// Until 11 August 2026 this list mixed two different years on one row: a
+// "current" column beside its "proposed" successor, and four *_new columns
+// holding the year after's charges. That is why every FY 2026/2027 proposal was
+// filed under 2025/2026, and it left no way to mark a figure as approved other
+// than by editing something called "new".
+//
+// Now "current" and "proposed" are the SAME field on two rows. Which one it is
+// depends only on which year you are looking at and whether the meeting has
+// approved it. `scope` says which year a field belongs to:
+//
+//   "year"   — a rate or a decision. Belongs to the year it applies to.
+//   "report" — describes the DOCUMENT, not a rate. Belongs to the year the
+//              report covers, and is not carried forward or applied.
 const AGM_FIELDS = [
-  { key: "garden_rate_per_day", label: "Garden — current rate per day", kind: "money" },
-  { key: "garden_increase_pct", label: "Garden — proposed increase (%)", kind: "number" },
-  { key: "garden_proposed_rate_per_day", label: "Garden — proposed rate per day", kind: "money" },
-  { key: "garden_visits_per_month", label: "Garden — visits per month", kind: "number" },
-  { key: "garden_bonus_amount", label: "Garden — proposed year-end bonus", kind: "money" },
-  { key: "garden_bonus_due_date", label: "Garden — bonus payable by", kind: "date" },
-  { key: "garden_increase_effective_date", label: "Garden — increase effective date", kind: "date" },
-  { key: "blockwatch_monthly_current", label: "Blockwatch — monthly fee, current", kind: "money" },
-  { key: "blockwatch_monthly_proposed", label: "Blockwatch — monthly fee, proposed", kind: "money" },
-  { key: "sewerage_per_unit_new", label: "Sewerage — new rate per unit / month", kind: "money" },
-  { key: "water_demand_levy_new", label: "Water demand levy — new rate per unit / month", kind: "money" },
-  { key: "electricity_service_fee_new", label: "Electricity service charge — new complex total", kind: "money" },
-  { key: "electricity_network_fee_new", label: "Electricity network charge — new complex total", kind: "money" },
-  { key: "services_note_annual_estimate", label: "Service notes — estimated annual cost", kind: "money" },
+  { key: "garden_rate_per_day", label: "Garden — rate per day", kind: "money", scope: "year" },
+  { key: "garden_increase_pct", label: "Garden — increase on the prior year (%)", kind: "number", scope: "year" },
+  { key: "garden_visits_per_month", label: "Garden — visits per month", kind: "number", scope: "year" },
+  { key: "garden_bonus_amount", label: "Garden — year-end bonus", kind: "money", scope: "year" },
+  { key: "garden_bonus_due_date", label: "Garden — bonus payable by", kind: "date", scope: "year" },
+  { key: "garden_increase_effective_date", label: "Garden — increase effective date", kind: "date", scope: "year" },
+  { key: "blockwatch_monthly", label: "Blockwatch — monthly fee", kind: "money", scope: "year" },
+  { key: "sewerage_per_unit", label: "Sewerage — rate per unit / month", kind: "money", scope: "year", applies: "levy_rates" },
+  { key: "water_demand_levy", label: "Water demand levy — rate per unit / month", kind: "money", scope: "year", applies: "levy_rates" },
+  { key: "electricity_service_fee", label: "Electricity service charge — complex total", kind: "money", scope: "year", applies: "levy_rates" },
+  { key: "electricity_network_fee", label: "Electricity network charge — complex total", kind: "money", scope: "year", applies: "levy_rates" },
+  { key: "services_note_annual_estimate", label: "Service notes — estimated annual cost", kind: "money", scope: "report" },
   // Section 12. Neither figure is derivable from anything the app holds.
   //
   // The BASIS is an unresolved reading of Regulation 2 — s3(1)(f) points at the
@@ -9036,22 +9106,24 @@ const AGM_FIELDS = [
   // an unanswered question should not produce the more convenient answer.
   //
   // The DESIGNATION is a decision the meeting takes, in the same way the four
-  // "new rate" fields above are proposals the meeting votes on rather than
-  // figures the council or an invoice can supply.
+  // charge fields above are proposals the meeting votes on rather than figures
+  // the council or an invoice can supply.
   {
     key: "reserve_contribution_basis",
     label: "Reserve fund — basis for the 15% minimum",
     kind: "select",
+    scope: "year",
     options: [
       { value: "", label: "Not chosen — defaults to all contributions" },
       { value: "all_contributions", label: "All owner contributions" },
       { value: "levy_only", label: "Levy contributions only" },
     ],
   },
-  { key: "reserve_proposed_designation", label: "Reserve fund — proposed opening designation", kind: "money" },
-  // Water rate-card reconciliation factor, approved at the AGM for the year
-  // AHEAD. Multiply CoJ's published step rates by it to get the card owners are
-  // billed on:  card rate = CoJ step rate × factor.
+  { key: "reserve_proposed_designation", label: "Reserve fund — opening designation", kind: "money", scope: "year", applies: "reserve_ledger" },
+  // Water rate-card reconciliation factor. Multiply CoJ's published step rates
+  // by it to get the card owners are billed on:  card rate = step rate × factor.
+  // It belongs to the year it APPLIES to, and is computed from the year BEFORE
+  // that — which is why the calculated panel resolves the previous year.
   //
   // How it is worked out, once a year, from data already captured:
   //   numerator   — the twelve council consumption charges, ex VAT
@@ -9071,43 +9143,56 @@ const AGM_FIELDS = [
   // adopted into the billing engine, this must become effective-dated first —
   // otherwise editing it silently re-prices every statement already issued,
   // which is exactly the bug the water-band rate versioning fixed in August.
-  { key: "water_reconciliation_factor", label: "Water rate card — reconciliation factor (year ahead)", kind: "number" },
-  { key: "prepared_by", label: "Report prepared by", kind: "text" },
-  { key: "checked_by", label: "Report checked by", kind: "text" },
+  { key: "water_reconciliation_factor", label: "Water rate card — reconciliation factor", kind: "number", scope: "year" },
+  { key: "prepared_by", label: "Report prepared by", kind: "text", scope: "report" },
+  { key: "checked_by", label: "Report checked by", kind: "text", scope: "report" },
 ];
 
+// The figures an application writes through to the tables the app bills and
+// reports on, and where each one lands. A field with no `applies` is read
+// straight off agm_report_settings by the report and needs no promotion.
+const AGM_APPLY_TARGETS = {
+  levy_rates: "levy_rates",
+  reserve_ledger: "reserve_fund_entries",
+};
+
 function AgmReportSettings() {
-  // Which years to offer: the current body-corp FY and the three before it. The
-  // report is only ever run for a year that has data, and a longer list is just
-  // noise on a scheme this size.
+  // The year picked here is now the year the figures APPLY TO, so the list has
+  // to reach one year FORWARD — that is where every proposal the September
+  // meeting votes on belongs. Three years back covers reprinting an old report.
   const years = useMemo(() => {
     const start = Number(periodToFY(CURRENT_PERIOD).split("/")[0]);
-    return [0, 1, 2, 3].map((n) => `${start - n}/${start - n + 1}`);
+    return [-1, 0, 1, 2, 3].map((n) => `${start - n}/${start - n + 1}`);
   }, []);
+  // Default to the year ahead: that is the one being prepared for the meeting.
   const [fy, setFy] = useState(years[0]);
   const [settings, setSettings] = useState({});
-  // The factor the year's own invoices and readings imply. Recomputed whenever
-  // the year changes; the stored field is only ever an override of it.
+  const [row, setRow] = useState({});   // as loaded, for approval/applied state
+  // The factor implied for THIS year, computed from the year BEFORE it — the
+  // council invoices and readings the factor is derived from are last year's.
+  // The stored field is only ever an override of it.
   const [calcFactor, setCalcFactor] = useState(undefined); // undefined = still working, null = can't
   const [status, setStatus] = useState("loading"); // loading | ready | error
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState(null);
   const [error, setError] = useState(null);
+  const [applyResult, setApplyResult] = useState(null);
 
   // Values are held as strings while editing — the same reason the Tariffs and
   // Meter readings tables do: an <input type="number"> renders through the en-ZA
   // locale and turns 33.57 into 33,57, and strips trailing zeros.
   useEffect(() => {
     let alive = true;
-    setStatus("loading"); setNotice(null); setError(null);
+    setStatus("loading"); setNotice(null); setError(null); setApplyResult(null);
     (async () => {
       try {
         const client = await ensureSupabaseClient();
         const s = await client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1);
         if (s.error) throw s.error;
         if (!alive) return;
-        const row = (s.data || [])[0] || {};
-        setSettings(Object.fromEntries(AGM_FIELDS.map((f) => [f.key, row[f.key] == null ? "" : String(row[f.key])])));
+        const r = (s.data || [])[0] || {};
+        setRow(r);
+        setSettings(Object.fromEntries(AGM_FIELDS.map((f) => [f.key, r[f.key] == null ? "" : String(r[f.key])])));
         setStatus("ready");
       } catch (err) {
         console.error("Loading AGM report settings failed:", err);
@@ -9115,8 +9200,10 @@ function AgmReportSettings() {
       }
     })();
     // Worked out separately so a failure costs the suggestion, not the card.
+    // Computed from the PREVIOUS year: the factor that applies to FY X is the
+    // one FY X−1's council invoices and unit readings imply.
     setCalcFactor(undefined);
-    computeWaterReconciliationFactor(fy)
+    computeWaterReconciliationFactor(previousFY(fy))
       .then((r) => { if (alive) setCalcFactor(r); })
       .catch((err) => { console.warn("Computing the water reconciliation factor failed:", err); if (alive) setCalcFactor(null); });
     return () => { alive = false; };
@@ -9188,6 +9275,8 @@ function AgmReportSettings() {
       }
       const { error: se } = await client.from("agm_report_settings").upsert(payload, { onConflict: "financial_year" });
       if (se) throw se;
+      const back = await client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1);
+      if (!back.error) setRow((back.data || [])[0] || {});
       setNotice(`Saved for FY ${fy}. The AGM report picks this up the next time it is generated.`);
     } catch (err) {
       console.error("Saving AGM report settings failed:", err);
@@ -9197,12 +9286,147 @@ function AgmReportSettings() {
     }
   };
 
+  // ---------- Approving, and applying ----------
+  //
+  // Three states, and the difference between them matters:
+  //
+  //   proposed  — typed here, printed in the report's "New" column, billing
+  //               untouched
+  //   approved  — the meeting carried it. Recorded, still not billing.
+  //   applied   — written through to levy_rates and the reserve ledger, which
+  //               is what the app actually bills and reports on
+  //
+  // Before this existed there was no third step at all: an approved figure had
+  // to be re-typed on another screen and nothing recorded that the meeting had
+  // decided anything. Nothing in the app has ever written the levy_rates fee
+  // columns — they were inserted as null and left that way — so the report's
+  // "an approved figure in levy_rates wins" branch was unreachable.
+  const markApproved = async (on, by) => {
+    setBusy(true); setNotice(null); setError(null);
+    try {
+      const client = await ensureSupabaseClient();
+      const { error: e } = await client.from("agm_report_settings")
+        .upsert({ financial_year: fy, figures_approved_on: on || null, figures_approved_by: by || null, updated_at: new Date().toISOString() },
+                { onConflict: "financial_year" });
+      if (e) throw e;
+      const back = await client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1);
+      if (back.error) throw back.error;
+      setRow((back.data || [])[0] || {});
+      setNotice(on ? `Recorded as approved on ${on}.` : "Approval withdrawn.");
+    } catch (err) {
+      console.error("Recording the AGM approval failed:", err);
+      setError(err.message || "Couldn't record the approval — see browser console.");
+    } finally { setBusy(false); }
+  };
+
+  const applyFigures = async () => {
+    setBusy(true); setNotice(null); setError(null); setApplyResult(null);
+    try {
+      // Guard 1: only an approved set may be applied. The button is hidden
+      // otherwise, but the check is here because the button is a convenience.
+      if (!row.figures_approved_on) {
+        setError("Record the meeting's approval first. Only approved figures can be applied.");
+        setBusy(false); return;
+      }
+      // Guard 2: never backwards. Applying to a year already billed would
+      // re-price statements that have gone out — the same failure the water
+      // band versioning exists to prevent.
+      const activeFY = periodToFY(CURRENT_PERIOD);
+      if (fy < activeFY) {
+        setError(`FY ${fy} has already been billed. Figures can only be applied to FY ${activeFY} or later — applying backwards would re-price statements already issued.`);
+        setBusy(false); return;
+      }
+
+      const client = await ensureSupabaseClient();
+      const written = [], skipped = [], manual = [];
+      const val = (k) => (row[k] == null ? null : Number(row[k]));
+
+      // ---- levy_rates: the three charges the billing engine reads ----
+      const fees = {
+        water_demand_levy: val("water_demand_levy"),
+        electricity_service_fee: val("electricity_service_fee"),
+        electricity_network_fee: val("electricity_network_fee"),
+      };
+      const haveFees = Object.entries(fees).filter(([, v]) => v != null);
+      if (haveFees.length) {
+        const existing = await client.from("levy_rates").select("financial_year").eq("financial_year", fy).limit(1);
+        if (existing.error) throw existing.error;
+        const patch = Object.fromEntries(haveFees);
+        const { error: le } = (existing.data || []).length
+          ? await client.from("levy_rates").update({ ...patch, updated_at: new Date().toISOString() }).eq("financial_year", fy)
+          : await client.from("levy_rates").insert({ financial_year: fy, ...patch });
+        if (le) throw le;
+        haveFees.forEach(([k, v]) => written.push({ figure: k, to: "levy_rates", value: v }));
+      }
+      Object.entries(fees).filter(([, v]) => v == null)
+        .forEach(([k]) => skipped.push({ figure: k, reason: "no figure captured for this year" }));
+
+      // Sewerage has no column in levy_rates — it is billed as a levy grid line,
+      // not a rate. Saying so beats writing it nowhere and reporting success.
+      if (val("sewerage_per_unit") != null) {
+        manual.push({ figure: "sewerage_per_unit", where: "Levy breakdown — the Sewerage line", value: val("sewerage_per_unit") });
+      }
+
+      // ---- reserve ledger: the opening designation ----
+      const designation = val("reserve_proposed_designation");
+      if (designation != null) {
+        // Idempotent: a second application must not designate the money twice.
+        const already = await client.from("reserve_fund_entries")
+          .select("id, amount").eq("financial_year", fy).eq("entry_type", "contribution");
+        if (already.error) throw already.error;
+        const dup = (already.data || []).some((e) => Math.abs(Number(e.amount) - designation) < 0.005);
+        if (dup) {
+          skipped.push({ figure: "reserve_proposed_designation", reason: "a contribution of this amount is already on the reserve ledger for this year" });
+        } else {
+          const { error: re } = await client.from("reserve_fund_entries").insert({
+            entry_date: row.figures_approved_on,
+            financial_year: fy,
+            entry_type: "contribution",
+            amount: designation,
+            description: `Opening designation approved at the AGM${row.figures_approved_by ? ` (${row.figures_approved_by})` : ""} — transfer from accumulated administrative funds, not a new levy.`,
+          });
+          if (re) throw re;
+          written.push({ figure: "reserve_proposed_designation", to: "reserve_fund_entries", value: designation });
+        }
+      }
+
+      // ---- deliberately not applied ----
+      if (val("water_reconciliation_factor") != null) {
+        skipped.push({
+          figure: "water_reconciliation_factor",
+          reason: "nothing bills on the factor — the engine still uses individualWaterCost and the August 2026 minimum-charge rule. It must become effective-dated before it can be applied, or editing it would silently re-price statements already issued.",
+        });
+      }
+      ["garden_rate_per_day", "garden_bonus_amount", "blockwatch_monthly"].forEach((k) => {
+        if (val(k) != null) manual.push({ figure: k, where: "Levy breakdown — the matching levy line", value: val(k) });
+      });
+
+      const result = { written, skipped, manual, approved_on: row.figures_approved_on };
+      const me = (await client.auth.getUser()).data?.user?.email || null;
+      const { error: ae } = await client.from("agm_figure_applications")
+        .insert({ financial_year: fy, applied_by: me, result });
+      if (ae) throw ae;
+      const { error: ue } = await client.from("agm_report_settings")
+        .update({ figures_applied_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq("financial_year", fy);
+      if (ue) throw ue;
+
+      const back = await client.from("agm_report_settings").select("*").eq("financial_year", fy).limit(1);
+      if (!back.error) setRow((back.data || [])[0] || {});
+      setApplyResult(result);
+      setNotice(`Applied to FY ${fy}: ${written.length} figure(s) written.${manual.length ? ` ${manual.length} still need entering by hand.` : ""}`);
+    } catch (err) {
+      console.error("Applying the AGM figures failed:", err);
+      setError(err.message || "Applying failed — see browser console. Check what was written before retrying.");
+    } finally { setBusy(false); }
+  };
+
   return (
     <Card style={{ marginTop: 16 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 4 }}>
-        <div style={{ fontWeight: 700, fontSize: 13.5 }}>AGM report figures</div>
+        <div style={{ fontWeight: 700, fontSize: 13.5 }}>AGM figures — FY {fy}</div>
         <label style={{ fontSize: 12.5, color: "#64748B" }}>
-          Financial year{" "}
+          Figures apply to{" "}
           <select value={fy} onChange={(e) => setFy(e.target.value)}
                   style={{ ...inputStyle, width: 130, textAlign: "left", fontFamily: "inherit" }}>
             {years.map((y) => <option key={y} value={y}>{y}</option>)}
@@ -9210,14 +9434,15 @@ function AgmReportSettings() {
         </label>
       </div>
       <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 0, marginBottom: 14, lineHeight: 1.6 }}>
-        The garden, blockwatch, utility-charge and sign-off figures used by the annual report. The four <i>new rate</i> fields — sewerage, water demand levy and the two electricity charges — are the section 9 tariff proposals: the council hasn’t published next year’s figures and the invoice only carries what is being billed now, so these are the meeting’s proposals and have no other source.
-        The insurance schedule moved to its own <b>Insurance</b> page, where the broker's schedule is uploaded and the per-unit figure is worked out — one editable grid over that table rather than two.
+        <b>The year above is the year these figures apply to</b> — not the year the report covers. A September 2026 meeting reviewing FY 2025/2026 votes on the FY <b>2026/2027</b> figures, so that is where they are captured. There is no longer a "current" field beside a "proposed" one: they are the same field on two different years, and the report reads both — this year's row for its <i>Current</i> column, next year's for <i>New</i>.
         <br />
-        <b>The year above is the year the report covers</b>, not the year every figure applies to. The <i>current</i> fields are that year's; the <i>proposed</i> and <i>new</i> fields are what the meeting is asked to approve for the year after. A September 2026 AGM reporting on FY 2025/2026 therefore keeps both sets on <b>2025/2026</b>.
+        <b>A figure here is a proposal until the meeting approves it, and a proposal changes nothing.</b> Record the approval below, then <i>apply</i> it — that is what writes the charges to <b>levy_rates</b> and the reserve designation to the <b>reserve ledger</b>, which is what the app actually bills and reports on. Before this, an approved figure had to be re-typed on another screen and nothing recorded that the meeting had decided anything.
         <br />
-        <b>The two reserve fund fields</b> drive section 12. The <i>basis</i> settles which budget income lines the 15% statutory minimum is taken of — Regulation 2 says "the total budgeted contribution to the administrative fund" and never defines it, so this is the reading the trustees have adopted on the accountant's advice. Left unchosen it defaults to <b>all owner contributions</b>, the larger base and so the more conservative floor. Which rows fall into each reading is set per line on the <b>Budget</b> page. The <i>proposed opening designation</i> is what the meeting is asked to transfer from accumulated administrative funds — a decision, not a figure any table can produce.
+        <b>Sewerage, the water demand levy and the two electricity charges</b> have no council source until the tariff is published, and the invoice only carries what is being billed now — so for a future year these are the meeting's proposals and have no other origin. The insurance schedule lives on its own <b>Insurance</b> page.
         <br />
-        <b>The water reconciliation factor</b> is the figure the meeting approves for the year ahead: multiply the council's published step rates by it to get the rate card owners are billed on. Work it out as the year's council consumption charges (excluding VAT) divided by the same year's unit readings priced on the council's own step rates, capped at the highest step any invoice reached. FY 2025/2026 gives <b>0,9543</b>. <b>Nothing is billed on it yet</b> — statements still use the tariff table directly — so changing it here affects the AGM discussion only.
+        <b>The two reserve fund fields</b> drive section 12. The <i>basis</i> settles which budget income lines the 15% statutory minimum is taken of — Regulation 2 says "the total budgeted contribution to the administrative fund" and never defines it, so this is the reading the trustees have adopted on the accountant's advice. Left unchosen it defaults to <b>all owner contributions</b>, the larger base and so the more conservative floor. Which rows fall into each reading is set per line on the <b>Budget</b> page.
+        <br />
+        <b>The water reconciliation factor</b> for FY {fy} is worked out from FY {previousFY(fy)}'s council invoices and readings, which is what the panel below computes. <b>Nothing is billed on it</b> — statements still use the tariff table directly — so it is never applied, only reported.
       </p>
 
       {status === "loading" && <div style={{ color: "#94A0AC", fontSize: 13 }}>Loading…</div>}
@@ -9225,8 +9450,12 @@ function AgmReportSettings() {
 
       {status === "ready" && (
         <>
+          <div style={{ fontWeight: 700, fontSize: 12, color: "#1B2A38", marginBottom: 8 }}>
+            Figures for FY {fy}
+            <span style={{ fontWeight: 400, color: "#94A0AC" }}> — rates and decisions that apply to this year</span>
+          </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "10px 24px" }}>
-            {AGM_FIELDS.map((f) => (
+            {AGM_FIELDS.filter((f) => f.scope !== "report").map((f) => (
               <label key={f.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, fontSize: 12.5 }}>
                 <span style={{ color: "#1B2A38" }}>{f.label}</span>
                 {f.kind === "select" ? (
@@ -9258,14 +9487,39 @@ function AgmReportSettings() {
             ))}
           </div>
 
+          <div style={{ fontWeight: 700, fontSize: 12, color: "#1B2A38", margin: "18px 0 8px" }}>
+            Report metadata
+            <span style={{ fontWeight: 400, color: "#94A0AC" }}> — describes a report COVERING FY {fy}, not a rate. Never applied.</span>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "10px 24px" }}>
+            {AGM_FIELDS.filter((f) => f.scope === "report").map((f) => (
+              <label key={f.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, fontSize: 12.5 }}>
+                <span style={{ color: "#1B2A38" }}>{f.label}</span>
+                <input
+                  type={f.kind === "date" ? "date" : "text"}
+                  inputMode={f.kind === "money" || f.kind === "number" ? "decimal" : undefined}
+                  value={settings[f.key] ?? ""}
+                  onChange={(e) => setSettings((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                  onBlur={() => {
+                    if (f.kind !== "money" && f.kind !== "number") return;
+                    const n = num(settings[f.key], f.kind);
+                    if (n === null || Number.isNaN(n)) return;
+                    setSettings((prev) => ({ ...prev, [f.key]: f.kind === "money" ? n.toFixed(2) : String(n) }));
+                  }}
+                  style={{ ...inputStyle, width: f.kind === "text" || f.kind === "date" ? 150 : 110, textAlign: f.kind === "text" ? "left" : "right", fontFamily: f.kind === "text" || f.kind === "date" ? "inherit" : inputStyle.fontFamily }}
+                />
+              </label>
+            ))}
+          </div>
+
           <div style={{ marginTop: 16, padding: "10px 12px", background: "#F4F7F9", borderLeft: "3px solid #2F5D50", borderRadius: 4 }}>
             <div style={{ fontSize: 12.5, fontWeight: 700, color: "#1B2A38", marginBottom: 4 }}>
-              Water rate card — calculated from FY {fy}
+              Water rate card for FY {fy} — calculated from FY {previousFY(fy)}
             </div>
             {calcFactor === undefined && <div style={{ fontSize: 12, color: "#94A0AC" }}>Working it out from the council invoices and meter readings…</div>}
             {calcFactor === null && (
               <div style={{ fontSize: 12, color: "#94A0AC", lineHeight: 1.6 }}>
-                Can’t be worked out for FY {fy} — it needs both council water invoices and unit meter readings for the same months. Capture them on <b>Utility bills</b> and <b>Meter readings</b>.
+                Can’t be worked out from FY {previousFY(fy)} — it needs both council water invoices and unit meter readings for the same months. Capture them on <b>Utility bills</b> and <b>Meter readings</b>.
               </div>
             )}
             {calcFactor && (
@@ -9297,19 +9551,72 @@ function AgmReportSettings() {
 
           <div style={{ marginTop: 18, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
             <button style={primaryBtn} onClick={save} disabled={busy}>
-              {/* Deliberately not "…for FY <year>". The row holds this year's
-                  current figures AND next year's proposed ones, so naming a
-                  single year on the button reads as though the proposed
-                  columns belong to it too. */}
-              {busy ? "Saving…" : "Save AGM figures"}
+              {/* Now safe to name the year: the row holds one year's figures. */}
+              {busy ? "Saving…" : `Save FY ${fy} figures`}
             </button>
             {notice && <span style={{ fontSize: 12.5, color: "#2F5D50", fontWeight: 600 }}>{notice}</span>}
             {error && <span style={{ fontSize: 12.5, color: "#B5651D", fontWeight: 600 }}>{error}</span>}
           </div>
           <p style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 12, lineHeight: 1.6 }}>
-            The projected annual garden cost in the report is the proposed rate per day times the visits per month, over twelve months — it isn’t entered here, so it can’t fall out of step with the rate.
+            The projected annual garden cost in the report is this year's rate per day times the visits per month, over twelve months — it isn’t entered here, so it can’t fall out of step with the rate.
             Leaving a field blank renders that row of the report as an empty cell to complete in Word, which is how the whole section used to work.
           </p>
+
+          {/* ---------- Approval, and applying ---------- */}
+          <div style={{ marginTop: 18, padding: "12px 14px", borderRadius: 6, background: row.figures_applied_at ? "#F1F6F3" : "#FBFAF6", border: `1px solid ${row.figures_applied_at ? "#B9D3C6" : "#D8D0BE"}` }}>
+            <div style={{ fontWeight: 700, fontSize: 12.5, color: "#1B2A38", marginBottom: 6 }}>
+              Approval and application — FY {fy}
+            </div>
+            <p style={{ fontSize: 11.5, color: "#94A0AC", margin: "0 0 10px", lineHeight: 1.6 }}>
+              The figures above are <b>proposals</b> and change nothing on their own. Record the meeting's decision, then apply it — applying writes the three council charges to <b>levy_rates</b> and the opening designation to the <b>reserve ledger</b>. Sewerage and the garden and blockwatch fees are levy grid lines and still have to be entered on <b>Levy breakdown</b>; the panel says which, rather than reporting success for something it didn't write.
+            </p>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", fontSize: 12.5 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ color: "#1B2A38" }}>Approved on</span>
+                <input type="date" value={row.figures_approved_on || ""}
+                       onChange={(e) => markApproved(e.target.value, row.figures_approved_by)}
+                       disabled={busy}
+                       style={{ ...inputStyle, width: 150, textAlign: "left", fontFamily: "inherit" }} />
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ color: "#1B2A38" }}>by</span>
+                <input value={row.figures_approved_by || ""}
+                       placeholder="meeting / resolution"
+                       onChange={(e) => setRow((p) => ({ ...p, figures_approved_by: e.target.value }))}
+                       onBlur={(e) => { if (row.figures_approved_on) markApproved(row.figures_approved_on, e.target.value); }}
+                       disabled={busy}
+                       style={{ ...inputStyle, width: 190, textAlign: "left", fontFamily: "inherit" }} />
+              </label>
+              {row.figures_approved_on && (
+                <button style={{ ...primaryBtn, background: "#2F5D50" }} onClick={applyFigures} disabled={busy}>
+                  {busy ? "Applying…" : row.figures_applied_at ? `Apply again to FY ${fy}` : `Apply approved figures to FY ${fy}`}
+                </button>
+              )}
+            </div>
+            {row.figures_applied_at && (
+              <div style={{ fontSize: 11.5, color: "#2F5D50", marginTop: 8, fontWeight: 600 }}>
+                Last applied {new Date(row.figures_applied_at).toLocaleString("en-ZA")}. Applying again is safe — a designation already on the ledger is not written twice.
+              </div>
+            )}
+            {!row.figures_approved_on && (
+              <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 8 }}>
+                Nothing can be applied until an approval date is recorded.
+              </div>
+            )}
+            {applyResult && (
+              <div style={{ marginTop: 10, fontSize: 11.5, lineHeight: 1.7, color: "#3D4B57" }}>
+                {applyResult.written.length > 0 && (
+                  <div><b style={{ color: "#2F5D50" }}>Written:</b> {applyResult.written.map((w) => `${w.figure} → ${w.to} (${rand(w.value)})`).join(" · ")}</div>
+                )}
+                {applyResult.manual.length > 0 && (
+                  <div><b style={{ color: "#8A6A1E" }}>Still to enter by hand:</b> {applyResult.manual.map((m) => `${m.figure} → ${m.where}`).join(" · ")}</div>
+                )}
+                {applyResult.skipped.length > 0 && (
+                  <div><b style={{ color: "#94A0AC" }}>Not applied:</b> {applyResult.skipped.map((k) => `${k.figure} — ${k.reason}`).join(" · ")}</div>
+                )}
+              </div>
+            )}
+          </div>
         </>
       )}
     </Card>

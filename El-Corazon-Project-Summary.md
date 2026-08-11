@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 11 August 2026, session 21 (supersedes the 11 August 2026 session 20 summary)
+Last updated: 11 August 2026, session 22 (supersedes the 11 August 2026 session 21 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,83 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 11 August 2026, session 22 — AGM figures get a year, and a way back into the app
+
+Devon asked the question the model had no answer to: **"if the new figures are approved at the AGM,
+how will they be updated in the app?"** They wouldn't have been. Nothing in the app has ever written
+the `levy_rates` fee columns — `saveCommonPropertyStandards` inserts them as explicit `null` and
+nothing else touches them — so the report's "an AGM-approved figure in `levy_rates` wins" branch,
+written in session 13, was **unreachable**. Every approved figure had to be re-typed on another
+screen, and nothing recorded that the meeting had decided anything.
+
+### `agm_report_settings` is re-keyed on the year the figures APPLY TO
+
+It used to key on the year the report *covers*, so one row held `garden_rate_per_day` beside
+`garden_proposed_rate_per_day` and four `*_new` columns carrying the year after's charges. That is
+why every FY 2026/2027 proposal was filed under 2025/2026.
+
+**"Current" and "proposed" are now the same column on two rows.** Six columns renamed
+(`sewerage_per_unit_new` → `sewerage_per_unit`, and so on), two dropped once their values moved to
+their own year. The report reads **both** rows — this year's for its Current column, next year's for
+New. `AGM_FIELDS` gained a **`scope`**: `"year"` for a rate or a decision, `"report"` for
+`prepared_by`, `checked_by` and the services-note estimate, which describe the document rather than
+a rate and stay on the covering year. The Config card groups by it and the year picker now reaches
+**one year forward**, which is where the September meeting's proposals belong.
+
+> **Order mattered in the migration:** values were moved while the old column names still existed,
+> and only then were the columns renamed and the paired ones dropped. Doing it the other way round
+> loses a year of proposals.
+
+### Three states, not two
+
+| State | Means | Billing |
+|---|---|---|
+| proposed | typed on Config, printed in the report's New column | untouched |
+| approved | `figures_approved_on` — the meeting carried it | untouched |
+| applied | written through to `levy_rates` and the reserve ledger | **live** |
+
+**Apply** writes the three council charges to `levy_rates` and the opening designation to
+`reserve_fund_entries`, then logs the run to a new `agm_figure_applications` table — what was
+written, what was skipped and why, who ran it. Four guards:
+
+- **Approved first.** Unapproved figures cannot be applied; the button isn't even shown.
+- **Never backwards.** Refuses a year earlier than the active FY — applying to a billed year
+  re-prices statements already issued, the failure the water-band versioning exists to prevent.
+- **Idempotent.** A designation already on the ledger for that year is not written twice.
+- **It says what it did NOT do.** Sewerage has no column in `levy_rates` — it is a levy grid line —
+  and the garden and blockwatch fees are grid lines too, so they are reported as *still to enter by
+  hand* rather than counted as written. **The water reconciliation factor is never applied**:
+  nothing bills on it, and it must become effective-dated first.
+
+### The download was blocked, and it was our fault not Chrome's
+
+"Needs permission to download." Building the pack takes seconds — CDN load, six queries, charts — so
+by the time `a.click()` fired the browser no longer connected it to the click that started it.
+**Chrome treats that as an *automatic* download** and gates it behind the Automatic downloads site
+permission.
+
+Generation now **returns the blob** and the caller shows a separate **"Download the AGM pack"**
+button, so the click that saves the file is a fresh user gesture and the download is never
+automatic. A missed download can also be retried without rebuilding the document. New `downloadBlob()`
+is the one place that turns a built file into a save.
+
+### Verified
+Bundle clean, `no-undef` clean (bar the pre-existing `URLSearchParams`), no leftover references to
+any renamed column or field. Live data traced end to end: garden 387 → 414 at +7%, blockwatch
+150 → 150, and the four charges landing in the New column from the 2026/2027 row.
+**Devon has since set the basis to `levy_only`**, so section 12 now reports a minimum of
+R 22,502.39 with the R 70,000 designation at 46.7% of the levy grid — clear of 25% on both readings.
+Migration `agm_settings_keyed_by_applying_year.sql`, applied and mirrored.
+
+> **`npm run build` still has to be run locally.**
+
+### Not done
+Applying does not touch the levy grid, so garden, blockwatch and sewerage remain manual — worth
+revisiting once it is clear whether a per-unit grid write can be made safe. The `applied` state is
+also per year, not per figure: editing one field after an application does not mark it unapplied.
 
 ---
 
