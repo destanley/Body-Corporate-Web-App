@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 11 August 2026, session 18 (supersedes the 11 August 2026 session 17 summary)
+Last updated: 11 August 2026, session 19 (supersedes the 11 August 2026 session 18 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,81 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 11 August 2026, session 19 — a silent data-loss bug, and the factor computes itself
+
+### The AGM figures card was writing null and calling it a save
+
+**Symptom:** the water demand levy, electricity service charge and electricity network charge were
+typed, saved, confirmed with "Saved for FY …", and were empty on the next refresh. Sewerage,
+entered on the same card at the same time, survived.
+
+**Cause:** `num()` in `AgmReportSettings` did `.replace(",", ".")` — which replaces only the
+**first** comma. So:
+
+| typed | old parser | stored |
+|---|---|---|
+| `774.48` | 774.48 | ✓ saved |
+| `1 125,75` | 1125.75 | ✓ saved |
+| `1,125.75` | `"1.125.75"` → NaN | **null** |
+| `R 124,00` | `"R124.00"` → NaN | **null** |
+
+On NaN the function returned `null`, the upsert wrote null, and the notice said "Saved". Sewerage
+was the only one of the four typed without a thousands separator or an R, which is why it alone
+survived. Confirmed against live data: `agm_report_settings` FY 2025/2026 holds
+`sewerage_per_unit_new = 774.48` with the other three null.
+
+**Fix, three parts:**
+
+- **`num(value, kind)` understands what people type.** Strips spaces, non-breaking spaces and a
+  leading `R`; where several separators appear, all but the last are thousands marks. `kind`
+  matters: for `money` a lone three-digit group is thousands, so `1,125` is 1125; for `number` it
+  never is, because the reconciliation factor is a decimal and `1.045` must stay 1.045.
+- **A field that cannot be read stops the save.** `num()` now returns `NaN` for unreadable input
+  rather than `null`, and `save()` refuses, naming the offending fields. Writing null for something
+  the trustee typed is what caused the loss; it can no longer happen silently.
+- **Numeric fields reformat on blur**, so what the parser understood is visible before saving.
+
+> **Devon must re-enter the three FY 2026/2027 proposals.** They are figures the meeting votes on,
+> not something derivable from the invoices, so nothing can restore them. They will stick now.
+
+The same `.replace(",", ".")` shape exists in other components. Only `AgmReportSettings` was fixed
+this session; **the others are worth auditing** — a table using it for meter readings would corrupt
+a reading rather than blank a config field.
+
+### The reconciliation factor now works itself out
+
+New **`computeWaterReconciliationFactor(fy)`**. Everything it needs is already captured, so the
+trustee never works it out by hand:
+
+- **numerator** — the year's council water *consumption* charges ex VAT (`council_invoices.bulk_water_rand`);
+  not sewerage, not the demand levy, which are flat per-dwelling pass-throughs that recover exactly
+- **denominator** — the same months of unit readings priced on CoJ's own step rates from
+  `water_tariff_bands`, stopped at the highest step any invoice reached
+- Only months holding **both** an invoice and readings count, on both sides
+
+The cap is **one step for the whole year**, not per month: the output is a card printed once and
+used for twelve months. The step each month reached is inferred from bulk kL ÷ dwellings against
+the band table — `council_invoices` does not store the reading-period day count, and a nominal
+calendar month places the step reliably (FY 2025/2026 reaches step 3 in eleven months, step 2 in
+the twelfth).
+
+**Verified against live data — the function's logic reproduced in SQL gives top step index 2
+(R31.15), numerator R14 165.50, denominator R14 844.40, factor 0.9543 over 84 unit-months**, which
+matches the AGM pack to the digit.
+
+On the Config card it appears as a green-ruled panel under the fields: the figure, the two amounts
+it came from, the card it implies, and a **Use this figure** button. **The stored field is only ever
+an override** — left blank, the calculated figure stands. Failure costs the panel, not the card.
+
+### Still true, and worth repeating
+
+**Nothing bills on the factor.** The engine remains `individualWaterCost` and the August 2026
+minimum-charge rule. The factor and the rate card are a proposal for the meeting. If it is adopted,
+`water_reconciliation_factor` must become effective-dated **before** the billing engine reads it —
+see the note on `AGM_FIELDS`.
 
 ---
 

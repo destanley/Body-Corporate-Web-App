@@ -8683,6 +8683,99 @@ function InsurancePreview({ preview, onApply, onDiscard }) {
 // used to render as blank cells for typing into Word each September, which meant
 // re-keying them every year. Kept per financial year so last year's report can
 // still be regenerated exactly as it was signed off.
+// ---------- Water rate card: the reconciliation factor, computed ----------
+// Everything this needs is already captured, so the trustee should never have
+// to work it out by hand:
+//
+//   numerator   — the year's council water CONSUMPTION charges, ex VAT
+//                 (`council_invoices.bulk_water_rand`). Not sewerage and not
+//                 the water demand levy: those are flat per-dwelling charges
+//                 passed through at cost and recover exactly.
+//   denominator — the same months of unit readings priced on CoJ's own step
+//                 rates, stopped at the highest step any invoice reached in
+//                 the year.
+//
+// The cap is a SINGLE step for the whole year, not per month: the output is a
+// rate card printed once and used for twelve months, so it cannot vary. The
+// step each month reached is inferred from bulk kL ÷ dwellings against the
+// band table — `council_invoices` doesn't store the reading-period day count,
+// and a nominal calendar month is close enough to place the step (FY 2025/2026
+// reaches step 3 in eleven months and step 2 in the twelfth).
+//
+// Returns null when there is nothing to compute from, otherwise the factor
+// plus its inputs so the card can show its working.
+async function computeWaterReconciliationFactor(fy, unitCount = UNITS.length) {
+  const client = await ensureSupabaseClient();
+  const { from, to } = fyBounds(fy);
+  const [inv, usage, bands] = await Promise.all([
+    client.from("council_invoices").select("period, bulk_water_kl, bulk_water_rand").gte("period", from).lte("period", to),
+    client.from("monthly_usage").select("period, water_current, water_previous").gte("period", from).lte("period", to),
+    client.from("water_tariff_bands").select("band_label, from_kl, to_kl, rate_per_kl, effective_from")
+      .lte("effective_from", to).order("effective_from", { ascending: false }),
+  ]);
+  const failed = [inv, usage, bands].find((r) => r.error);
+  if (failed) throw failed.error;
+
+  // Newest rate set that had taken effect by the end of the year.
+  const rows = bands.data || [];
+  if (!rows.length) return null;
+  const newest = rows[0].effective_from;
+  const scale = rows.filter((r) => r.effective_from === newest)
+    .map((r) => ({ from: Number(r.from_kl), to: r.to_kl == null ? null : Number(r.to_kl), rate: Number(r.rate_per_kl) || 0 }))
+    .sort((a, b) => a.from - b.from);
+  if (scale.length < 2) return null;
+
+  // Which step did the complex itself reach? Highest across the year.
+  let topStep = 1;
+  const invoices = (inv.data || []).filter((r) => r.bulk_water_rand != null && Number(r.bulk_water_rand) > 0);
+  invoices.forEach((r) => {
+    const perDwelling = (Number(r.bulk_water_kl) || 0) / unitCount;
+    for (let i = scale.length - 1; i >= 1; i -= 1) {
+      if (perDwelling > scale[i].from) { topStep = Math.max(topStep, i); break; }
+    }
+  });
+
+  // Price one unit-month on that scale, with everything above the top step
+  // charged AT the top step's rate rather than climbing past it.
+  const priceOne = (kl) => {
+    let r = Math.max(0, kl), c = 0;
+    for (let i = 0; i < scale.length; i += 1) {
+      if (r <= 0) break;
+      const b = scale[i];
+      const width = (i === topStep || b.to == null) ? r : Math.max(0, b.to - b.from);
+      const used = Math.min(r, width);
+      c += used * b.rate;
+      r -= used;
+    }
+    return c;
+  };
+
+  // Only months that have BOTH an invoice and readings can be compared.
+  const priced = new Set(invoices.map((r) => String(r.period).slice(0, 10)));
+  const usageMonths = new Set();
+  let denominator = 0;
+  (usage.data || []).forEach((r) => {
+    const p = String(r.period).slice(0, 10);
+    if (!priced.has(p)) return;
+    usageMonths.add(p);
+    denominator += priceOne(round2((Number(r.water_current) || 0) - (Number(r.water_previous) || 0)));
+  });
+  const usable = invoices.filter((r) => usageMonths.has(String(r.period).slice(0, 10)));
+  const numerator = usable.reduce((s, r) => s + Number(r.bulk_water_rand), 0);
+  if (!(denominator > 0) || !(numerator > 0)) return null;
+
+  return {
+    factor: numerator / denominator,
+    numerator, denominator,
+    months: usable.length,
+    topStepLabel: scale[topStep] ? `${scale[topStep].from}–${scale[topStep].to == null ? "" : scale[topStep].to} kL @ ${rand(scale[topStep].rate)}` : "",
+    cardRates: scale.slice(1).map((b) => ({ from: b.from, to: b.to, nominal: b.rate, card: b.rate * (numerator / denominator) }))
+      .slice(0, topStep),
+    effectiveFrom: newest,
+    missingInvoice: [...usageMonths].length !== (inv.data || []).length,
+  };
+}
+
 const AGM_FIELDS = [
   { key: "garden_rate_per_day", label: "Garden — current rate per day", kind: "money" },
   { key: "garden_increase_pct", label: "Garden — proposed increase (%)", kind: "number" },
@@ -8735,6 +8828,9 @@ function AgmReportSettings() {
   }, []);
   const [fy, setFy] = useState(years[0]);
   const [settings, setSettings] = useState({});
+  // The factor the year's own invoices and readings imply. Recomputed whenever
+  // the year changes; the stored field is only ever an override of it.
+  const [calcFactor, setCalcFactor] = useState(undefined); // undefined = still working, null = can't
   const [status, setStatus] = useState("loading"); // loading | ready | error
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -8760,16 +8856,50 @@ function AgmReportSettings() {
         if (alive) setStatus("error");
       }
     })();
+    // Worked out separately so a failure costs the suggestion, not the card.
+    setCalcFactor(undefined);
+    computeWaterReconciliationFactor(fy)
+      .then((r) => { if (alive) setCalcFactor(r); })
+      .catch((err) => { console.warn("Computing the water reconciliation factor failed:", err); if (alive) setCalcFactor(null); });
     return () => { alive = false; };
   }, [fy]);
 
-  // "1234,56" and "1234.56" both mean the same thing to a South African typing
-  // into this form; parseFloat on the comma form silently returns 1234.
-  const num = (v) => {
-    const t = String(v ?? "").trim().replace(/\s/g, "").replace(",", ".");
+  // Parses what a South African actually types into a money field: a space or a
+  // comma for thousands, a comma or a full stop for the decimal, and often the
+  // figure pasted straight off an invoice complete with its R.
+  //
+  // THE BUG THIS REPLACES (found 11 Aug 2026): the old parser did
+  // `.replace(",", ".")`, which replaces only the FIRST comma. "1 125,75" came
+  // through fine, but "1,125.75" became the unparseable "1.125.75", Number()
+  // returned NaN, and the function returned **null** — so the save wrote null,
+  // reported "Saved", and the figure was gone. Anything with an R prefix went
+  // the same way. That is how the water demand levy and the two electricity
+  // charges emptied themselves while sewerage (typed "774.48", no separator,
+  // no R) survived.
+  //
+  // Returns null for an empty field and **NaN for something typed that cannot
+  // be read** — the caller must refuse to save on NaN rather than storing null.
+  //
+  // `kind` matters: for "money" a lone group of exactly three digits is read as
+  // a thousands separator, so "1,125" is 1125. For "number" it never is, because
+  // the reconciliation factor is a decimal — "1.045" must stay 1.045, not 1045.
+  const num = (v, kind = "money") => {
+    let t = String(v ?? "").trim().replace(/[\s ]/g, "").replace(/^r/i, "");
     if (t === "") return null;
+    const neg = /^[-(]/.test(t);
+    t = t.replace(/[()+-]/g, "");
+    const seps = (t.match(/[.,]/g) || []).length;
+    if (seps > 1) {
+      // Every separator but the last is a thousands mark: "1.234.567,89".
+      const last = Math.max(t.lastIndexOf(","), t.lastIndexOf("."));
+      t = t.slice(0, last).replace(/[.,]/g, "") + "." + t.slice(last + 1);
+    } else if (seps === 1) {
+      t = kind === "money" && /^[1-9]\d{0,2}[.,]\d{3}$/.test(t)
+        ? t.replace(/[.,]/g, "")   // "1,125" / "1.125" -> 1125
+        : t.replace(",", ".");     // otherwise the separator is the decimal
+    }
     const n = Number(t);
-    return isFinite(n) ? n : null;
+    return isFinite(n) ? (neg ? -n : n) : NaN;
   };
   const txt = (v) => { const t = String(v ?? "").trim(); return t === "" ? null : t; };
 
@@ -8778,7 +8908,24 @@ function AgmReportSettings() {
     try {
       const client = await ensureSupabaseClient();
       const payload = { financial_year: fy, updated_at: new Date().toISOString() };
-      AGM_FIELDS.forEach((f) => { payload[f.key] = f.kind === "money" || f.kind === "number" ? num(settings[f.key]) : txt(settings[f.key]); });
+      // A field that was typed but can't be read must STOP the save. Writing
+      // null for it is what silently lost three figures before — the row saved,
+      // the notice said "Saved", and only a later refresh showed the damage.
+      const unreadable = [];
+      AGM_FIELDS.forEach((f) => {
+        if (f.kind === "money" || f.kind === "number") {
+          const n = num(settings[f.key], f.kind);
+          if (Number.isNaN(n)) unreadable.push(f.label);
+          payload[f.key] = n;
+        } else {
+          payload[f.key] = txt(settings[f.key]);
+        }
+      });
+      if (unreadable.length) {
+        setError(`Couldn't read a number in: ${unreadable.join("; ")}. Nothing was saved — check those fields and try again.`);
+        setBusy(false);
+        return;
+      }
       const { error: se } = await client.from("agm_report_settings").upsert(payload, { onConflict: "financial_year" });
       if (se) throw se;
       setNotice(`Saved for FY ${fy}. The AGM report picks this up the next time it is generated.`);
@@ -8825,10 +8972,56 @@ function AgmReportSettings() {
                   inputMode={f.kind === "money" || f.kind === "number" ? "decimal" : undefined}
                   value={settings[f.key] ?? ""}
                   onChange={(e) => setSettings((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                  // Show what was actually understood, the moment focus leaves.
+                  // Typing "1,125.75" and seeing it settle to 1125.75 is the
+                  // difference between catching a mis-read and losing the figure.
+                  onBlur={() => {
+                    if (f.kind !== "money" && f.kind !== "number") return;
+                    const n = num(settings[f.key], f.kind);
+                    if (n === null || Number.isNaN(n)) return;
+                    setSettings((prev) => ({ ...prev, [f.key]: f.kind === "money" ? n.toFixed(2) : String(n) }));
+                  }}
                   style={{ ...inputStyle, width: f.kind === "text" || f.kind === "date" ? 150 : 110, textAlign: f.kind === "text" ? "left" : "right", fontFamily: f.kind === "text" || f.kind === "date" ? "inherit" : inputStyle.fontFamily }}
                 />
               </label>
             ))}
+          </div>
+
+          <div style={{ marginTop: 16, padding: "10px 12px", background: "#F4F7F9", borderLeft: "3px solid #2F5D50", borderRadius: 4 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 700, color: "#1B2A38", marginBottom: 4 }}>
+              Water rate card — calculated from FY {fy}
+            </div>
+            {calcFactor === undefined && <div style={{ fontSize: 12, color: "#94A0AC" }}>Working it out from the council invoices and meter readings…</div>}
+            {calcFactor === null && (
+              <div style={{ fontSize: 12, color: "#94A0AC", lineHeight: 1.6 }}>
+                Can’t be worked out for FY {fy} — it needs both council water invoices and unit meter readings for the same months. Capture them on <b>Utility bills</b> and <b>Meter readings</b>.
+              </div>
+            )}
+            {calcFactor && (
+              <div style={{ fontSize: 12, color: "#3D4B57", lineHeight: 1.7 }}>
+                <b style={{ fontSize: 14 }}>{calcFactor.factor.toFixed(4)}</b>
+                {" — "}{rand(calcFactor.numerator)} charged by the council over {calcFactor.months} month{calcFactor.months === 1 ? "" : "s"},
+                {" "}divided by {rand(calcFactor.denominator)} of metered water priced on the council’s own scale, stopped at {calcFactor.topStepLabel}.
+                {calcFactor.cardRates.length > 0 && (
+                  <>
+                    <br />
+                    Card that produces: first {calcFactor.cardRates[0].from} kL free
+                    {calcFactor.cardRates.map((b) => `, ${rand(b.card)}/kL ${b.to == null ? `above ${b.from}` : `for ${b.from}–${b.to}`} kL`).join("")}.
+                  </>
+                )}
+                <br />
+                <span style={{ color: "#94A0AC" }}>
+                  Leave the field above blank to use this figure. Type one only to override what the meeting actually approved.
+                  {calcFactor.missingInvoice && " Some months have readings but no invoice, or the reverse, and are left out of both sides."}
+                </span>
+                {" "}
+                <button
+                  style={{ ...primaryBtn, padding: "3px 10px", fontSize: 11.5, marginLeft: 2 }}
+                  onClick={() => setSettings((p) => ({ ...p, water_reconciliation_factor: calcFactor.factor.toFixed(4) }))}>
+                  Use this figure
+                </button>
+              </div>
+            )}
           </div>
 
           <div style={{ marginTop: 18, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
