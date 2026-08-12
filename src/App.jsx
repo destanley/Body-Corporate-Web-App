@@ -2063,12 +2063,24 @@ async function changeOwnPassword(newPassword) {
 // The four sign-offs that gate statement release. Scope is a financial year
 // for the two annual subjects and a statement period for the two monthly ones
 // — see the approvals table comment for why they differ.
+// `gatesStatements` exists because not every sign-off is about statements.
+// The first four are: nothing goes out until they are in. The maintenance plan
+// is a PMR 22 decision on a ten-year schedule and has no bearing on whether
+// July's levy statement can be printed — gating statements on it would hold
+// every owner's account hostage to a property survey. It is listed here anyway
+// so it shares one table, one component and one set of scoping rules with the
+// others rather than growing a parallel approval mechanism of its own.
 const APPROVAL_SUBJECTS = [
-  { key: "levy_breakdown", label: "Levy breakdown", scopeKind: "fy" },
-  { key: "insurance", label: "Insurance breakdown", scopeKind: "fy" },
-  { key: "meter_readings", label: "Meter readings", scopeKind: "period" },
-  { key: "statements", label: "Statements", scopeKind: "period" },
+  { key: "levy_breakdown", label: "Levy breakdown", scopeKind: "fy", gatesStatements: true },
+  { key: "insurance", label: "Insurance breakdown", scopeKind: "fy", gatesStatements: true },
+  { key: "meter_readings", label: "Meter readings", scopeKind: "period", gatesStatements: true },
+  { key: "statements", label: "Statements", scopeKind: "period", gatesStatements: true },
+  { key: "maintenance_plan", label: "Maintenance plan", scopeKind: "fy", gatesStatements: false },
 ];
+
+// Derived once. Everything that reasons about statement release reads THIS, so
+// adding a sixth subject cannot silently start blocking statements.
+const STATEMENT_GATE_SUBJECTS = APPROVAL_SUBJECTS.filter((s) => s.gatesStatements);
 
 const approvalScopeFor = (subjectKey, period = ACTIVE_PERIOD) => {
   const s = APPROVAL_SUBJECTS.find((x) => x.key === subjectKey);
@@ -2113,7 +2125,11 @@ async function setApproval(subjectKey, approved, period = ACTIVE_PERIOD, note = 
 // The approval control that appears on all four screens. One component so the
 // four cannot drift apart in wording or behaviour — and so the thing that
 // gates statements looks the same everywhere it is asked for.
-function ApprovalCheckbox({ subject, period = ACTIVE_PERIOD, hint }) {
+// `onChanged` fires after a successful toggle, for a screen whose OWN behaviour
+// depends on the approval — the maintenance register locks the moment the plan
+// is approved, and a lock that only appears on the next page load is a lock the
+// trustee will work around without realising.
+function ApprovalCheckbox({ subject, period = ACTIVE_PERIOD, hint, onChanged }) {
   const canApprove = useCanApprove();
   const { role } = useTrusteeRole();
   const [row, setRow] = useState(undefined); // undefined = loading
@@ -2138,6 +2154,7 @@ function ApprovalCheckbox({ subject, period = ACTIVE_PERIOD, hint }) {
     try {
       await setApproval(subject, !row, period);
       await load();
+      if (onChanged) onChanged();
     } catch (err) {
       console.error("Saving the approval failed:", err);
       // The database refuses a write from a role without can_approve(), which
@@ -2211,8 +2228,8 @@ function useStatementReleaseGate(period = ACTIVE_PERIOD) {
   }, [period, version]);
 
   const outstanding = approvals == null
-    ? APPROVAL_SUBJECTS.map((s) => s.label)
-    : APPROVAL_SUBJECTS.filter((s) => !approvals[s.key]).map((s) => s.label);
+    ? STATEMENT_GATE_SUBJECTS.map((s) => s.label)
+    : STATEMENT_GATE_SUBJECTS.filter((s) => !approvals[s.key]).map((s) => s.label);
   const loading = approvals == null;
   return {
     loading,
@@ -2238,7 +2255,7 @@ function StatementReleaseGate({ gate, period }) {
     return (
       <Card style={{ marginBottom: 16, background: "#EEF4F0", border: "1px solid #B9D4CE" }}>
         <div style={{ fontSize: 12.5, color: "#2F5D50", lineHeight: 1.7 }}>
-          <b>All four sign-offs are in for {periodLabel(period)}.</b> Statements can be produced and sent.
+          <b>All {STATEMENT_GATE_SUBJECTS.length} sign-offs are in for {periodLabel(period)}.</b> Statements can be produced and sent.
         </div>
       </Card>
     );
@@ -2246,8 +2263,8 @@ function StatementReleaseGate({ gate, period }) {
   // Split the outstanding list by cadence. An annual sign-off missing in
   // August is a different job from a monthly one missing this month — the
   // first is done once and clears the rest of the year.
-  const annual = APPROVAL_SUBJECTS.filter((s) => s.scopeKind === "fy" && !gate.approvals[s.key]);
-  const monthly = APPROVAL_SUBJECTS.filter((s) => s.scopeKind === "period" && !gate.approvals[s.key]);
+  const annual = STATEMENT_GATE_SUBJECTS.filter((s) => s.scopeKind === "fy" && !gate.approvals[s.key]);
+  const monthly = STATEMENT_GATE_SUBJECTS.filter((s) => s.scopeKind === "period" && !gate.approvals[s.key]);
   return (
     <Card style={{ marginBottom: 16, background: "#FBF3E9", border: "1px solid #E3C9A8" }}>
       <div style={{ fontSize: 12.5, color: "#8A5A1E", lineHeight: 1.7 }}>
@@ -7320,6 +7337,9 @@ async function fetchMaintenancePlan(fy, opts = {}) {
     return {
       id: a.id, code: a.code, name: a.name, category: a.category, status: a.status,
       installedOn: a.installed_on, expectedLife: life, cost, costBasis: a.cost_basis, notes: a.notes,
+      // Carried so the register grid and the spreadsheet round trip can edit
+      // every stored field, not just the four a survey produces.
+      location: a.location, quantity: a.quantity == null ? null : Number(a.quantity),
       condition: insp ? insp.condition : null,
       inspectedOn: insp ? String(insp.inspected_on).slice(0, 10) : null,
       remaining, remainingBasis, assessed,
@@ -11364,6 +11384,457 @@ function BankRecon({ periods, period, setPeriod, onImported }) {
 // list, its condition history, and the reserve fund ledger. Section 12 of the
 // AGM report is computed from exactly this data, so anything captured here
 // appears in the report and nothing has to be typed twice.
+// ---------- Maintenance register: the spreadsheet round trip ----------
+// The register is completed by walking the property, which happens on paper and
+// in a spreadsheet, not in a browser. So the register exports to .xlsx, gets
+// filled in, and comes back — and on the way back THE FILE IS THE SOURCE OF
+// TRUTH: a row that has gone from the sheet goes from the register.
+//
+// Three things make that survivable:
+//
+//  1. **Removal is deactivation, never a delete.** `active = false` drops the
+//     component out of the register and out of the plan — fetchMaintenancePlan
+//     already filters on active — while its inspections and any tagged reserve
+//     entry survive. A mistaken upload is recoverable; a delete is not, and
+//     asset_inspections cascades.
+//  2. **Nothing is written until the diff has been seen.** The upload parses
+//     into a preview naming every add, every change and every removal. An
+//     import that silently deletes is the failure mode this design exists to
+//     avoid.
+//  3. **Validation is total and up front.** Supabase-js has no transaction, so
+//     a half-applied "source of truth" file would leave the register in a state
+//     that matches neither the sheet nor what it replaced. Every row is checked
+//     before the first write; one unreadable cell refuses the whole import.
+//
+// Loaded from a CDN on first use, the same pattern as supabase-js, pdf.js and
+// docx. 0.20.3 from SheetJS's own CDN rather than 0.18.5 from jsDelivr: 0.18.5
+// is the last build npm mirrors and it carries the prototype-pollution advisory
+// that later versions fix.
+let xlsxLoadPromise = null;
+function ensureXlsxLoaded() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (xlsxLoadPromise) return xlsxLoadPromise;
+  xlsxLoadPromise = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js";
+    s.onload = () => resolve(window.XLSX);
+    s.onerror = () => { xlsxLoadPromise = null; reject(new Error("Could not load the spreadsheet library")); };
+    document.head.appendChild(s);
+  });
+  return xlsxLoadPromise;
+}
+
+// Mirrors assets_status_chk in the schema. Kept as a list rather than free text
+// so an import cannot write a status the CHECK constraint will reject halfway
+// through the file.
+const ASSET_STATUSES = ["not_assessed", "assessed", "scheduled", "replaced", "retired"];
+const ASSET_COST_BASES = ["quote", "valuation", "insurer schedule", "estimate"];
+
+// ONE definition drives the export, the import and the on-screen grid. Two
+// lists would drift, and a column present in the export but missing from the
+// import map is a column the trustee fills in and quietly loses.
+const REGISTER_COLUMNS = [
+  { key: "id", header: "ID (do not edit)", kind: "id", width: 38 },
+  { key: "name", header: "Component", kind: "text", width: 34, required: true },
+  { key: "category", header: "Category", kind: "text", width: 18, required: true },
+  { key: "code", header: "Code", kind: "text", width: 10 },
+  { key: "location", header: "Location", kind: "text", width: 18 },
+  { key: "quantity", header: "Qty", kind: "number", width: 7, min: 0 },
+  { key: "installed_on", header: "Installed on", kind: "date", width: 14 },
+  { key: "expected_life_years", header: "Expected life (yrs)", kind: "int", width: 17, min: 1 },
+  { key: "replacement_cost", header: "Replacement cost", kind: "number", width: 18, min: 0 },
+  { key: "cost_basis", header: "Cost basis", kind: "choice", width: 16, choices: ASSET_COST_BASES },
+  { key: "status", header: "Status", kind: "choice", width: 14, choices: ASSET_STATUSES },
+  { key: "notes", header: "Notes", kind: "text", width: 48 },
+];
+const REGISTER_SHEET = "Register";
+// The grid shows every exportable column plus three computed ones (condition,
+// remaining, provision) and the actions cell. Counted rather than typed, so a
+// new column cannot leave a colSpan short and break the category headings.
+const REGISTER_GRID_COLS = REGISTER_COLUMNS.filter((c) => c.kind !== "id").length + 4;
+
+// A cell that was filled in but cannot be read. Deliberately NOT null: session
+// 19 lost a year of AGM proposals because an unreadable figure was stored as
+// null and the save said "Saved". Unreadable stops the import and is named.
+const CELL_UNREADABLE = Symbol("unreadable");
+
+const normaliseHeader = (h) => String(h == null ? "" : h).replace(/\u00A0/g, " ").trim().toLowerCase();
+
+// NOT `v instanceof Date`. The spreadsheet library constructs the Date, and a
+// value that has crossed a realm boundary — an iframe, a worker, or the test
+// harness that evaluates this block in a vm context — fails instanceof while
+// being a perfectly good date. The round-trip test caught exactly that, and
+// outside the main realm it would have shown up as "can't read this install
+// date" on a cell that was fine.
+const isDate = (v) => Object.prototype.toString.call(v) === "[object Date]";
+
+function cellText(v) {
+  if (v == null) return null;
+  const s = String(v).replace(/\u00A0/g, " ").trim();
+  return s === "" ? null : s;
+}
+
+// Tolerant of what people actually type — "R 12 000,00", "1,125.75", "1.500" —
+// and strict about what it cannot read. Where several separators appear, all
+// but the last are thousands marks; a lone final group of exactly three digits
+// is thousands too, so "1,125" is 1125 rather than 1.125. That last rule is why
+// this is not shared with parseAmount(), which is for a resident typing a
+// single amount and where "1,125" means 1.125.
+function cellNumber(v) {
+  if (v == null || v === "") return null;
+  if (isDate(v)) return CELL_UNREADABLE;
+  if (typeof v === "number") return Number.isFinite(v) ? v : CELL_UNREADABLE;
+  let s = String(v).replace(/\u00A0/g, " ").trim().replace(/^R/i, "").replace(/\s/g, "");
+  if (s === "") return null;
+  const negative = s.startsWith("-");
+  if (negative) s = s.slice(1);
+  const parts = s.split(/[.,]/);
+  if (parts.length > 1) {
+    const last = parts[parts.length - 1];
+    const lastIsThousands = parts.length === 2 && /^\d{3}$/.test(last);
+    s = lastIsThousands ? parts.join("") : `${parts.slice(0, -1).join("")}.${last}`;
+  }
+  if (!/^\d+(\.\d+)?$/.test(s)) return CELL_UNREADABLE;
+  const n = Number(s);
+  if (!Number.isFinite(n)) return CELL_UNREADABLE;
+  return negative ? -n : n;
+}
+
+// Real Date cells (what the export writes) and ISO text only. A slash date is
+// REFUSED rather than guessed: 03/04/2020 is two different dates depending on
+// who typed it, and a component's install date drives its remaining life.
+function cellDate(v) {
+  if (v == null || v === "") return null;
+  if (isDate(v)) {
+    if (!Number.isFinite(v.getTime())) return CELL_UNREADABLE;
+    const p = (n) => String(n).padStart(2, "0");
+    return `${v.getFullYear()}-${p(v.getMonth() + 1)}-${p(v.getDate())}`;
+  }
+  const s = String(v).trim().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return CELL_UNREADABLE;
+  return Number.isFinite(new Date(`${s}T00:00:00`).getTime()) ? s : CELL_UNREADABLE;
+}
+
+// ---------- Export ----------
+function buildRegisterWorkbook(XLSX, rows, fy) {
+  const header = REGISTER_COLUMNS.map((c) => c.header);
+  const body = rows.map((r) => REGISTER_COLUMNS.map((c) => {
+    switch (c.key) {
+      case "id": return r.id;
+      case "name": return r.name || "";
+      case "category": return r.category || "";
+      case "code": return r.code || "";
+      case "location": return r.location || "";
+      case "quantity": return r.quantity == null ? "" : Number(r.quantity);
+      // A real Date cell, so the round trip never goes through a string and
+      // never meets the slash-date ambiguity cellDate() refuses.
+      case "installed_on": return r.installedOn ? new Date(`${String(r.installedOn).slice(0, 10)}T00:00:00`) : "";
+      case "expected_life_years": return r.expectedLife == null ? "" : Number(r.expectedLife);
+      case "replacement_cost": return r.cost == null ? "" : Number(r.cost);
+      case "cost_basis": return r.costBasis || "";
+      case "status": return r.status || "";
+      case "notes": return r.notes || "";
+      default: return "";
+    }
+  }));
+
+  const ws = XLSX.utils.aoa_to_sheet([header, ...body], { cellDates: true });
+  ws["!cols"] = REGISTER_COLUMNS.map((c) => ({ wch: c.width, hidden: c.kind === "id" }));
+  // Column A is hidden, so it neither prints nor invites editing — but it is
+  // still in the file, which is what makes a renamed component update instead
+  // of duplicating. Number formats so the printed sheet reads as money and
+  // dates rather than as serial numbers.
+  const range = XLSX.utils.decode_range(ws["!ref"]);
+  for (let R = 1; R <= range.e.r; R++) {
+    REGISTER_COLUMNS.forEach((c, C) => {
+      const cell = ws[XLSX.utils.encode_cell({ r: R, c: C })];
+      if (!cell) return;
+      if (c.kind === "date") cell.z = "yyyy-mm-dd";
+      else if (c.key === "replacement_cost") cell.z = "#,##0.00";
+    });
+  }
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, REGISTER_SHEET);
+
+  const guide = [
+    [`El Corazon — component register, FY ${fy}`],
+    [`Exported ${TODAY_ISO}`],
+    [],
+    ["How to complete this sheet"],
+    ["1.", "Print the Register tab, or work in it directly. Column A is hidden on purpose — leave it alone."],
+    ["2.", "Fill in what the walk-round establishes. Every column is editable except the hidden ID."],
+    ["3.", "To ADD a component, type a new row at the bottom and leave the ID blank. Name and Category are required."],
+    ["4.", "To REMOVE a component, delete its whole row. Deleting the row is what removes it — blanking the cells is not."],
+    ["5.", "Upload the saved file on the Maintenance plan page. You will see exactly what will change before anything is written."],
+    [],
+    ["What the columns will accept"],
+    ["Installed on", "A date cell, or text in the form 2020-05-01. 03/04/2020 is refused — it means two different dates."],
+    ["Expected life (yrs)", "A whole number of years, 1 or more. Blank if unknown."],
+    ["Replacement cost", "Rands. R 12 000,00 and 12000 are both read. Blank if not yet costed."],
+    ["Qty", "A number. Blank if it does not apply."],
+    ["Cost basis", ASSET_COST_BASES.join(" / ") + "  (or blank)"],
+    ["Status", ASSET_STATUSES.join(" / ")],
+    [],
+    ["Worth knowing"],
+    ["", "A component carries a provision in the ten-year plan only once it has BOTH an expected life and a replacement cost."],
+    ["", "Once the maintenance plan has been approved for the year, components can still be added — but no upload can remove one."],
+  ];
+  const gs = XLSX.utils.aoa_to_sheet(guide);
+  gs["!cols"] = [{ wch: 22 }, { wch: 104 }];
+  XLSX.utils.book_append_sheet(wb, gs, "How to complete");
+
+  const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  return new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+
+// ---------- Import ----------
+// Returns { rows, error }. The header row is located rather than assumed to be
+// row 1, so a title line pasted above the table does not break the import.
+function readRegisterSheet(XLSX, arrayBuffer) {
+  const wb = XLSX.read(arrayBuffer, { cellDates: true });
+  const name = wb.SheetNames.includes(REGISTER_SHEET) ? REGISTER_SHEET : wb.SheetNames[0];
+  const ws = wb.Sheets[name];
+  if (!ws) return { rows: [], error: "The workbook has no sheets." };
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, blankrows: false, defval: null });
+
+  const wanted = new Map(REGISTER_COLUMNS.map((c) => [normaliseHeader(c.header), c.key]));
+  let headerRow = -1, colFor = null;
+  for (let i = 0; i < Math.min(aoa.length, 20); i++) {
+    const map = {};
+    (aoa[i] || []).forEach((h, idx) => {
+      const key = wanted.get(normaliseHeader(h));
+      if (key && map[key] == null) map[key] = idx;
+    });
+    if (map.name != null && map.category != null) { headerRow = i; colFor = map; break; }
+  }
+  if (headerRow < 0) {
+    return { rows: [], error: `Could not find the header row on the "${name}" sheet — it needs at least a "Component" and a "Category" column. Export a fresh copy and work in that.` };
+  }
+
+  const rows = [];
+  for (let i = headerRow + 1; i < aoa.length; i++) {
+    const raw = aoa[i] || [];
+    const cells = {};
+    let anything = false;
+    REGISTER_COLUMNS.forEach((c) => {
+      const idx = colFor[c.key];
+      const v = idx == null ? null : raw[idx];
+      cells[c.key] = v;
+      if (c.kind !== "id" && v != null && String(v).trim() !== "") anything = true;
+    });
+    if (!anything) continue;                       // a blank row is not a component
+    rows.push({ excelRow: i + 1, cells });
+  }
+  return { rows, error: null, sheetName: name };
+}
+
+// The whole point of the preview. Nothing here writes; it decides what WOULD be
+// written and what cannot be read, and hands both back to be shown.
+function diffRegisterImport(sheetRows, planRows, { locked }) {
+  const errors = [];
+  const byId = new Map(planRows.map((r) => [String(r.id), r]));
+  const seen = new Set();
+  const adds = [], updates = [];
+  let unchanged = 0;
+
+  const parsed = sheetRows.map(({ excelRow, cells }) => {
+    const out = { excelRow, values: {} };
+    REGISTER_COLUMNS.forEach((c) => {
+      const v = cells[c.key];
+      if (c.kind === "id") { out.id = cellText(v); return; }
+      let parsedValue;
+      if (c.kind === "text") parsedValue = cellText(v);
+      else if (c.kind === "date") parsedValue = cellDate(v);
+      else if (c.kind === "int" || c.kind === "number") parsedValue = cellNumber(v);
+      else if (c.kind === "choice") {
+        const t = cellText(v);
+        if (t == null) parsedValue = null;
+        else {
+          const match = c.choices.find((x) => x.toLowerCase() === t.toLowerCase());
+          parsedValue = match || CELL_UNREADABLE;
+        }
+      }
+      if (parsedValue === CELL_UNREADABLE) {
+        const hint = c.kind === "choice" ? ` It has to be one of: ${c.choices.join(", ")}.`
+          : c.kind === "date" ? " Use a date cell, or type it as 2020-05-01."
+          : " It has to be a number.";
+        errors.push(`Row ${excelRow}, "${c.header}": can't read "${String(v).trim()}".${hint}`);
+        parsedValue = null;
+      }
+      if (parsedValue != null && (c.kind === "int" || c.kind === "number")) {
+        if (c.kind === "int" && !Number.isInteger(parsedValue)) {
+          errors.push(`Row ${excelRow}, "${c.header}": ${parsedValue} is not a whole number of years.`);
+        } else if (c.min != null && parsedValue < c.min) {
+          errors.push(`Row ${excelRow}, "${c.header}": ${parsedValue} is below the minimum of ${c.min}.`);
+        }
+      }
+      if (c.required && parsedValue == null) {
+        errors.push(`Row ${excelRow}: "${c.header}" is required and is blank.`);
+      }
+      out.values[c.key] = parsedValue;
+    });
+    return out;
+  });
+
+  // A code has a UNIQUE constraint in the schema. Catching a clash here names
+  // both rows; catching it at the insert names neither.
+  const codes = new Map();
+  parsed.forEach((p) => {
+    const code = p.values.code;
+    if (!code) return;
+    const k = code.toLowerCase();
+    if (codes.has(k)) errors.push(`Rows ${codes.get(k)} and ${p.excelRow} both use the code "${code}". Codes have to be unique.`);
+    else codes.set(k, p.excelRow);
+  });
+
+  parsed.forEach((p) => {
+    if (!p.id) { adds.push(p); return; }
+    const existing = byId.get(p.id);
+    if (!existing) {
+      errors.push(`Row ${p.excelRow}: the ID in the hidden column does not match any component on the register. Don't retype IDs — leave the cell blank and the row is added as new.`);
+      return;
+    }
+    if (seen.has(p.id)) {
+      errors.push(`Row ${p.excelRow}: "${existing.name}" appears more than once. Copying a row copies its ID; clear the ID on the copy.`);
+      return;
+    }
+    seen.add(p.id);
+    const changes = {};
+    const current = {
+      name: existing.name ?? null, category: existing.category ?? null,
+      code: existing.code ?? null, location: existing.location ?? null,
+      quantity: existing.quantity ?? null,
+      installed_on: existing.installedOn ? String(existing.installedOn).slice(0, 10) : null,
+      expected_life_years: existing.expectedLife ?? null,
+      replacement_cost: existing.cost ?? null,
+      cost_basis: existing.costBasis ?? null, status: existing.status ?? null,
+      notes: existing.notes ?? null,
+    };
+    Object.keys(current).forEach((k) => {
+      const was = current[k], now = p.values[k] === undefined ? null : p.values[k];
+      const same = typeof was === "number" || typeof now === "number"
+        ? Number(was ?? NaN) === Number(now ?? NaN) || (was == null && now == null)
+        : was === now;
+      if (!same) changes[k] = { from: was, to: now };
+    });
+    if (Object.keys(changes).length) updates.push({ ...p, existing, changes });
+    else unchanged += 1;
+  });
+
+  // Anything on the register that the sheet no longer carries. THE FILE IS THE
+  // SOURCE OF TRUTH — except once the plan is approved, when removal stops
+  // being available at all and these are reported as kept.
+  const missing = planRows.filter((r) => !seen.has(String(r.id)));
+  return {
+    adds, updates, unchanged, errors,
+    deactivations: locked ? [] : missing,
+    blockedRemovals: locked ? missing : [],
+  };
+}
+
+// The preview between reading the file and writing anything. It exists because
+// "the uploaded file is the source of truth" is a rule that deletes things, and
+// nobody should discover what it deleted afterwards.
+function ImportPreview({ state, onApply, onCancel, busy, locked, money }) {
+  const { diff, filename, rowCount } = state;
+  const { adds, updates, deactivations, blockedRemovals, unchanged, errors } = diff;
+  const blocked = errors.length > 0;
+  const nothing = !blocked && !adds.length && !updates.length && !deactivations.length;
+
+  const box = { marginTop: 14, borderTop: "1px solid #EEE7D6", paddingTop: 14 };
+  const head = { fontWeight: 700, fontSize: 12.5, marginBottom: 5 };
+  const list = { fontSize: 12, color: "#4A5A67", lineHeight: 1.75, margin: 0, paddingLeft: 18 };
+  const show = (v) => (v == null || v === "" ? "—" : typeof v === "number" ? money(v) : String(v));
+  const fieldLabel = (k) => (REGISTER_COLUMNS.find((c) => c.key === k) || { header: k }).header;
+
+  return (
+    <div style={box}>
+      <div style={{ fontSize: 12.5, marginBottom: 10 }}>
+        Read <b>{filename}</b> — {rowCount} component row{rowCount === 1 ? "" : "s"}.{" "}
+        {blocked
+          ? <span style={{ color: "#B5651D", fontWeight: 600 }}>Nothing will be written until these are fixed.</span>
+          : nothing
+            ? <span style={{ color: "#64748B" }}>It matches the register exactly — there is nothing to apply.</span>
+            : <span style={{ color: "#64748B" }}>{unchanged} row{unchanged === 1 ? "" : "s"} unchanged.</span>}
+      </div>
+
+      {blocked && (
+        <div style={{ marginBottom: 12, background: "#FBF3E9", border: "1px solid #E3C9A8", borderRadius: 8, padding: "10px 12px" }}>
+          <div style={{ ...head, color: "#8A5A1E" }}>{errors.length} problem{errors.length === 1 ? "" : "s"} in the file</div>
+          <ul style={{ ...list, color: "#8A5A1E" }}>{errors.map((e, i) => <li key={i}>{e}</li>)}</ul>
+        </div>
+      )}
+
+      {!blocked && adds.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={head}>{adds.length} component{adds.length === 1 ? "" : "s"} will be added</div>
+          <ul style={list}>
+            {adds.map((a) => (
+              <li key={a.excelRow}>
+                <b>{a.values.name}</b> ({a.values.category})
+                {a.values.replacement_cost != null && a.values.expected_life_years != null
+                  ? <> — {money(a.values.replacement_cost)} over {a.values.expected_life_years}y, so it joins the plan straight away</>
+                  : <> — no cost and life yet, so it carries no provision</>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {!blocked && updates.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={head}>{updates.length} component{updates.length === 1 ? "" : "s"} will change</div>
+          <ul style={list}>
+            {updates.map((u) => (
+              <li key={u.excelRow}>
+                <b>{u.existing.name}</b> —{" "}
+                {Object.entries(u.changes).map(([k, c], i, arr) => (
+                  <span key={k}>{fieldLabel(k)} {show(c.from)} → <b>{show(c.to)}</b>{i < arr.length - 1 ? "; " : ""}</span>
+                ))}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {!blocked && deactivations.length > 0 && (
+        <div style={{ marginBottom: 10, background: "#FBF3E9", border: "1px solid #E3C9A8", borderRadius: 8, padding: "10px 12px" }}>
+          <div style={{ ...head, color: "#8A5A1E" }}>{deactivations.length} component{deactivations.length === 1 ? "" : "s"} will be removed</div>
+          <ul style={{ ...list, color: "#8A5A1E" }}>
+            {deactivations.map((d) => (
+              <li key={d.id}>
+                <b>{d.name}</b> ({d.category}){d.annualProvision ? <> — currently carrying {money(d.annualProvision)} a year in the plan</> : null}
+                {d.inspectionCount ? <> · {d.inspectionCount} inspection{d.inspectionCount === 1 ? "" : "s"} kept</> : null}
+              </li>
+            ))}
+          </ul>
+          <div style={{ fontSize: 11.5, color: "#8A5A1E", marginTop: 6 }}>
+            They are marked inactive, not deleted — they leave the register and the ten-year plan, and their inspections and any tagged reserve entries are kept. If this list is not what you meant, the row is probably missing from the sheet by accident.
+          </div>
+        </div>
+      )}
+
+      {!blocked && locked && blockedRemovals.length > 0 && (
+        <div style={{ marginBottom: 10, background: "#EEF4F0", border: "1px solid #B9D4C6", borderRadius: 8, padding: "10px 12px" }}>
+          <div style={{ ...head, color: "#2F5D50" }}>{blockedRemovals.length} component{blockedRemovals.length === 1 ? "" : "s"} missing from the sheet will be KEPT</div>
+          <div style={{ fontSize: 12, color: "#2F5D50", lineHeight: 1.7 }}>
+            The maintenance plan is approved, so an upload can add components but cannot remove them:{" "}
+            <b>{blockedRemovals.map((d) => d.name).join(", ")}</b>. Everything else in the file applies as normal.
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 6 }}>
+        <button style={{ ...primaryBtn, opacity: blocked || nothing ? 0.5 : 1 }} onClick={onApply} disabled={blocked || nothing || busy}>
+          {busy ? "Applying…" : "Apply to the register"}
+        </button>
+        <button style={secondaryBtn} onClick={onCancel} disabled={busy}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
 function MaintenancePlan() {
   const [plan, setPlan] = useState(null);
   const [status, setStatus] = useState("loading"); // loading | ready | error
@@ -11372,6 +11843,20 @@ function MaintenancePlan() {
   const [edits, setEdits] = useState({});          // assetId -> patch
   const [inspectFor, setInspectFor] = useState(null);
   const [newComponent, setNewComponent] = useState({ name: "", category: "", code: "", location: "" });
+  // The financial years a maintenance plan has been approved for. undefined =
+  // not yet known, and removal is refused while it is unknown — the same
+  // fail-closed rule as the statement gate: not knowing whether the plan is
+  // approved is not evidence that it is not.
+  //
+  // ANY approved year locks the register, which is exactly what
+  // maintenance_plan_is_approved() asks in the database. The two have to agree,
+  // and matching the database's question is the only way to guarantee that —
+  // see the note in migrations/maintenance_plan_approval_and_removal_lock.sql
+  // for the version that looked more precise and drifted.
+  const [approvedYears, setApprovedYears] = useState(undefined);
+  const [importState, setImportState] = useState(null); // { filename, diff } once a file has been read
+  const [importBusy, setImportBusy] = useState(false);
+  const fileInputRef = useRef(null);
   const canManage = useCanManageMaintenance();
   const fy = FY_ACTIVE;
 
@@ -11381,8 +11866,22 @@ function MaintenancePlan() {
   const load = async () => {
     setStatus("loading");
     try {
-      const p = await fetchMaintenancePlan(fy);
-      setPlan(p); setStatus("ready");
+      const client = await ensureSupabaseClient();
+      const [p, approved] = await Promise.all([
+        fetchMaintenancePlan(fy),
+        client.from("approvals").select("scope").eq("subject", "maintenance_plan")
+          .then(({ data, error }) => {
+            if (error) throw error;
+            return (data || []).map((r) => r.scope).sort();
+          })
+          .catch((err) => {
+            console.error("Loading the maintenance plan approval failed:", err);
+            return undefined;             // undefined -> unknown -> locked
+          }),
+      ]);
+      setPlan(p);
+      setApprovedYears(approved);
+      setStatus("ready");
     } catch (err) {
       console.error("Loading the maintenance plan failed:", err);
       setStatus("error");
@@ -11390,38 +11889,184 @@ function MaintenancePlan() {
   };
   useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Warm the spreadsheet library while the page is being read, so the export
+  // click does not have to wait on a CDN. The AGM pack needs its two-step
+  // download because generating it takes seconds and Chrome stops treating the
+  // save as user-initiated; this export builds from data already in memory, so
+  // one click is enough — provided the library is already here.
+  useEffect(() => { ensureXlsxLoaded().catch(() => {}); }, []);
+
+  // Approved means: add, don't remove. Unknown counts as approved for the
+  // purpose of refusing a removal.
+  const lockKnown = approvedYears !== undefined;
+  const planLocked = !lockKnown || approvedYears.length > 0;
+  const lockedFor = lockKnown && approvedYears.length ? approvedYears.join(", ") : null;
+
   const patch = (id, field, value) => setEdits((e) => ({ ...e, [id]: { ...(e[id] || {}), [field]: value } }));
   const dirty = Object.keys(edits).length;
 
-  // Only the four fields a survey produces are editable here. Everything else
-  // about a component — its name, category, code — is register structure and is
-  // changed deliberately, not in passing while capturing a condition.
+  // Every stored field is editable here, not just the four a survey produces.
+  // That was a deliberate narrowing once — name, category and code read as
+  // register structure rather than survey findings — but the register is being
+  // completed from a spreadsheet that carries all of them, and a grid that
+  // could not make a correction the upload could make would send every small
+  // fix back through Excel.
+  //
+  // The text fields go through the same parsers as the import, so a cost typed
+  // as "R 12 000,00" means the same thing on both routes. An unreadable value
+  // REFUSES THE SAVE naming the field — writing null for something the trustee
+  // typed is the session-19 data loss, and it is not repeated here.
   const saveAssets = async () => {
     setSaving("assets"); setNotice(null);
+    const problems = [];
+    const staged = [];
+    for (const [id, p] of Object.entries(edits)) {
+      const existing = plan.rows.find((r) => r.id === id) || {};
+      const row = { updated_at: new Date().toISOString() };
+      const put = (field, value, label) => {
+        if (value === CELL_UNREADABLE) { problems.push(`${existing.name || "component"} — ${label}`); return; }
+        row[field] = value;
+      };
+      if ("name" in p) put("name", cellText(p.name), "Component");
+      if ("category" in p) put("category", cellText(p.category), "Category");
+      if ("code" in p) put("code", cellText(p.code), "Code");
+      if ("location" in p) put("location", cellText(p.location), "Location");
+      if ("quantity" in p) put("quantity", cellNumber(p.quantity), "Qty");
+      if ("installed_on" in p) put("installed_on", cellDate(p.installed_on), "Installed on");
+      if ("expected_life_years" in p) put("expected_life_years", cellNumber(p.expected_life_years), "Expected life");
+      if ("replacement_cost" in p) put("replacement_cost", cellNumber(p.replacement_cost), "Replacement cost");
+      if ("cost_basis" in p) row.cost_basis = p.cost_basis || null;
+      if ("status" in p) row.status = p.status || existing.status;
+      if ("notes" in p) row.notes = cellText(p.notes);
+      if (row.name === null) problems.push(`${existing.name || "component"} — Component cannot be blank`);
+      if (row.category === null) problems.push(`${existing.name || "component"} — Category cannot be blank`);
+      if (row.expected_life_years != null && (!Number.isInteger(row.expected_life_years) || row.expected_life_years < 1)) {
+        problems.push(`${existing.name || "component"} — Expected life must be a whole number of years, 1 or more`);
+      }
+      if (row.replacement_cost != null && row.replacement_cost < 0) {
+        problems.push(`${existing.name || "component"} — Replacement cost cannot be negative`);
+      }
+      // A component with both a cost and a life is assessed by definition.
+      const cost = "replacement_cost" in row ? row.replacement_cost : existing.cost;
+      const life = "expected_life_years" in row ? row.expected_life_years : existing.expectedLife;
+      if (cost != null && life != null && existing.status === "not_assessed" && !("status" in row)) row.status = "assessed";
+      staged.push([id, row]);
+    }
+    if (problems.length) {
+      setNotice(`Nothing was saved. Fix these first: ${problems.join("; ")}.`);
+      setSaving(null);
+      return;
+    }
     try {
       const client = await ensureSupabaseClient();
-      for (const [id, p] of Object.entries(edits)) {
-        const row = { updated_at: new Date().toISOString() };
-        if ("installed_on" in p) row.installed_on = p.installed_on || null;
-        if ("expected_life_years" in p) row.expected_life_years = p.expected_life_years === "" ? null : Number(p.expected_life_years);
-        if ("replacement_cost" in p) row.replacement_cost = p.replacement_cost === "" ? null : parseAmount(p.replacement_cost);
-        if ("cost_basis" in p) row.cost_basis = p.cost_basis || null;
-        if ("notes" in p) row.notes = p.notes || null;
-        // A component with both a cost and a life is assessed by definition.
-        const merged = { ...(plan.rows.find((r) => r.id === id) || {}) };
-        const cost = "replacement_cost" in row ? row.replacement_cost : merged.cost;
-        const life = "expected_life_years" in row ? row.expected_life_years : merged.expectedLife;
-        if (cost != null && life != null && merged.status === "not_assessed") row.status = "assessed";
+      for (const [id, row] of staged) {
         const { error } = await client.from("assets").update(row).eq("id", id);
         if (error) throw error;
       }
-      setEdits({}); setNotice(`Saved ${Object.keys(edits).length} component(s).`);
+      setEdits({}); setNotice(`Saved ${staged.length} component(s).`);
       await load();
     } catch (err) {
       console.error("Saving the register failed:", err);
-      setNotice("Saving failed — see browser console. Nothing was written.");
+      setNotice(err.message || "Saving failed — see browser console.");
     }
     setSaving(null);
+  };
+
+  // ---------- Spreadsheet round trip ----------
+  const exportRegister = async () => {
+    setSaving("export"); setNotice(null);
+    try {
+      const XLSX = await ensureXlsxLoaded();
+      const blob = buildRegisterWorkbook(XLSX, plan.rows, fy);
+      downloadBlob(blob, `El-Corazon-component-register-${fy.replace("/", "-")}.xlsx`);
+      setNotice("Register exported. Print the Register tab, or fill it in and upload it below.");
+    } catch (err) {
+      console.error("Exporting the register failed:", err);
+      setNotice("Exporting the register failed — see browser console.");
+    }
+    setSaving(null);
+  };
+
+  // Reads and diffs. WRITES NOTHING — applyImport does that, after the diff has
+  // been shown.
+  const readImportFile = async (file) => {
+    if (!file) return;
+    setImportBusy(true); setNotice(null); setImportState(null);
+    try {
+      const XLSX = await ensureXlsxLoaded();
+      const buf = await file.arrayBuffer();
+      const { rows, error } = readRegisterSheet(XLSX, buf);
+      if (error) { setNotice(error); setImportBusy(false); return; }
+      const diff = diffRegisterImport(rows, plan.rows, { locked: planLocked });
+      setImportState({ filename: file.name, rowCount: rows.length, diff });
+    } catch (err) {
+      console.error("Reading the uploaded register failed:", err);
+      setNotice("Could not read that file — see browser console. It needs to be an .xlsx workbook.");
+    }
+    setImportBusy(false);
+  };
+
+  const cancelImport = () => {
+    setImportState(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const applyImport = async () => {
+    if (!importState || importState.diff.errors.length) return;
+    const { adds, updates, deactivations } = importState.diff;
+    setImportBusy(true); setNotice(null);
+    const failures = [];
+    try {
+      const client = await ensureSupabaseClient();
+      let maxSort = Math.max(0, ...plan.rows.map((r) => Number(r.sortOrder || 0)));
+
+      for (const u of updates) {
+        const row = { updated_at: new Date().toISOString() };
+        Object.entries(u.changes).forEach(([field, { to }]) => { row[field] = to; });
+        const cost = "replacement_cost" in row ? row.replacement_cost : u.existing.cost;
+        const life = "expected_life_years" in row ? row.expected_life_years : u.existing.expectedLife;
+        if (cost != null && life != null && (row.status || u.existing.status) === "not_assessed") row.status = "assessed";
+        const { error } = await client.from("assets").update(row).eq("id", u.id);
+        if (error) failures.push(`Row ${u.excelRow} (${u.existing.name}): ${error.message}`);
+      }
+
+      for (const a of adds) {
+        maxSort += 1;
+        const v = a.values;
+        const assessed = v.replacement_cost != null && v.expected_life_years != null;
+        const { error } = await client.from("assets").insert({
+          name: v.name, category: v.category, code: v.code, location: v.location,
+          quantity: v.quantity, installed_on: v.installed_on,
+          expected_life_years: v.expected_life_years, replacement_cost: v.replacement_cost,
+          cost_basis: v.cost_basis, notes: v.notes,
+          status: v.status || (assessed ? "assessed" : "not_assessed"),
+          active: true, sort_order: maxSort,
+        });
+        if (error) failures.push(`Row ${a.excelRow} (${v.name}): ${error.message}`);
+      }
+
+      // Deactivation, not deletion. See the note above ensureXlsxLoaded.
+      for (const d of deactivations) {
+        const { error } = await client.from("assets")
+          .update({ active: false, updated_at: new Date().toISOString() })
+          .eq("id", d.id);
+        if (error) failures.push(`${d.name}: ${error.message}`);
+      }
+
+      const done = [];
+      if (updates.length) done.push(`${updates.length} updated`);
+      if (adds.length) done.push(`${adds.length} added`);
+      if (deactivations.length) done.push(`${deactivations.length} removed`);
+      setNotice(failures.length
+        ? `Applied with problems — ${done.join(", ") || "nothing written"}. Failed: ${failures.join("; ")}. Check the register before re-uploading.`
+        : `Register updated from ${importState.filename} — ${done.join(", ") || "nothing to change"}.`);
+      cancelImport();
+      await load();
+    } catch (err) {
+      console.error("Applying the uploaded register failed:", err);
+      setNotice(err.message || "Applying the upload failed — see browser console.");
+    }
+    setImportBusy(false);
   };
 
   const addInspection = async (assetId, form) => {
@@ -11485,6 +12130,16 @@ function MaintenancePlan() {
   };
 
   const removeComponent = async (r) => {
+    // The approval lock comes first, and it is absolute: an approved plan is a
+    // schedule the meeting adopted, so a component can join it but none can
+    // quietly leave. Mirrored in the database by a trigger — this only lets the
+    // button explain itself before it is pressed.
+    if (planLocked) {
+      setNotice(lockKnown
+        ? `The maintenance plan is approved (FY ${lockedFor}), so components can be added but not removed. The approving trustee can withdraw the approval on this page to remove one.`
+        : "Can't tell whether the maintenance plan is approved, so removal is refused. Reload the page.");
+      return;
+    }
     const blocking = captureBlocking(r);
     if (blocking.length) {
       setNotice(`"${r.name}" has ${blocking.join(", ")} captured against it, so it can't be removed. Clear those first, or leave it on the register.`);
@@ -11533,6 +12188,42 @@ function MaintenancePlan() {
         </Card>
       )}
 
+      <ApprovalCheckbox
+        subject="maintenance_plan"
+        onChanged={() => { cancelImport(); load(); }}
+        hint="Approving fixes the components the plan is built on: from then on a component can be added, but none can be removed — not from this grid and not by an upload. It does not hold statements; those are gated by the other four sign-offs."
+      />
+
+      {/* ---------- Spreadsheet round trip ---------- */}
+      {canManage && (
+        <Card style={{ marginBottom: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 6 }}>Complete the register on paper</div>
+          <div style={{ fontSize: 12.5, color: "#64748B", lineHeight: 1.7, marginBottom: 12 }}>
+            The register is finished by walking the property, which is not a job for a browser. Export it, print the <b>Register</b> tab or fill it in directly, then upload it back.
+            {" "}<b>The uploaded file is the source of truth</b> — a row you add becomes a component, a row you delete removes one{planLocked ? " (except while the plan is approved, when removals are refused)" : ""}, and the rest are updated to match. Nothing is written until you have seen exactly what will change.
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <button style={primaryBtn} onClick={exportRegister} disabled={saving === "export"}>
+              {saving === "export" ? "Building…" : "Export register to Excel"}
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              onChange={(e) => readImportFile(e.target.files && e.target.files[0])}
+              disabled={importBusy}
+              style={{ fontSize: 12.5 }}
+            />
+            {importBusy && <span style={{ fontSize: 12, color: "#64748B" }}>Reading…</span>}
+          </div>
+          <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 8 }}>
+            Column A of the exported sheet is hidden and holds each component's ID. It is what makes a renamed component update instead of duplicating — leave it alone, and leave it blank on any row you add.
+          </div>
+
+          {importState && <ImportPreview state={importState} onApply={applyImport} onCancel={cancelImport} busy={importBusy} locked={planLocked} money={money} />}
+        </Card>
+      )}
+
       <Card style={{ marginBottom: 16 }}>
         <div style={{ display: "flex", gap: 28, flexWrap: "wrap", fontSize: 13 }}>
           <div><div style={{ color: "#64748B", fontSize: 11.5 }}>ASSESSED</div><strong>{plan.assessedCount} of {plan.totalCount}</strong></div>
@@ -11551,10 +12242,11 @@ function MaintenancePlan() {
           </button>
         </div>
         <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 1040 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 1720 }}>
             <thead><tr>
-              <th style={th}>Component</th><th style={th}>Installed</th><th style={th}>Life (yrs)</th>
-              <th style={th}>Replacement cost</th><th style={th}>Cost basis</th>
+              <th style={th}>Component</th><th style={th}>Category</th><th style={th}>Code</th><th style={th}>Location</th>
+              <th style={th}>Qty</th><th style={th}>Installed</th><th style={th}>Life (yrs)</th>
+              <th style={th}>Replacement cost</th><th style={th}>Cost basis</th><th style={th}>Status</th><th style={th}>Notes</th>
               <th style={th}>Condition</th><th style={th}>Remaining</th><th style={th}>Provision / yr</th><th style={th} />
             </tr></thead>
             <tbody>
@@ -11562,23 +12254,39 @@ function MaintenancePlan() {
                 const prev = i === 0 || plan.rows[i - 1].category !== r.category;
                 return (
                   <React.Fragment key={r.id}>
+                    {/* Grouping reads the SAVED category, not the edited one, so
+                        a row being recategorised stays put until it is saved
+                        rather than jumping out from under the cursor. */}
                     {prev && (
-                      <tr><td colSpan={9} style={{ ...td, background: "#F6F1E7", fontWeight: 700, fontSize: 12 }}>{r.category}</td></tr>
+                      <tr><td colSpan={REGISTER_GRID_COLS} style={{ ...td, background: "#F6F1E7", fontWeight: 700, fontSize: 12 }}>{r.category}</td></tr>
                     )}
                     <tr style={r.assessed ? undefined : { background: "#FCFAF5" }}>
+                      <td style={td}><input style={{ ...inp, minWidth: 190, fontWeight: 600 }} value={val(r, "name", r.name)} onChange={(e) => patch(r.id, "name", e.target.value)} /></td>
                       <td style={td}>
-                        <div style={{ fontWeight: 600 }}>{r.name}</div>
-                        {r.notes && <div style={{ fontSize: 11, color: "#94A0AC", maxWidth: 260 }}>{r.notes}</div>}
+                        <input style={{ ...inp, minWidth: 120 }} list="asset-categories" value={val(r, "category", r.category)} onChange={(e) => patch(r.id, "category", e.target.value)} />
                       </td>
+                      <td style={td}><input style={{ ...inp, maxWidth: 80 }} value={val(r, "code", r.code)} onChange={(e) => patch(r.id, "code", e.target.value)} /></td>
+                      <td style={td}><input style={{ ...inp, minWidth: 110 }} value={val(r, "location", r.location)} onChange={(e) => patch(r.id, "location", e.target.value)} /></td>
+                      <td style={td}><input style={{ ...inp, maxWidth: 60 }} inputMode="decimal" value={val(r, "quantity", r.quantity)} onChange={(e) => patch(r.id, "quantity", e.target.value)} /></td>
                       <td style={td}><input type="date" style={inp} value={val(r, "installed_on", r.installedOn)} onChange={(e) => patch(r.id, "installed_on", e.target.value)} /></td>
                       <td style={td}><input style={{ ...inp, maxWidth: 70 }} inputMode="numeric" value={val(r, "expected_life_years", r.expectedLife)} onChange={(e) => patch(r.id, "expected_life_years", e.target.value)} /></td>
                       <td style={td}><input style={{ ...inp, maxWidth: 120 }} inputMode="decimal" value={val(r, "replacement_cost", r.cost)} onChange={(e) => patch(r.id, "replacement_cost", e.target.value)} /></td>
                       <td style={td}>
                         <select style={{ ...inp, maxWidth: 130 }} value={val(r, "cost_basis", r.costBasis)} onChange={(e) => patch(r.id, "cost_basis", e.target.value)}>
-                          <option value="">—</option><option value="quote">Quote</option><option value="valuation">Valuation</option>
-                          <option value="insurer schedule">Insurer schedule</option><option value="estimate">Estimate</option>
+                          <option value="">—</option>
+                          {ASSET_COST_BASES.map((b) => <option key={b} value={b}>{b.charAt(0).toUpperCase() + b.slice(1)}</option>)}
                         </select>
                       </td>
+                      <td style={td}>
+                        {/* Status is offered because the register carries it and
+                            the spreadsheet can set it. It is still derived on
+                            save: capturing a cost and a life promotes a
+                            not_assessed component by itself. */}
+                        <select style={{ ...inp, maxWidth: 125 }} value={val(r, "status", r.status)} onChange={(e) => patch(r.id, "status", e.target.value)}>
+                          {ASSET_STATUSES.map((s) => <option key={s} value={s}>{s.replace(/_/g, " ")}</option>)}
+                        </select>
+                      </td>
+                      <td style={td}><input style={{ ...inp, minWidth: 200 }} value={val(r, "notes", r.notes)} onChange={(e) => patch(r.id, "notes", e.target.value)} /></td>
                       <td style={td}>
                         {r.condition ? <span style={{ fontWeight: 600 }}>{r.condition}</span> : <span style={{ color: "#94A0AC" }}>—</span>}
                         {r.inspectedOn && <div style={{ fontSize: 10.5, color: "#94A0AC" }}>{r.inspectedOn}</div>}
@@ -11592,16 +12300,21 @@ function MaintenancePlan() {
                           </button>
                           {canManage && (() => {
                             const blocking = captureBlocking(r);
-                            const locked = blocking.length > 0;
+                            const locked = planLocked || blocking.length > 0;
+                            const why = planLocked
+                              ? (lockKnown
+                                  ? `The maintenance plan is approved (FY ${lockedFor}) — components can be added but not removed`
+                                  : "Can't tell whether the plan is approved, so removal is refused")
+                              : blocking.length
+                                ? `Can't be removed — has ${blocking.join(", ")} captured against it`
+                                : `Remove ${r.name}`;
                             return (
                               <button
                                 type="button"
                                 onClick={() => removeComponent(r)}
                                 disabled={saving === "remove"}
                                 aria-label={`Remove ${r.name}`}
-                                title={locked
-                                  ? `Can't be removed — has ${blocking.join(", ")} captured against it`
-                                  : `Remove ${r.name}`}
+                                title={why}
                                 style={{
                                   border: "1px solid #E3D9C6", background: "#FFF",
                                   color: locked ? "#C3BCAD" : "#B5651D",
@@ -11616,7 +12329,7 @@ function MaintenancePlan() {
                       </td>
                     </tr>
                     {inspectFor === r.id && (
-                      <tr><td colSpan={9} style={{ ...td, background: "#F6F1E7" }}>
+                      <tr><td colSpan={REGISTER_GRID_COLS} style={{ ...td, background: "#F6F1E7" }}>
                         <InspectionForm onSave={(f) => addInspection(r.id, f)} saving={saving === "inspection"} />
                       </td></tr>
                     )}
@@ -11626,9 +12339,18 @@ function MaintenancePlan() {
             </tbody>
           </table>
         </div>
+        {/* Shared by the inline category cells and the add form below, so both
+            offer the same set. */}
+        <datalist id="asset-categories">
+          {[...new Set(plan.rows.map((r) => r.category).filter(Boolean))].map((c) => <option key={c} value={c} />)}
+        </datalist>
         <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 10 }}>
-          A shaded row is not yet assessed and contributes nothing to the plan. Remaining life comes from the latest inspection where one gives a revised figure, otherwise from age against the expected life.
-          {canManage && <> A component showing 🔒 has an inspection, a tagged reserve entry, a replacement cost or an expected life captured against it and cannot be removed — it is carrying history or a provision.</>}
+          A shaded row is not yet assessed and contributes nothing to the plan. Remaining life comes from the latest inspection where one gives a revised figure, otherwise from age against the expected life. Condition is not edited here — it belongs to a dated inspection, so use <b>Inspect</b>.
+          {canManage && (planLocked
+            ? <> {lockKnown
+                ? <>The plan is approved (FY {lockedFor}), so every component shows 🔒</>
+                : <>The approval could not be read, so removal is refused and every component shows 🔒</>}: components can be added, but none can be removed until the approval is withdrawn.</>
+            : <> A component showing 🔒 has an inspection, a tagged reserve entry, a replacement cost or an expected life captured against it and cannot be removed — it is carrying history or a provision.</>)}
         </div>
 
         {canManage && (
@@ -11642,13 +12364,12 @@ function MaintenancePlan() {
               </div>
               <div style={{ flex: 1, minWidth: 140 }}>
                 <div style={{ fontSize: 11, color: "#64748B" }}>Category</div>
+                {/* Existing categories offered rather than enforced — the
+                    register groups by this text, so a typo makes a new group.
+                    The datalist itself lives under the grid, shared with the
+                    inline category cells. */}
                 <input style={inp} list="asset-categories" value={newComponent.category} placeholder="e.g. Security"
                        onChange={(e) => setNewComponent({ ...newComponent, category: e.target.value })} />
-                {/* Existing categories offered rather than enforced — the
-                    register groups by this text, so a typo makes a new group. */}
-                <datalist id="asset-categories">
-                  {[...new Set(plan.rows.map((r) => r.category).filter(Boolean))].map((c) => <option key={c} value={c} />)}
-                </datalist>
               </div>
               <div style={{ width: 110 }}>
                 <div style={{ fontSize: 11, color: "#64748B" }}>Code</div>

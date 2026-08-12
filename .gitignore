@@ -4,3 +4,8 @@ dist
 .env.local
 .DS_Store
 *.log
+
+# Fetched on demand by docs/test-register-roundtrip.mjs — the same build the app
+# loads from the CDN at runtime. Not committed: it is a 950 KB vendor file and
+# the test's header says how to get it.
+docs/xlsx.full.min.js

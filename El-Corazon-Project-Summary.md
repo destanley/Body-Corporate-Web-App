@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 11 August 2026, session 22 (supersedes the 11 August 2026 session 21 summary)
+Last updated: 12 August 2026, session 23 (supersedes the 11 August 2026 session 22 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,163 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 12 August 2026, session 23 — the register goes out on paper and comes back as truth
+
+Devon asked for the maintenance plan to be exportable to .xlsx so it can be printed and completed,
+uploaded back to populate the register grid, every field editable, additions and removals in the
+sheet carried through — **the uploaded file being the source of truth, because this is the first
+time the register is being filled in** — and, once the plan is approved, line items addable but
+never removable.
+
+The register has been 24 components with **zero costs and zero lives** since session 11, and
+sessions 20 and 21 both closed with the same sentence: costing the components is the only work that
+answers whether the fund is sufficient. That work happens walking the property, not in a browser.
+This session builds the road out and back.
+
+### `assets` gained nothing; the register grid gained everything
+
+Every stored field is now editable in the grid — name, category, code, location, quantity, status
+and notes alongside the four a survey produces. Session 11 narrowed it to four on the reasoning that
+"name, category, code is register structure and is changed deliberately". **That reasoning does not
+survive a spreadsheet that carries all of them**: a grid that could not make a correction the upload
+could make would send every small fix back through Excel.
+
+`fetchMaintenancePlan` now returns `location` and `quantity` — it was already reading `select("*")`
+and dropping them on the floor.
+
+**Condition is still not editable in the grid.** It belongs to a dated inspection, and that is the
+one thing session 11 got right about which fields live where.
+
+### `REGISTER_COLUMNS` is one list driving three things
+
+Export, import and the on-screen grid all read it. Two lists would drift, and *a column present in
+the export but missing from the import map is a column the trustee fills in and quietly loses.*
+`REGISTER_GRID_COLS` is counted from it rather than typed, so a new column cannot leave a `colSpan`
+short and break the category headings.
+
+The export writes two sheets: **Register**, and **How to complete** carrying the instructions and
+the values each column accepts. Column A holds the asset UUID and is **hidden** — so it neither
+prints nor invites editing, while still being what makes a renamed component update instead of
+duplicating. A blank ID is a new component. Install dates are written as real Date cells with a
+`yyyy-mm-dd` format, so the round trip never passes through a string.
+
+### Three rules make "the file is the source of truth" survivable
+
+1. **Removal is deactivation, never a delete.** `active = false` drops the component out of the
+   register and the plan — `fetchMaintenancePlan` already filters on `active` — while its
+   inspections and any tagged reserve entry survive. A mistaken upload is recoverable; a delete is
+   not, and `asset_inspections` cascades. It also means the session-15 capture guard never has to be
+   relaxed.
+2. **Nothing is written until the diff has been seen.** The upload parses into a preview naming
+   every add, every change field by field with old → new, and every removal — with the annual
+   provision each removal is currently carrying. An import that silently deletes is the failure this
+   design exists to prevent. An empty sheet removing all 24 components is *possible*, and the
+   preview says so in as many words.
+3. **Validation is total and up front.** supabase-js has no transaction, so a half-applied source of
+   truth leaves the register matching neither the sheet nor what it replaced. Every row is checked
+   before the first write and **one unreadable cell refuses the whole import**, naming the row and
+   the column.
+
+Refused, each with the row and column named: a blank name or category, an unreadable number, a
+status or cost basis outside the schema's CHECK lists, a fractional or zero expected life, a
+negative cost, a slash date, an ID matching nothing, and **a duplicated ID — which is what copying a
+row in Excel produces** — plus a duplicated code, caught here because catching it at the INSERT
+names neither row.
+
+### The number parser, and why it is not `parseAmount`
+
+`cellNumber` is the session-19 lesson applied properly: strips spaces, non-breaking spaces and a
+leading R; where several separators appear all but the last are thousands marks; **a lone final
+group of exactly three digits is thousands**, so `1,125` is 1125. It returns an unreadable sentinel,
+never null and never 0.
+
+> **`parseAmount` still has the session-19 bug and is now confirmed, not suspected.**
+> `.replace(",", ".")` replaces only the **first** comma, so `parseAmount("1,125.75")` returns
+> **1.125** — and it returns **0** rather than NaN on anything it cannot read, silently. Session 19
+> flagged that "the same shape exists in other components"; this is that shape, in the helper used
+> for amounts residents type. The register grid deliberately does **not** use it. **Auditing its
+> other call sites is outstanding work.**
+
+### Approval: a fifth subject that does not gate statements
+
+`maintenance_plan` joins `APPROVAL_SUBJECTS` with FY scope, reusing `ApprovalCheckbox`, the
+approvals table and the approver role rather than growing a parallel mechanism. But
+`APPROVAL_SUBJECTS` was read directly by the statement gate, so a fifth subject would have started
+holding every owner's levy statement on a property survey. New **`gatesStatements` flag** and a
+derived **`STATEMENT_GATE_SUBJECTS`**, which everything reasoning about release now reads — so a
+sixth subject cannot silently start blocking statements either. "All four sign-offs" in the release
+banner is now counted, not typed.
+
+`ApprovalCheckbox` gained an optional **`onChanged`** callback, because a lock that only appears on
+the next page load is a lock the trustee works around without noticing.
+
+### The lock is in the database, and the first version of it was wrong
+
+`assets_block_removal_when_plan_approved` fires **before delete AND before update where active goes
+true → false**. A guard watching only DELETE would have been decorative: deactivation is the route
+the import actually uses.
+
+> **The rule is "any year approved", and that is a correction, not a shortcut.** The first version
+> derived today's financial year in SQL and locked only on an approval for that year. It looked more
+> precise and was worse: the app's `FY_ACTIVE` follows the **selected statement month**, and
+> `CURRENT_PERIOD` is bumped by hand — so on 12 August 2026 the app was still on 2025/2026 while SQL
+> said 2026/2027, and the grid would have refused a removal the database allowed straight through
+> the API. Both sides now ask a question neither can get wrong: does any `maintenance_plan` approval
+> row exist? Withdrawing deletes the row, which is how every approval in this schema already works,
+> so the unlock path is the same tick-box that locked it.
+
+The app reads the same rule — a direct query for the approved years, not `fetchApprovals(period)`
+which resolves to one scope. **It fails closed**: an approvals table that cannot be read locks the
+register, the same reasoning as the statement gate.
+
+Editing a component's figures is still allowed while approved. The lock is on **the set of
+components**, because that is what an upload can silently change.
+
+### Verified
+
+`no-undef` clean apart from the pre-existing `URLSearchParams` at line 950; bundle clean.
+
+**55 assertions, all passing** — `docs/test-register-roundtrip.mjs`, which **slices the real
+functions out of `App.jsx` and evaluates them**, the session-17 technique, rather than testing a
+copy that can drift. Parser shapes, the full export → re-import round trip producing zero changes,
+add/edit/remove diffing, the approved case keeping what it would otherwise remove, and all eleven
+refusals.
+
+**The test found two real defects before they shipped:**
+
+- **`v instanceof Date` was realm-fragile.** A Date that has crossed a realm boundary fails
+  `instanceof` while being a perfectly good date. Now `Object.prototype.toString.call(v)`. The same
+  flaw is *inside SheetJS*, which is why the harness has to evaluate the library in the same context
+  as the slice — a Date built in the wrong realm is written as a bare object and **the install-date
+  column comes out empty**.
+- **Three literal U+00A0 characters** landed in the new regexes. Session 19 warned about exactly
+  this; they are now `\u00A0` escapes, and the file holds **zero** literal non-breaking spaces.
+
+Two assertions were themselves wrong and were fixed rather than accommodated: `!cols` is not
+restored by the reader, so the hidden-column check now reads the bytes written; and a JSON clone of
+the parsed rows turned Date cells into UTC strings, which in SAST reads back a day early.
+
+Trigger behaviour tested against the **live database** with a throwaway component, all six correct —
+deactivate allowed unapproved, refused approved, delete refused approved, editing a field still
+allowed, adding still allowed, and removal available again once withdrawn. The block ends in a
+`raise`, so it rolled back: 24 active components, 0 inactive, 0 maintenance_plan approvals, nothing
+left behind.
+
+> **`npm run build` still has to be run locally.**
+
+### Not done
+
+- **`parseAmount`'s remaining call sites are unaudited.** Confirmed buggy, not just suspected.
+- Removal is per-component; there is no way to bring a deactivated component back from the UI. It is
+  one `update assets set active = true` away, but nothing offers it.
+- The import writes sequentially with no transaction. Validation is total, so a failure now means a
+  constraint the checks do not mirror — it is reported per row and named, but the register can be
+  left partly updated.
+- Nothing writes `maintenance_plan_snapshots`. The approval records that the meeting carried the
+  plan; it does not freeze what was carried.
 
 ---
 
@@ -391,7 +548,7 @@ eslint --config <cfg> --rule '{"no-unused-vars":"off"}' src/App.jsx
 Proven both ways this session: clean on the fixed file, and `5567:74 error 'water' is not defined`
 on a copy with the bug reintroduced. It also caught a **literal non-breaking space** pasted into
 the new `num()` regex — invisible in source and liable to be mangled by an editor — now written
-` `. (`react-hooks/exhaustive-deps` errors in the output are inline disable comments for a
+`\u00A0`. (`react-hooks/exhaustive-deps` errors in the output are inline disable comments for a
 plugin that isn't installed, and `no-unused-vars` is noise without the React plugin: JSX components
 read as unused. `no-undef` is the signal.)
 
@@ -1736,7 +1893,7 @@ A **Generate AGM report** button beside Print / PDF produces an editable `.docx`
 - **Recovered from git history, not written from scratch.** A docx generator existed at commit `f790331` (16 July) and was removed before `67e2b87` (29 July). `git log --all -S"<string>"` found it. **Check history before rebuilding anything on this project.**
 - Ten sections per the trustee's spec: (1) I&E year-on-year, (2) I&E month-to-month, (3) miscellaneous expenses, (4) insurance schedule, (5) Blockwatch, (6) garden service, (7) water tariffs, (8) electricity tariffs, (9) service notes, (10) levy split.
 - **Six page sections alternating portrait/landscape** so no rand value ever wraps: sections 2, 4 and 10 are landscape; the rest portrait. Section 2 and 10 additionally render at 8pt with tight cell margins. Section 2 drops the `R` prefix on month columns (14 columns don't otherwise fit) and says so.
-- **Every rand value uses non-breaking spaces** — en-ZA formats as `R 1 234,56`, and `nb()` converts each space to ` `.
+- **Every rand value uses non-breaking spaces** — en-ZA formats as `R 1 234,56`, and `nb()` converts each space to `\u00A0`.
 - Sections 1, 2, 3 and 6 read the **dashboard's own `report` object**, passed straight in — no recomputation, so the document cannot disagree with the screen. Sections 3, 5, 7, 8 and 10 read the DB directly via `fetchAgmExtras`.
 - `loadFyReport(fy, categories)` was extracted from the Analytics effect to module scope so the comparative prior year can be loaded without duplicating the fetch. Dashboard behaviour is unchanged.
 - **Section 3 itemises all three expense sources** — `ops_expenses`, bank debits, *and approved resident deductions*. The first version omitted deductions and showed one row of R6,999.00 against a Miscellaneous line of R8,052.43. Each claim line carries its own `comment`; the claim-level `deduction_comment` is a concatenation of them all and must not be used per item.
