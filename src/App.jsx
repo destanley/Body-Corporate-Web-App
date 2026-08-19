@@ -3253,6 +3253,7 @@ export default function App() {
               />
             )}
             {tab === "maintenance" && <MaintenancePlan />}
+            {tab === "residents" && <ResidentRegister />}
             {tab === "budget" && <Budget />}
             {tab === "rate-history" && <RateHistory />}
             {tab === "levy-setup" && (
@@ -3407,6 +3408,11 @@ const NAV_PAGES = [
   { key: "reconciliation", label: "Tenant recon", roles: ["finance"] },
   { key: "bank-recon", label: "Bank recon", roles: ["finance"] },
   { key: "maintenance", label: "Maintenance plan", roles: ["finance", "maintenance"] },
+  // Every role sees it: the maintenance trustee has to be able to phone someone
+  // about a geyser, and the approver should know who they are approving figures
+  // for. Only finance can WRITE, which RLS enforces. noPeriod because a contact
+  // list under "August 2026" invites the reader to think it is scoped to August.
+  { key: "residents", label: "Resident register", roles: ["finance", "approver", "maintenance"], noPeriod: true },
   { key: "budget", label: "Budget", roles: ["finance"] },
   { key: "statement-preview", label: "Statement preview", roles: ["finance", "approver"] },
   { key: "analytics", label: "Financial dashboard", roles: ["finance", "approver", "maintenance"] },
@@ -10752,6 +10758,68 @@ function ResidentTokenApp({ unit, remittanceDeductions, setRemittanceDeductions,
           setRemittanceAdvices={setRemittanceAdvices}
         />
       )}
+      {stmt !== undefined && <ResidentContactCard />}
+    </div>
+  );
+}
+
+// What the register holds about THIS unit, read-only. Deliberately not editable:
+// submit_remittance stays the only thing the anon role can write, and the email
+// levy notices go to is exactly what somebody holding a leaked link would want
+// to change. Showing it is still worth doing — it is how a wrong number gets
+// noticed, and the resident is the only person who can tell.
+//
+// A failure here costs the card, not the statement: the statement is the reason
+// the page exists and must not depend on a contact list loading.
+function ResidentContactCard() {
+  const [rows, setRows] = useState(undefined); // undefined = loading, null = unavailable
+
+  useEffect(() => {
+    let cancelled = false;
+    ensureSupabaseClient()
+      .then((client) => client.rpc("get_unit_contacts", { p_token: RESIDENT_TOKEN }))
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) throw error;
+        setRows(data || []);
+      })
+      .catch((err) => {
+        console.error("Could not load your contact details:", err);
+        if (!cancelled) setRows(null);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  if (rows === undefined || rows === null || rows.length === 0) return null;
+  const owners = rows.filter((r) => r.kind === "owner");
+  const tenant = rows.find((r) => r.kind === "tenant") || null;
+  const line = (p) => [p.cell, p.email, p.alternate_contact].filter(Boolean).join(" · ") || "no contact details recorded";
+
+  return (
+    <div style={{ maxWidth: 680, margin: "0 auto", padding: "0 20px 40px" }}>
+      <Card>
+        <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 8 }}>What we have on file for your unit</div>
+        {owners.map((o, i) => (
+          <div key={`o${i}`} style={{ fontSize: 12.5, lineHeight: 1.7, marginBottom: 6 }}>
+            <b>{o.first_name ? `${o.first_name} ${o.surname}` : o.surname}</b>
+            {o.is_primary && <span style={{ color: "#2F5D50" }}> — main contact</span>}
+            <div style={{ color: "#64748B" }}>{line(o)}</div>
+          </div>
+        ))}
+        {tenant && (
+          <div style={{ fontSize: 12.5, lineHeight: 1.7, marginTop: 10, paddingTop: 8, borderTop: "1px solid #F0EADC" }}>
+            <span style={{ color: "#94A0AC", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.3 }}>Tenant</span>
+            <div><b>{tenant.first_name ? `${tenant.first_name} ${tenant.surname}` : tenant.surname}</b>
+              {tenant.started_on && <span style={{ color: "#94A0AC" }}> · since {String(tenant.started_on).slice(0, 10)}</span>}
+            </div>
+            <div style={{ color: "#64748B" }}>{line(tenant)}</div>
+          </div>
+        )}
+        <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 10, lineHeight: 1.7 }}>
+          Anything wrong or out of date? Let the trustee know and it will be corrected — these details can't be changed from this
+          page, so a lost link can never be used to redirect your levy notices.
+        </div>
+      </Card>
     </div>
   );
 }
@@ -11384,6 +11452,63 @@ function BankRecon({ periods, period, setPeriod, onImported }) {
 // list, its condition history, and the reserve fund ledger. Section 12 of the
 // AGM report is computed from exactly this data, so anything captured here
 // appears in the report and nothing has to be typed twice.
+// ---------- Resident register ----------
+// Who is in each unit and how to reach them. It sits ALONGSIDE units.owner_name
+// rather than replacing it: owner_name is the BILLING name printed on the
+// statement, the remittance advice and the AGM pack, and for Unit 2 it is a
+// trust that has no first name and no surname. Nothing here bills anything.
+//
+// A unit's owner_name and its registered owners are expected to look similar
+// and are allowed to differ — a trust with two natural-person trustees is the
+// ordinary case, not a data error — so the screen SHOWS both side by side and
+// never reconciles them silently.
+async function fetchResidentRegister() {
+  const client = await ensureSupabaseClient();
+  const [units, owners, tenancies] = await Promise.all([
+    client.from("units").select("id, unit_number, owner_name, email, cor_reference").order("unit_number"),
+    client.from("unit_owners").select("*").order("sort_order"),
+    client.from("unit_tenancies").select("*").order("started_on", { ascending: false }),
+  ]);
+  const failed = [units, owners, tenancies].find((r) => r.error);
+  if (failed) throw failed.error;
+
+  const ownersByUnit = {}, tenanciesByUnit = {};
+  (owners.data || []).forEach((o) => { (ownersByUnit[o.unit_id] = ownersByUnit[o.unit_id] || []).push(o); });
+  (tenancies.data || []).forEach((t) => { (tenanciesByUnit[t.unit_id] = tenanciesByUnit[t.unit_id] || []).push(t); });
+
+  return (units.data || []).map((u) => {
+    const list = ownersByUnit[u.id] || [];
+    const leases = tenanciesByUnit[u.id] || [];
+    // The current tenancy is the open one. There can only be one — a partial
+    // unique index enforces it, because "is this unit let, and to whom" is the
+    // whole question the table exists to answer.
+    const current = leases.find((t) => t.ended_on == null) || null;
+    return {
+      id: u.id, unitNumber: u.unit_number, billingName: u.owner_name,
+      billingEmail: u.email, corReference: u.cor_reference,
+      owners: list.filter((o) => o.active),
+      formerOwners: list.filter((o) => !o.active),
+      currentTenancy: current,
+      pastTenancies: leases.filter((t) => t.ended_on != null),
+      isLet: Boolean(current),
+      needsReview: list.some((o) => o.active && o.needs_review),
+    };
+  });
+}
+
+const displayPersonName = (p) => (p.first_name ? `${p.first_name} ${p.surname}` : p.surname);
+
+// A South African cell number, tidied for display only — the stored value is
+// whatever was typed. Normalising on save would silently rewrite a number
+// somebody checked against a lease, and an international number typed by an
+// owner living abroad is a real case here.
+const formatCell = (v) => {
+  const digits = String(v || "").replace(/[^\d+]/g, "");
+  if (/^0\d{9}$/.test(digits)) return `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}`;
+  if (/^\+27\d{9}$/.test(digits)) return `+27 ${digits.slice(3, 5)} ${digits.slice(5, 8)} ${digits.slice(8)}`;
+  return String(v || "");
+};
+
 // ---------- Maintenance register: the spreadsheet round trip ----------
 // The register is completed by walking the property, which happens on paper and
 // in a spreadsheet, not in a browser. So the register exports to .xlsx, gets
@@ -11731,6 +11856,486 @@ function diffRegisterImport(sheetRows, planRows, { locked }) {
     deactivations: locked ? [] : missing,
     blockedRemovals: locked ? missing : [],
   };
+}
+
+// ---------- Resident register screen ----------
+// One card per unit. Owners are a list because a unit routinely has two, and
+// tenancies are dated because "who was in Unit 4 last March" is the question
+// that actually gets asked — when a reading spikes, when a levy goes unpaid.
+function ResidentRegister() {
+  const [rows, setRows] = useState(null);
+  const [status, setStatus] = useState("loading");   // loading | ready | error
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(null);
+  const [ownerEdits, setOwnerEdits] = useState({});  // ownerId -> patch
+  const [addingTo, setAddingTo] = useState(null);    // unitId of the open add-owner form
+  const [newOwner, setNewOwner] = useState({ first_name: "", surname: "", cell: "", email: "", is_entity: false });
+  const [letFor, setLetFor] = useState(null);        // unitId of the open start-a-let form
+  const [newTenancy, setNewTenancy] = useState({ first_name: "", surname: "", cell: "", email: "", started_on: TODAY_ISO, occupants: "", lease_reference: "" });
+  const [showHistory, setShowHistory] = useState({});
+  const canWrite = useCanWriteFinance();
+
+  const load = async () => {
+    setStatus("loading");
+    try { setRows(await fetchResidentRegister()); setStatus("ready"); }
+    catch (err) { console.error("Loading the resident register failed:", err); setStatus("error"); }
+  };
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Every write goes through here so the failure path is written once. The
+  // database refuses a write from a role without can_write_finance(), which is
+  // the actual control — say so plainly rather than "save failed".
+  const run = async (key, fn, okMessage) => {
+    setBusy(key); setNotice(null);
+    try {
+      await fn(await ensureSupabaseClient());
+      setNotice(okMessage);
+      await load();
+    } catch (err) {
+      console.error(`${key} failed:`, err);
+      setNotice(canWrite ? (err.message || "That didn't save — see browser console.")
+        : "Only the finance trustee can change the resident register.");
+    }
+    setBusy(null);
+  };
+
+  const patchOwner = (id, field, value) =>
+    setOwnerEdits((e) => ({ ...e, [id]: { ...(e[id] || {}), [field]: value } }));
+  const dirtyOwners = Object.keys(ownerEdits).length;
+
+  const saveOwners = () => run("save-owners", async (client) => {
+    for (const [id, p] of Object.entries(ownerEdits)) {
+      const row = { updated_at: new Date().toISOString() };
+      ["first_name", "surname", "cell", "email", "alternate_contact", "postal_address", "id_number", "notes"]
+        .forEach((f) => { if (f in p) row[f] = cellText(p[f]); });
+      if ("is_entity" in p) {
+        row.is_entity = p.is_entity;
+        // The CHECK refuses a first name on an entity. Clearing it here means
+        // ticking the box on a row that has one doesn't fail at the database
+        // with a message about a constraint nobody has heard of.
+        if (p.is_entity) row.first_name = null;
+      }
+      if (row.surname === null) throw new Error("A surname (or the registered name, for a trust or company) is required.");
+      // Anything the trustee has edited has been looked at, which is what the
+      // review flag was asking for.
+      row.needs_review = false;
+      const { error } = await client.from("unit_owners").update(row).eq("id", id);
+      if (error) throw error;
+    }
+    setOwnerEdits({});
+  }, `Saved ${dirtyOwners} owner record(s).`);
+
+  const addOwner = (unitId) => {
+    const surname = (newOwner.surname || "").trim();
+    if (!surname) { setNotice("An owner needs at least a surname, or the registered name for a trust or company."); return; }
+    return run("add-owner", async (client) => {
+      const unit = rows.find((r) => r.id === unitId);
+      const { error } = await client.from("unit_owners").insert({
+        unit_id: unitId,
+        first_name: newOwner.is_entity ? null : (cellText(newOwner.first_name)),
+        surname, is_entity: newOwner.is_entity,
+        cell: cellText(newOwner.cell), email: cellText(newOwner.email),
+        // Primary only if this unit has nobody holding it — a partial unique
+        // index allows one per unit, so claiming it here would fail on the
+        // second owner rather than just not being primary.
+        is_primary: !(unit.owners || []).some((o) => o.is_primary),
+        sort_order: Math.max(0, ...(unit.owners || []).map((o) => Number(o.sort_order || 0))) + 1,
+      });
+      if (error) throw error;
+      setNewOwner({ first_name: "", surname: "", cell: "", email: "", is_entity: false });
+      setAddingTo(null);
+    }, `Added ${surname}.`);
+  };
+
+  const makePrimary = (unitId, ownerId) => run("primary", async (client) => {
+    // Clear then set: the partial unique index allows exactly one primary per
+    // unit, so these cannot be done in either order in one statement.
+    const { error: e1 } = await client.from("unit_owners").update({ is_primary: false }).eq("unit_id", unitId).eq("is_primary", true);
+    if (e1) throw e1;
+    const { error: e2 } = await client.from("unit_owners").update({ is_primary: true, updated_at: new Date().toISOString() }).eq("id", ownerId);
+    if (e2) throw e2;
+  }, "Primary contact updated.");
+
+  // Sold, died, or came off the title. The record is KEPT — a levy dispute over
+  // a period they owned the unit needs to know who to ask — so this deactivates
+  // rather than deletes.
+  const retireOwner = (o) => {
+    if (!window.confirm(`Remove ${displayPersonName(o)} from the current owners of this unit?\n\nThe record is kept as a former owner, not deleted.`)) return;
+    return run("retire-owner", async (client) => {
+      const { error } = await client.from("unit_owners")
+        .update({ active: false, is_primary: false, updated_at: new Date().toISOString() })
+        .eq("id", o.id);
+      if (error) throw error;
+    }, `${displayPersonName(o)} moved to former owners.`);
+  };
+
+  const restoreOwner = (o) => run("restore-owner", async (client) => {
+    const { error } = await client.from("unit_owners")
+      .update({ active: true, updated_at: new Date().toISOString() }).eq("id", o.id);
+    if (error) throw error;
+  }, `${displayPersonName(o)} restored to current owners.`);
+
+  const startLet = (unitId) => {
+    const surname = (newTenancy.surname || "").trim();
+    if (!surname) { setNotice("A tenant needs at least a surname."); return; }
+    if (!newTenancy.started_on) { setNotice("A tenancy needs a start date — it is what makes the register answer who was here when."); return; }
+    return run("start-let", async (client) => {
+      const { error } = await client.from("unit_tenancies").insert({
+        unit_id: unitId,
+        first_name: cellText(newTenancy.first_name), surname,
+        cell: cellText(newTenancy.cell), email: cellText(newTenancy.email),
+        started_on: newTenancy.started_on,
+        occupants: newTenancy.occupants === "" ? null : Number(newTenancy.occupants),
+        lease_reference: cellText(newTenancy.lease_reference),
+      });
+      if (error) throw error;
+      setNewTenancy({ first_name: "", surname: "", cell: "", email: "", started_on: TODAY_ISO, occupants: "", lease_reference: "" });
+      setLetFor(null);
+    }, `${surname} recorded as the tenant.`);
+  };
+
+  const endLet = (t) => {
+    const on = window.prompt(`What date did ${displayPersonName(t)} move out?\n\nYYYY-MM-DD. The tenancy stays on the register as history.`, TODAY_ISO);
+    if (!on) return;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(on)) { setNotice("That date wasn't in the form 2026-08-31, so nothing was changed."); return; }
+    if (on < String(t.started_on).slice(0, 10)) { setNotice("A tenancy can't end before it started."); return; }
+    return run("end-let", async (client) => {
+      const { error } = await client.from("unit_tenancies")
+        .update({ ended_on: on, updated_at: new Date().toISOString() }).eq("id", t.id);
+      if (error) throw error;
+    }, `Tenancy ended ${on}. The unit shows as owner-occupied until a new tenant is recorded.`);
+  };
+
+  const th = { padding: "6px 8px", textAlign: "left", fontSize: 11, textTransform: "uppercase", color: "#64748B" };
+  const td = { padding: "5px 8px", borderTop: "1px solid #F0EADC", fontSize: 12.5 };
+  const inp = { ...inputStyle, padding: "4px 6px", fontSize: 12.5, width: "100%", boxSizing: "border-box" };
+  const pill = (bg, fg) => ({ background: bg, color: fg, fontSize: 10.5, fontWeight: 700, padding: "2px 7px", borderRadius: 999, textTransform: "uppercase", letterSpacing: 0.3 });
+
+  if (status === "loading") return <Card><div style={{ fontSize: 13, color: "#64748B" }}>Loading the resident register…</div></Card>;
+  if (status === "error") return <Card><div style={{ fontSize: 13, color: "#B5651D" }}>Could not load the resident register — see browser console.</div></Card>;
+
+  const val = (o, field) => {
+    const e = ownerEdits[o.id] || {};
+    return field in e ? e[field] : (o[field] == null ? "" : o[field]);
+  };
+  const toReview = rows.filter((r) => r.needsReview);
+  const letCount = rows.filter((r) => r.isLet).length;
+  const noContact = rows.filter((r) => !r.owners.some((o) => o.cell || o.email));
+
+  return (
+    <>
+      <h1 className="f-display" style={{ fontSize: 24, marginBottom: 4 }}>Resident register</h1>
+      <p style={{ color: "#64748B", fontSize: 13.5, marginBottom: 18 }}>
+        Who owns each unit, who lives in it, and how to reach them. This is a <b>contact</b> register — it changes nothing that bills.
+        The name on a levy statement is still the unit's registered <b>billing name</b>, shown on each card, and for a trust that is
+        deliberately not a person's name.
+      </p>
+
+      {notice && (
+        <Card style={{ marginBottom: 14, borderColor: "#B9D4C6" }}>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: "#2F5D50" }}>{notice}</div>
+        </Card>
+      )}
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 28, flexWrap: "wrap", fontSize: 13 }}>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>UNITS</div><strong>{rows.length}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>REGISTERED OWNERS</div><strong>{rows.reduce((s, r) => s + r.owners.length, 0)}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>LET</div><strong>{letCount} of {rows.length}</strong></div>
+          <div><div style={{ color: "#64748B", fontSize: 11.5 }}>NO CELL OR EMAIL</div><strong style={{ color: noContact.length ? "#B5651D" : undefined }}>{noContact.length}</strong></div>
+        </div>
+      </Card>
+
+      {toReview.length > 0 && (
+        <Card style={{ marginBottom: 16, background: "#FBF3E9", border: "1px solid #E3C9A8" }}>
+          <div style={{ fontSize: 12.5, color: "#8A5A1E", lineHeight: 1.7 }}>
+            <b>{toReview.length} unit{toReview.length === 1 ? "" : "s"} still hold a seeded owner record.</b>{" "}
+            Each unit started with one owner carrying whatever <code>units.owner_name</code> held — "DM &amp; AJ Stanley" is two
+            people and "Manie Jooste Family Trust" is a juristic person, and <b>nothing was split by guessing</b>, because a parsed
+            name is indistinguishable from a real one six months later. Split them into a first name and a surname below, add the
+            second owner where there is one, and tick <b>Registered entity</b> for the trust. Saving a row clears its flag.
+            {" "}Units {toReview.map((r) => r.unitNumber).join(", ")}.
+          </div>
+        </Card>
+      )}
+
+      {dirtyOwners > 0 && (
+        <Card style={{ marginBottom: 16, position: "sticky", top: 8, zIndex: 5, background: "#EEF4F0", border: "1px solid #B9D4C6" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <div style={{ fontSize: 12.5, color: "#2F5D50" }}>{dirtyOwners} owner record(s) edited and not yet saved.</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={secondaryBtn} onClick={() => setOwnerEdits({})} disabled={busy === "save-owners"}>Discard</button>
+              <button style={primaryBtn} onClick={saveOwners} disabled={busy === "save-owners"}>
+                {busy === "save-owners" ? "Saving…" : `Save ${dirtyOwners} change(s)`}
+              </button>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {rows.map((u) => {
+        const t = u.currentTenancy;
+        // The billing name and the registered owners are ALLOWED to differ.
+        // Flagged for the eye, never reconciled — a trust with two natural
+        // trustees is the ordinary case, not an error.
+        const namesDiffer = u.owners.length > 0 && !u.owners.some(
+          (o) => displayPersonName(o).replace(/\s+/g, " ").toLowerCase() === String(u.billingName || "").replace(/\s+/g, " ").toLowerCase());
+        return (
+          <Card key={u.id} style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
+              <div>
+                <span className="f-display" style={{ fontSize: 17, fontWeight: 700 }}>Unit {u.unitNumber}</span>
+                {u.corReference && <span style={{ color: "#94A0AC", fontSize: 12.5 }}> · {u.corReference}</span>}
+                <span style={{ marginLeft: 10, ...(u.isLet ? pill("#EAF0FA", "#33507C") : pill("#F1EEE4", "#7A7263")) }}>
+                  {u.isLet ? "Let" : "Owner-occupied"}
+                </span>
+              </div>
+              <div style={{ fontSize: 11.5, color: "#94A0AC", textAlign: "right" }}>
+                Billed as <b style={{ color: "#4A5A67" }}>{u.billingName}</b>
+                {u.billingEmail && <> · {u.billingEmail}</>}
+                <div>Statements use this name, not the register.</div>
+              </div>
+            </div>
+
+            {namesDiffer && (
+              <div style={{ fontSize: 11.5, color: "#8A5A1E", background: "#FBF3E9", border: "1px solid #E3C9A8", borderRadius: 8, padding: "6px 10px", marginBottom: 10 }}>
+                No registered owner's name matches the billing name. That is expected for a trust or a company, and worth a look otherwise — the billing name is what the owner sees on their statement.
+              </div>
+            )}
+
+            <div style={{ fontWeight: 700, fontSize: 12.5, marginBottom: 6 }}>
+              Owners{u.owners.length > 1 && <span style={{ color: "#94A0AC", fontWeight: 400 }}> — {u.owners.length} on this unit</span>}
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 900 }}>
+                <thead><tr>
+                  <th style={th}>First name</th><th style={th}>Surname / registered name</th>
+                  <th style={th}>Cell</th><th style={th}>Email</th><th style={th}>Other contact</th>
+                  <th style={th}>Entity</th><th style={th} />
+                </tr></thead>
+                <tbody>
+                  {u.owners.length === 0 && (
+                    <tr><td colSpan={7} style={{ ...td, color: "#94A0AC" }}>No owner recorded for this unit.</td></tr>
+                  )}
+                  {u.owners.map((o) => {
+                    const entity = "is_entity" in (ownerEdits[o.id] || {}) ? ownerEdits[o.id].is_entity : o.is_entity;
+                    return (
+                      <tr key={o.id} style={o.needs_review ? { background: "#FCFAF5" } : undefined}>
+                        <td style={td}>
+                          <input style={inp} value={entity ? "" : val(o, "first_name")} disabled={!canWrite || entity}
+                                 placeholder={entity ? "—" : ""}
+                                 onChange={(e) => patchOwner(o.id, "first_name", e.target.value)} />
+                        </td>
+                        <td style={td}>
+                          <input style={{ ...inp, fontWeight: 600 }} value={val(o, "surname")} disabled={!canWrite}
+                                 onChange={(e) => patchOwner(o.id, "surname", e.target.value)} />
+                          {o.is_primary && <div style={{ ...pill("#EEF4F0", "#2F5D50"), display: "inline-block", marginTop: 3 }}>Primary contact</div>}
+                        </td>
+                        <td style={td}>
+                          <input style={inp} value={val(o, "cell")} disabled={!canWrite} placeholder="082 123 4567"
+                                 onChange={(e) => patchOwner(o.id, "cell", e.target.value)} />
+                          {o.cell && !(ownerEdits[o.id] || {}).cell && <div style={{ fontSize: 10.5, color: "#94A0AC" }}>{formatCell(o.cell)}</div>}
+                        </td>
+                        <td style={td}>
+                          <input style={inp} type="email" value={val(o, "email")} disabled={!canWrite}
+                                 onChange={(e) => patchOwner(o.id, "email", e.target.value)} />
+                        </td>
+                        <td style={td}>
+                          <input style={inp} value={val(o, "alternate_contact")} disabled={!canWrite} placeholder="work / landline"
+                                 onChange={(e) => patchOwner(o.id, "alternate_contact", e.target.value)} />
+                        </td>
+                        <td style={{ ...td, textAlign: "center" }}>
+                          <input type="checkbox" checked={Boolean(entity)} disabled={!canWrite}
+                                 title="A trust, company or close corporation — it has a registered name, not a first name and surname"
+                                 onChange={(e) => patchOwner(o.id, "is_entity", e.target.checked)} />
+                        </td>
+                        <td style={td}>
+                          {canWrite && (
+                            <div style={{ display: "flex", gap: 6 }}>
+                              {!o.is_primary && (
+                                <button style={{ ...secondaryBtn, padding: "3px 8px", fontSize: 11.5 }}
+                                        onClick={() => makePrimary(u.id, o.id)} disabled={busy === "primary"}
+                                        title="The person phoned first about this unit. It carries no billing meaning.">Make primary</button>
+                              )}
+                              <button type="button" onClick={() => retireOwner(o)} disabled={busy === "retire-owner"}
+                                      aria-label={`Remove ${displayPersonName(o)}`} title="Sold or came off the title — the record is kept as a former owner"
+                                      style={{ border: "1px solid #E3D9C6", background: "#FFF", color: "#B5651D", borderRadius: 6, width: 24, height: 24, lineHeight: "20px", fontSize: 14, padding: 0, cursor: "pointer" }}>×</button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {canWrite && (addingTo === u.id ? (
+              <div style={{ marginTop: 10, background: "#F6F1E7", borderRadius: 8, padding: 10 }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+                  <div style={{ flex: 1, minWidth: 120 }}>
+                    <div style={{ fontSize: 11, color: "#64748B" }}>First name</div>
+                    <input style={inp} value={newOwner.first_name} disabled={newOwner.is_entity}
+                           onChange={(e) => setNewOwner({ ...newOwner, first_name: e.target.value })} />
+                  </div>
+                  <div style={{ flex: 1.4, minWidth: 150 }}>
+                    <div style={{ fontSize: 11, color: "#64748B" }}>Surname / registered name</div>
+                    <input style={inp} value={newOwner.surname}
+                           onChange={(e) => setNewOwner({ ...newOwner, surname: e.target.value })} />
+                  </div>
+                  <div style={{ flex: 1, minWidth: 130 }}>
+                    <div style={{ fontSize: 11, color: "#64748B" }}>Cell</div>
+                    <input style={inp} value={newOwner.cell} onChange={(e) => setNewOwner({ ...newOwner, cell: e.target.value })} />
+                  </div>
+                  <div style={{ flex: 1.4, minWidth: 170 }}>
+                    <div style={{ fontSize: 11, color: "#64748B" }}>Email</div>
+                    <input style={inp} type="email" value={newOwner.email} onChange={(e) => setNewOwner({ ...newOwner, email: e.target.value })} />
+                  </div>
+                  <label style={{ fontSize: 11.5, display: "flex", alignItems: "center", gap: 5, paddingBottom: 6 }}>
+                    <input type="checkbox" checked={newOwner.is_entity}
+                           onChange={(e) => setNewOwner({ ...newOwner, is_entity: e.target.checked, first_name: e.target.checked ? "" : newOwner.first_name })} />
+                    Entity
+                  </label>
+                  <button style={primaryBtn} onClick={() => addOwner(u.id)} disabled={busy === "add-owner"}>
+                    {busy === "add-owner" ? "Adding…" : "Add owner"}
+                  </button>
+                  <button style={secondaryBtn} onClick={() => setAddingTo(null)}>Cancel</button>
+                </div>
+              </div>
+            ) : (
+              <button style={{ ...secondaryBtn, marginTop: 10, fontSize: 12 }} onClick={() => { setAddingTo(u.id); setLetFor(null); }}>
+                + Add an owner to Unit {u.unitNumber}
+              </button>
+            ))}
+
+            {u.formerOwners.length > 0 && (
+              <details style={{ marginTop: 10 }}>
+                <summary style={{ fontSize: 11.5, color: "#94A0AC", cursor: "pointer" }}>
+                  {u.formerOwners.length} former owner{u.formerOwners.length === 1 ? "" : "s"}
+                </summary>
+                <div style={{ fontSize: 12, color: "#64748B", marginTop: 6, lineHeight: 1.8 }}>
+                  {u.formerOwners.map((o) => (
+                    <div key={o.id}>
+                      {displayPersonName(o)}{o.email ? ` · ${o.email}` : ""}{o.cell ? ` · ${formatCell(o.cell)}` : ""}
+                      {canWrite && (
+                        <button style={{ ...secondaryBtn, padding: "1px 7px", fontSize: 11, marginLeft: 8 }}
+                                onClick={() => restoreOwner(o)} disabled={busy === "restore-owner"}>Restore</button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+
+            {/* ---------- Tenancy ---------- */}
+            <div style={{ marginTop: 16, borderTop: "1px solid #EEE7D6", paddingTop: 12 }}>
+              <div style={{ fontWeight: 700, fontSize: 12.5, marginBottom: 6 }}>Tenant</div>
+              {t ? (
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
+                  <div style={{ fontSize: 12.5, lineHeight: 1.8 }}>
+                    <b>{displayPersonName(t)}</b>
+                    {t.occupants ? <span style={{ color: "#94A0AC" }}> · {t.occupants} occupant{t.occupants === 1 ? "" : "s"}</span> : null}
+                    <div style={{ color: "#64748B" }}>
+                      {t.cell ? formatCell(t.cell) : "no cell"}{" · "}{t.email || "no email"}
+                      {t.alternate_contact ? ` · ${t.alternate_contact}` : ""}
+                    </div>
+                    <div style={{ color: "#94A0AC", fontSize: 11.5 }}>
+                      In occupation since {String(t.started_on).slice(0, 10)}
+                      {t.lease_reference ? ` · lease ${t.lease_reference}` : ""}
+                    </div>
+                  </div>
+                  {canWrite && (
+                    <button style={secondaryBtn} onClick={() => endLet(t)} disabled={busy === "end-let"}>End this tenancy</button>
+                  )}
+                </div>
+              ) : letFor === u.id ? (
+                <div style={{ background: "#F6F1E7", borderRadius: 8, padding: 10 }}>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+                    <div style={{ flex: 1, minWidth: 110 }}>
+                      <div style={{ fontSize: 11, color: "#64748B" }}>First name</div>
+                      <input style={inp} value={newTenancy.first_name} onChange={(e) => setNewTenancy({ ...newTenancy, first_name: e.target.value })} />
+                    </div>
+                    <div style={{ flex: 1.2, minWidth: 130 }}>
+                      <div style={{ fontSize: 11, color: "#64748B" }}>Surname</div>
+                      <input style={inp} value={newTenancy.surname} onChange={(e) => setNewTenancy({ ...newTenancy, surname: e.target.value })} />
+                    </div>
+                    <div style={{ flex: 1, minWidth: 120 }}>
+                      <div style={{ fontSize: 11, color: "#64748B" }}>Cell</div>
+                      <input style={inp} value={newTenancy.cell} onChange={(e) => setNewTenancy({ ...newTenancy, cell: e.target.value })} />
+                    </div>
+                    <div style={{ flex: 1.3, minWidth: 160 }}>
+                      <div style={{ fontSize: 11, color: "#64748B" }}>Email</div>
+                      <input style={inp} type="email" value={newTenancy.email} onChange={(e) => setNewTenancy({ ...newTenancy, email: e.target.value })} />
+                    </div>
+                    <div style={{ width: 140 }}>
+                      <div style={{ fontSize: 11, color: "#64748B" }}>Moved in</div>
+                      <input style={inp} type="date" value={newTenancy.started_on} onChange={(e) => setNewTenancy({ ...newTenancy, started_on: e.target.value })} />
+                    </div>
+                    <div style={{ width: 80 }}>
+                      <div style={{ fontSize: 11, color: "#64748B" }}>Occupants</div>
+                      <input style={inp} inputMode="numeric" value={newTenancy.occupants} onChange={(e) => setNewTenancy({ ...newTenancy, occupants: e.target.value })} />
+                    </div>
+                    <div style={{ width: 110 }}>
+                      <div style={{ fontSize: 11, color: "#64748B" }}>Lease ref</div>
+                      <input style={inp} value={newTenancy.lease_reference} onChange={(e) => setNewTenancy({ ...newTenancy, lease_reference: e.target.value })} />
+                    </div>
+                    <button style={primaryBtn} onClick={() => startLet(u.id)} disabled={busy === "start-let"}>
+                      {busy === "start-let" ? "Recording…" : "Record tenancy"}
+                    </button>
+                    <button style={secondaryBtn} onClick={() => setLetFor(null)}>Cancel</button>
+                  </div>
+                  <div style={{ fontSize: 11.5, color: "#94A0AC", marginTop: 8 }}>
+                    The move-in date is what lets the register answer who was living here in a given month. Occupants matter because water is billed on the meter, not the unit.
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ fontSize: 12.5, color: "#94A0AC" }}>Not let — no current tenancy recorded.</div>
+                  {canWrite && (
+                    <button style={secondaryBtn} onClick={() => { setLetFor(u.id); setAddingTo(null); }}>Record a tenancy</button>
+                  )}
+                </div>
+              )}
+
+              {u.pastTenancies.length > 0 && (
+                <div style={{ marginTop: 8 }}>
+                  <button style={{ ...secondaryBtn, padding: "2px 8px", fontSize: 11.5 }}
+                          onClick={() => setShowHistory((h) => ({ ...h, [u.id]: !h[u.id] }))}>
+                    {showHistory[u.id] ? "Hide" : "Show"} {u.pastTenancies.length} past tenanc{u.pastTenancies.length === 1 ? "y" : "ies"}
+                  </button>
+                  {showHistory[u.id] && (
+                    <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 6 }}>
+                      <thead><tr><th style={th}>Tenant</th><th style={th}>From</th><th style={th}>To</th><th style={th}>Contact</th></tr></thead>
+                      <tbody>
+                        {u.pastTenancies.map((p) => (
+                          <tr key={p.id}>
+                            <td style={td}>{displayPersonName(p)}</td>
+                            <td style={td}>{String(p.started_on).slice(0, 10)}</td>
+                            <td style={td}>{String(p.ended_on).slice(0, 10)}</td>
+                            <td style={{ ...td, color: "#64748B" }}>{[p.cell && formatCell(p.cell), p.email].filter(Boolean).join(" · ") || "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              )}
+            </div>
+          </Card>
+        );
+      })}
+
+      <Card style={{ background: "#F4F1E9" }}>
+        <div style={{ fontSize: 12, color: "#64748B", lineHeight: 1.8 }}>
+          <b>What this register is not.</b> It does not decide who is billed or what a statement says — <code>units.owner_name</code> and
+          <code> units.email</code> still do that, and are shown on each card so the two can be compared. Levies remain the owner's
+          liability in law whoever is in occupation, so recording a tenant changes nothing about who owes what.
+          {!canWrite && <><br /><b>You can see this register but not change it.</b> Contact details are edited by the finance trustee.</>}
+          <br />Residents can see their own unit's entry on their statement link, and cannot edit it — tell them, and they will tell you when a number changes.
+        </div>
+      </Card>
+    </>
+  );
 }
 
 // The preview between reading the file and writing anything. It exists because

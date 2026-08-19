@@ -1,6 +1,6 @@
 # El Corazon Body Corporate — Finance Trustee App
 **Project summary / working notes**
-Last updated: 12 August 2026, session 23 (supersedes the 11 August 2026 session 22 summary)
+Last updated: 12 August 2026, session 24 (supersedes the 12 August 2026 session 23 summary)
 
 > Devon is the finance trustee for **El Corazon**, a 7-unit residential body corporate in OntdekkersPark (1709), South Africa. This app manages monthly levy statements, water & electricity billing, bank reconciliation, resident remittance advices, expense tracking and the annual income & expenditure statement. Devon builds and deploys it directly.
 
@@ -70,6 +70,140 @@ Water rates are stored one row per band per `effective_from` in `water_tariff_ba
 - **Editing view** — the Tariffs & rates page. Anchored on **today**, not the viewed month, and works off the full history (`waterBandHistory`, keyed by effective date, built from the bands fetch already being made — no extra query).
 
 Sets currently in the DB: **1 Jul 2024**, **1 Jul 2025**, **1 Aug 2026** (the 2026 set is ~12.5% up on 2025, except `>40-50` at +16.10%).
+
+---
+
+## Done on 12 August 2026, session 24 — a resident register: owners, contacts, tenancies
+
+Devon asked for a register of owner names and surnames allowing for multiple owners per unit, cell
+numbers and email addresses, and tenant information where a unit is let. The scheme has never held a
+way to reach the people in it.
+
+### What `units.owner_name` actually is, and why it was not touched
+
+`units.owner_name` holds `DM & AJ Stanley`, `I.A. and L Jacobs`, `DN and MP Hutchinson` and
+`Manie Jooste Family Trust`. **Those are not badly-modelled people lists.** They are the *billing
+name* — the label printed on the levy statement, the remittance advice and the AGM pack — and for
+Unit 2 it is a juristic person with no first name and no surname at all.
+
+So `owner_name` stays exactly as it is and **nothing that bills or prints changes**. The register
+sits alongside it and answers a different question: who do I phone. `units.email` is untouched for
+the same reason — it is NOT NULL, nothing in the app reads it, and it is the statement destination,
+not a contact list. Both are shown on each unit's card so the two can be compared.
+
+> A unit's billing name and its registered owners are **expected to look similar and allowed to
+> differ**. A trust with two natural-person trustees is the ordinary case, not a data error. The
+> card flags a mismatch for the eye; **nothing reconciles them silently.**
+
+### `unit_owners` and `unit_tenancies`
+
+`unit_owners` — one row per person per unit. `first_name` is nullable and `surname` is not, with an
+`is_entity` flag and a CHECK that an entity carries no first name: that is how the trust is held
+without inventing a person. One cell, one email and a free `alternate_contact` per person; a second
+table for a resident's second phone number is more structure than a seven-unit scheme will keep
+current, and **an unkept field is worse than no field**.
+
+`unit_tenancies` — **dated, not a set of fields on the unit.** The question that actually gets asked
+is *who was in Unit 4 last March*, when a water reading spikes or a levy goes unpaid. Overwriting
+the tenant on change answers none of that and loses the previous occupant the moment somebody types
+over them. The current tenancy is the one with no `ended_on`.
+
+**Two partial unique indexes do the enforcing, not triggers and not the UI:**
+
+| Index | Refuses |
+|---|---|
+| `unit_owners_one_primary` on `(unit_id) where is_primary and active` | a second primary contact |
+| `unit_tenancies_one_open` on `(unit_id) where ended_on is null` | a second open tenancy |
+
+The second one matters most: **a second open tenancy would make "is this unit let, and to whom"
+ambiguous, which is the whole question the table exists to answer.** Closing a tenancy is what makes
+room for the next, which is also what forces the end date to be recorded rather than skipped.
+
+Overlapping *closed* tenancies are deliberately allowed — a week's overlap while one tenant moves
+out and the next moves in is real. Consequence worth knowing: **`makePrimary` has to clear then set
+in two statements**, because the index permits exactly one and there is no order in which a single
+statement satisfies it.
+
+### Seeded, with nothing parsed
+
+Each unit starts with **one** owner row carrying whatever `owner_name` and `email` held, marked
+primary and flagged `needs_review`. **The names were not split by guessing.** "DM & AJ Stanley" is
+two people; a parser would produce records indistinguishable from real ones in six months. The whole
+string goes in `surname`, and a banner lists every unit still carrying a seeded record until Devon
+has split them by hand. Saving a row clears its own flag. Session 11's rule again: seed the
+checklist, invent nothing.
+
+### Removal keeps the record
+
+Retiring an owner sets `active = false`. **A levy dispute over a period somebody owned the unit needs
+to know who to ask**, so a sold unit's previous owner stays under "former owners" with a Restore
+button, not deleted. Same reasoning as the maintenance register in session 23, arrived at
+independently.
+
+### Residents see their own entry and cannot change it
+
+`get_unit_contacts(p_token)` — a SECURITY DEFINER RPC scoped to the one unit the token resolves to,
+alongside the four that already exist. It appears under the statement on the token link.
+
+**Read only, deliberately.** `submit_remittance` stays the only thing the anon role can write, and
+*the email levy notices go to is exactly what somebody holding a leaked link would want to change.*
+Showing it is still worth doing — it is how a wrong number gets noticed, and the resident is the
+only person who can notice it. `id_number` and `postal_address` are not returned: the resident knows
+them, and a share-style link should carry the least it can. **A failure costs the card, not the
+statement.**
+
+### Access
+
+`unit_owners` and `unit_tenancies`: **all trustees read, finance writes** — the same shape as the 25
+tables session 15 put on `can_write_finance()`. The maintenance trustee has to be able to phone a
+resident about a geyser without being able to rewrite the register; the approver should know who
+they are approving figures for. New nav page **Resident register**, visible to all three roles,
+`noPeriod` because a contact list under "August 2026" invites the reader to think it is scoped to
+August. Non-finance trustees see the fields disabled and a line saying why.
+
+### Verified
+
+`no-undef` clean apart from the pre-existing `URLSearchParams` at line 950; bundle clean; zero
+literal non-breaking spaces.
+
+**Ten constraint and RPC assertions against live data, all correct** — token RPC scoped to one unit,
+a stranger's token returning nothing, second primary refused, second *non-primary* owner allowed
+(the actual requirement), entity-with-a-first-name refused, second open tenancy refused, a new
+tenancy allowed once the previous is closed, an end date before the start refused, and the RPC
+returning only the open tenancy.
+
+**Role permissions run as each of the three real accounts**, impersonated as `authenticated` with a
+real `auth.uid()`:
+
+| | devon (finance) | ivana (maintenance) | margi (approver) |
+|---|---|---|---|
+| read owners | allowed, 7 rows ✓ | allowed, 7 rows ✓ | allowed, 7 rows ✓ |
+| write owners | allowed ✓ | **denied** ✓ | **denied** ✓ |
+| write tenancies | allowed ✓ | **denied** ✓ | **denied** ✓ |
+
+Anon: the RPC works, direct table reads are refused, and INSERT and UPDATE are refused.
+
+> **The anon test passed for the wrong reason first, and it is the session-16 trap exactly.** The
+> probe was `insert into unit_owners (unit_id, surname) select id, 'probe' from units where
+> unit_number = 6` — run *after* switching to `anon`, where RLS on `units` returns no rows. Inserting
+> **zero rows raises no error and evaluates no WITH CHECK**, so it reported ALLOWED having tested
+> nothing. Re-run with the unit id captured as owner beforehand, all three writes are properly
+> refused. **A permissions test that finds nothing to test is not a passing test** — written down in
+> session 16, fallen into again in session 24.
+
+All probes rolled back: 7 owners, 0 tenancies, 0 leftovers, all 7 still flagged for review.
+
+> **`npm run build` still has to be run locally.**
+
+### Not done
+
+- **The seeded names still need splitting by hand** — all 7 units. That is the point of the flag.
+- No spreadsheet round trip for this register. The session-23 machinery is general enough to be
+  pointed at it, but owners are a list per unit rather than one row per thing, so the sheet shape is
+  a different problem.
+- Nothing emails or SMSes from the register; it holds the details, it does not use them.
+- `units.email` is still the only statement destination. A unit with two owners who both want the
+  statement has no way to say so.
 
 ---
 
