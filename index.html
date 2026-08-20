@@ -2,8 +2,65 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>El Corazon Body Corporate</title>
+    <meta name="description" content="Levy statements, water and electricity billing, and payment details for El Corazon." />
+
+    <!-- Installable web app (Android / Chrome) -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#2F5D50" />
+    <link rel="icon" href="/icon-192.png" sizes="192x192" type="image/png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="El Corazon" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+    <script>
+      /*
+       * Resident capability token, remembered across app launches.
+       *
+       * A resident opens ?unit=<token>. The installed app, however, always
+       * launches at the manifest start_url ("/") with no query string, so
+       * without this the home-screen icon would open a signed-out shell.
+       *
+       * App.jsx reads the token once, at module evaluation, from
+       * window.location.search — so the URL has to be corrected here, in a
+       * classic script in <head>, before the module bundle runs.
+       *
+       * The restore only fires when the app was launched from the home
+       * screen (standalone). In an ordinary browser tab the URL is left
+       * exactly as typed, so the trustee's own login is never shadowed by a
+       * resident link opened once on the same device.
+       *
+       * "?unit=" with an empty value clears the stored token.
+       */
+      (function () {
+        var KEY = "ec_unit_token";
+        try {
+          var url = new URL(window.location.href);
+          var token = url.searchParams.get("unit");
+          if (token) {
+            localStorage.setItem(KEY, token);
+            return;
+          }
+          if (url.searchParams.has("unit")) {
+            localStorage.removeItem(KEY);
+            return;
+          }
+          var standalone =
+            (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) ||
+            window.navigator.standalone === true;
+          if (!standalone) return;
+          var saved = localStorage.getItem(KEY);
+          if (saved) {
+            url.searchParams.set("unit", saved);
+            window.history.replaceState(null, "", url.toString());
+          }
+        } catch (e) {
+          /* private mode / blocked storage — fall through to the normal app */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

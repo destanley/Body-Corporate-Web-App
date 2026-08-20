@@ -1,0 +1,6 @@
+# The service worker and manifest must never be served stale, or a deploy
+# can take days to reach an installed phone.
+/sw.js
+  Cache-Control: no-cache
+/manifest.webmanifest
+  Cache-Control: no-cache
