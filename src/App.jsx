@@ -11019,14 +11019,16 @@ function ResidentPortal({
                 placeholder="What it was for — e.g. 'Garden service, paid 5 June'"
                 value={item.comment}
                 onChange={(e) => updateDeductionItem(i, "comment", e.target.value)}
-                style={{ ...inputStyle, flex: 1, textAlign: "left" }}
+                // minWidth 0 lets this flex item shrink past an <input>'s intrinsic
+                // width, which is what keeps the row inside a 360px-wide phone.
+                style={{ ...inputStyle, flex: 1, minWidth: 0, textAlign: "left" }}
               />
-              <ExpenseCategorySelect
-                value={item.expenseCategory}
-                onChange={(v) => updateDeductionItem(i, "expenseCategory", v)}
-                placeholder="Type of expense"
-                style={{ padding: "10px", fontSize: 16, minWidth: 150 }}
-              />
+              {/* No expense-category picker here, deliberately. The trustee assigns the
+                  tag when reviewing the deduction on the reconciliation screen, and
+                  `expense_categories` is trustee-only under RLS — so on a resident's
+                  token link this dropdown was always empty anyway, while its 150px
+                  minimum width pushed the row out of alignment on a phone. The item
+                  still carries an `expenseCategory` field; it is submitted as null. */}
               <button
                 type="button"
                 onClick={() => removeDeductionItem(i)}
